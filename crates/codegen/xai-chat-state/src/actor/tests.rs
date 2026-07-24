@@ -723,6 +723,109 @@ async fn replace_conversation_persists_and_emits_reset() {
 }
 
 #[tokio::test]
+async fn acknowledged_compaction_install_does_not_persist_twice() {
+    let mut h = TestHarness::new();
+    h.handle.push_user_message(ConversationItem::user("old"));
+    let _ = h.handle.get_conversation().await;
+    h.drain_persistence();
+
+    h.handle
+        .install_persisted_compaction(vec![ConversationItem::system("persisted replacement")])
+        .await
+        .expect("actor acknowledges live install");
+
+    let conversation = h.handle.get_conversation().await;
+    assert_eq!(conversation[0].text_content(), "persisted replacement");
+    assert!(
+        h.drain_persistence().is_empty(),
+        "acknowledged persistence must not be followed by fire-and-forget replacement"
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_replacement_survives_actor_snapshot_and_persistence() {
+    let mut h = TestHarness::new();
+    let mut retained = ConversationItem::user("retained objective");
+    if let ConversationItem::User(user) = &mut retained {
+        user.response_item_id = Some("msg_actor_retained".into());
+    }
+    let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
+        "gpt-test",
+        Some("acct-test".to_string()),
+    );
+    compatibility.replacement_segment_items = 2;
+    compatibility.item_metadata = vec![
+        xai_grok_sampling_types::NativeCompactionItemMetadata {
+            input_index: 0,
+            kind: xai_grok_sampling_types::NativeCompactionItemKind::Message,
+            item_id: Some("msg_actor_retained".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        xai_grok_sampling_types::NativeCompactionItemMetadata {
+            input_index: 1,
+            kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+            item_id: Some("cmp_actor".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let replacement = vec![
+        ConversationItem::system("sys"),
+        retained,
+        ConversationItem::NativeCompactionMetadata(compatibility),
+        ConversationItem::Compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+            id: Some("cmp_actor".into()),
+            encrypted_content: "encrypted-actor-context".into(),
+        }),
+    ];
+    h.handle
+        .replace_conversation_for_compaction(replacement.clone());
+
+    let snapshot = h.handle.snapshot().await.expect("actor snapshot");
+    assert!(matches!(
+        &snapshot.conversation[1],
+        ConversationItem::User(user)
+            if user.response_item_id.as_deref() == Some("msg_actor_retained")
+    ));
+    assert!(matches!(
+        &snapshot.conversation[2],
+        ConversationItem::NativeCompactionMetadata(metadata)
+            if metadata.model == "gpt-test"
+                && metadata.chatgpt_account_id.as_deref() == Some("acct-test")
+    ));
+    match &snapshot.conversation[3] {
+        ConversationItem::Compaction(item) => {
+            assert_eq!(item.id.as_deref(), Some("cmp_actor"));
+            assert_eq!(item.encrypted_content, "encrypted-actor-context");
+        }
+        other => panic!("expected native compaction in snapshot, got {other:?}"),
+    }
+    let records = h.drain_persistence();
+    let persisted = records
+        .iter()
+        .find_map(|record| match record {
+            PersistenceRecord::ReplaceHistory(items) => Some(items),
+            _ => None,
+        })
+        .expect("replacement persisted");
+    assert!(matches!(
+        &persisted[1],
+        ConversationItem::User(user)
+            if user.response_item_id.as_deref() == Some("msg_actor_retained")
+    ));
+    assert!(matches!(
+        &persisted[2],
+        ConversationItem::NativeCompactionMetadata(metadata)
+            if metadata.model == "gpt-test"
+    ));
+    assert!(matches!(
+        &persisted[3],
+        ConversationItem::Compaction(item)
+            if item.id.as_deref() == Some("cmp_actor")
+                && item.encrypted_content == "encrypted-actor-context"
+    ));
+}
+
+#[tokio::test]
 async fn compaction_reseed_carries_provider_overhead() {
     let h = TestHarness::new();
     // ~1k estimated tokens; provider reports 51k → 50k overhead.
@@ -1730,6 +1833,7 @@ async fn parallel_tool_calls_accept_first_reject_second_skip_third() {
     let assistant_with_tools =
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
             content: "I'll read the file, fix it, and run tests.".into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".into(),
@@ -2016,6 +2120,7 @@ async fn dangling_tool_calls_after_crash_are_repaired_on_load() {
         ConversationItem::user("Read, edit, and test"),
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
             content: std::sync::Arc::<str>::from(""),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".into(),
@@ -2439,6 +2544,23 @@ async fn live_cancel_after_partial_tool_results_repairs_remaining() {
 
 // Turn message capture tests
 // ============================================================================
+
+#[tokio::test]
+async fn codex_turn_state_is_fresh_per_turn_and_stable_within_turn() {
+    let h = TestHarness::new();
+
+    h.handle.begin_codex_turn();
+    let first = h.handle.get_codex_turn_state().await.unwrap();
+    first.set("sticky-first".to_string()).unwrap();
+    let continuation = h.handle.get_codex_turn_state().await.unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &continuation));
+    assert_eq!(continuation.get().map(String::as_str), Some("sticky-first"));
+
+    h.handle.begin_codex_turn();
+    let second = h.handle.get_codex_turn_state().await.unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    assert!(second.get().is_none(), "turn state must never cross turns");
+}
 
 #[tokio::test]
 async fn turn_capture_collects_all_message_types() {
@@ -3107,6 +3229,7 @@ async fn get_first_user_text_image_first_returns_none() {
         content: vec![ContentPart::Image {
             url: "data:image/png;base64,abc".into(),
         }],
+        response_item_id: None,
         synthetic_reason: None,
         ..Default::default()
     }));
@@ -3131,6 +3254,7 @@ async fn get_first_user_text_image_then_text_returns_none() {
                 text: "describe this image".into(),
             },
         ],
+        response_item_id: None,
         synthetic_reason: None,
         ..Default::default()
     }));
@@ -3154,6 +3278,7 @@ async fn get_first_user_text_text_then_image_returns_text() {
                 url: "data:image/png;base64,abc".into(),
             },
         ],
+        response_item_id: None,
         synthetic_reason: None,
         ..Default::default()
     }));
@@ -3664,6 +3789,7 @@ async fn get_last_model_metadata_returns_both_fields() {
         ConversationItem::user("hi"),
         ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
             content: "hello".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("grok-4.5".into()),
             model_fingerprint: Some("fp_abc123".into()),
@@ -3715,6 +3841,7 @@ async fn sampling_config_survives_compaction_replacement() {
             ConversationItem::user("fix the bug"),
             ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
                 content: "I'll fix it.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),
                 model_fingerprint: Some("fp_abc123".into()),
@@ -3800,6 +3927,7 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
             ConversationItem::user("task"),
             ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
                 content: "done".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),
                 model_fingerprint: Some("fp_acd3142484d3ad6f".into()),
@@ -3835,6 +3963,7 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         .push_assistant_response(ConversationItem::Assistant(
             xai_grok_sampling_types::AssistantItem {
                 content: "working on it".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("grok-4.5".into()),
                 model_fingerprint: Some("fp_acd3142484d3ad6f".into()),
@@ -4317,6 +4446,7 @@ async fn prefix_stable_after_image_pruning() {
                     url: big_image_url.into(),
                 },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }),
@@ -4342,6 +4472,7 @@ async fn prefix_stable_after_image_pruning() {
                     url: "data:image/png;base64,newImageData".into(),
                 },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }));
@@ -4417,6 +4548,7 @@ async fn build_request_preserves_small_old_images() {
                     url: "data:image/png;base64,iVBORw0KGgo=".into(),
                 },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }),

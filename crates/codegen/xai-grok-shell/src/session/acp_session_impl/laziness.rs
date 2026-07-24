@@ -532,6 +532,7 @@ impl SessionActor {
                          === END TRANSCRIPT ===\n"
                     )),
                 }],
+                response_item_id: None,
                 synthetic_reason: None,
                 ..Default::default()
             }),

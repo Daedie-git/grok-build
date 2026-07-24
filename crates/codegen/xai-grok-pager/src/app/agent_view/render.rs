@@ -2264,14 +2264,20 @@ impl AgentView {
         }
         let mode_flags: &[PromptFlag] = &mode_flags_vec;
         let multiline = self.multiline_mode;
-        let warning = self.credit_balance.as_ref().and_then(|bal| {
-            crate::views::credit_bar::usage_warning_for_session(
-                bal,
-                self.auto_topup.as_ref(),
-                self.billing_surface_visible,
-                self.chat_kind,
-            )
-        });
+        let warning = if self.session.models.current_model_is_codex() && !self.chat_kind {
+            self.codex_rate_limits
+                .as_ref()
+                .and_then(crate::views::codex_usage::usage_warning)
+        } else {
+            self.credit_balance.as_ref().and_then(|bal| {
+                crate::views::credit_bar::usage_warning_for_session(
+                    bal,
+                    self.auto_topup.as_ref(),
+                    self.billing_surface_visible,
+                    self.chat_kind,
+                )
+            })
+        };
         let usage_warning_text: Option<String> = warning.as_ref().map(|(t, _)| t.clone());
         let usage_warning = usage_warning_text.as_deref();
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);

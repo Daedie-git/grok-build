@@ -395,6 +395,8 @@ pub enum Action {
     },
     /// Cycle to next model.
     NextModel,
+    /// Cycle reasoning effort on the current model (next menu entry, wrapping).
+    CycleEffort,
     /// Switch active model.
     SwitchModel {
         model_id: acp::ModelId,
@@ -2056,6 +2058,12 @@ pub enum Effect {
     /// pushing a system message into scrollback (used for automatic refreshes
     /// on session init and after each turn).
     FetchBilling { agent_id: AgentId, silent: bool },
+    /// Fetch ChatGPT/Codex account rate-limit windows.
+    FetchCodexRateLimits {
+        agent_id: AgentId,
+        silent: bool,
+        generation: u64,
+    },
     /// Fetch billing data at the app level (no agent required).
     /// Used on startup to populate the welcome-screen credit warning.
     FetchAppBilling,
@@ -2765,6 +2773,20 @@ pub enum TaskResult {
         subscription_tier: Option<String>,
         /// Auto top-up rule fetch result; `Unchanged` keeps any cached rule.
         autotopup: crate::views::credit_bar::AutoTopupFetch,
+    },
+    /// ChatGPT/Codex account rate-limit windows fetched for an agent.
+    CodexRateLimitsFetched {
+        agent_id: AgentId,
+        limits: xai_grok_shell::extensions::codex_usage::CodexRateLimits,
+        silent: bool,
+        generation: u64,
+    },
+    /// ChatGPT/Codex account rate-limit fetch failed.
+    CodexRateLimitsError {
+        agent_id: AgentId,
+        error: String,
+        silent: bool,
+        generation: u64,
     },
     /// App-level billing data (welcome screen).
     AppBillingFetched {

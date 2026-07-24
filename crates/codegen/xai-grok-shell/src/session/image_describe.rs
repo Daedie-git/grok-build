@@ -447,6 +447,7 @@ pub async fn describe_user_images(
         content: vec![ContentPart::Text {
             text: std::sync::Arc::<str>::from(prompt_text),
         }],
+        response_item_id: None,
         synthetic_reason: None,
         ..Default::default()
     });
@@ -547,6 +548,7 @@ mod tests {
             content: vec![xai_grok_sampling_types::conversation::ContentPart::Text {
                 text: text.into(),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })

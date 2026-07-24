@@ -71,6 +71,8 @@ pub enum ActionId {
 
     // Agent
     NextModel,
+    /// Cycle reasoning effort on the current model (menu order).
+    CycleEffort,
     CancelTurn,
     ToggleYolo,
     ToggleMultiline,

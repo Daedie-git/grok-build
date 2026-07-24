@@ -399,6 +399,9 @@ pub(crate) fn flatten_transcript_for_classifier(
                     }
                 }
             }
+            ConversationItem::ResponseOutputMetadata(_)
+            | ConversationItem::NativeCompactionMetadata(_)
+            | ConversationItem::Compaction(_) => {}
         }
     }
     out

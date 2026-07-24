@@ -826,6 +826,306 @@ async fn write_checkpoint_file(adapter: &JsonlStorageAdapter, info: &Info, id: &
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn compaction_checkpoint_round_trips_native_replacement_history() {
+    use crate::extensions::notification::CompactionCheckpointFile;
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let info = create_test_info();
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let mut retained_user = ConversationItem::user("retained user turn");
+    if let ConversationItem::User(user) = &mut retained_user {
+        user.response_item_id = Some("msg_checkpoint_user".into());
+    }
+    let checkpoint = CompactionCheckpointFile {
+        checkpoint_id: "native-checkpoint".into(),
+        prompt_index_at_compaction: 3,
+        compacted_history: vec![
+            ConversationItem::system("sys"),
+            retained_user,
+            ConversationItem::Compaction(
+                xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                    id: Some("cmp_checkpoint".into()),
+                    encrypted_content: "encrypted-checkpoint-context".into(),
+                },
+            ),
+        ],
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+    };
+    adapter
+        .write_compaction_checkpoint(&info, &checkpoint)
+        .await
+        .unwrap();
+    let restored = adapter
+        .read_compaction_checkpoint(
+            &info,
+            "compaction_checkpoints/native-checkpoint.json",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        &restored.compacted_history[1],
+        ConversationItem::User(user)
+            if user.response_item_id.as_deref() == Some("msg_checkpoint_user")
+    ));
+    match &restored.compacted_history[2] {
+        ConversationItem::Compaction(item) => {
+            assert_eq!(item.id.as_deref(), Some("cmp_checkpoint"));
+            assert_eq!(item.encrypted_content, "encrypted-checkpoint-context");
+        }
+        other => panic!("expected checkpointed native compaction, got {other:?}"),
+    }
+}
+#[tokio::test]
+async fn copy_session_data_uses_committed_rewind_over_stale_cache_in_both_modes() {
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("rewind-copy-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    let rewound = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept prompt"),
+        ConversationItem::assistant("kept answer"),
+    ];
+    let stale = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("dead prompt"),
+        ConversationItem::assistant("dead answer"),
+    ];
+    adapter.replace_chat_history(&source, &stale).await.unwrap();
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiSessionUpdate::RewindMarker {
+            target_prompt_index: 1,
+            transaction_id: Some("rewind-copy".into()),
+            rewound_history_json: Some(serde_json::to_string(&rewound).unwrap()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        },
+        meta: None,
+    }));
+    adapter
+        .append_update_durable_commit_aware(&source, &marker)
+        .await
+        .unwrap();
+
+    for (suffix, fork_filter) in [("verbatim", false), ("filtered", true)] {
+        let target = Info {
+            id: acp::SessionId::new(format!("rewind-copy-{suffix}")),
+            cwd: "/target/workspace".to_string(),
+        };
+        adapter
+            .copy_session_data_sync(
+                &source,
+                &target,
+                CopySessionOptions {
+                    fork_filter,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let copied = adapter
+            .read_chat_history_sync(adapter.chat_file(&target), CHAT_FORMAT_VERSION)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(copied).unwrap(),
+            serde_json::to_value(&rewound).unwrap(),
+            "{suffix} fork must use the committed rewind snapshot"
+        );
+        let updates = adapter.read_updates_jsonl(adapter.updates_file(&target)).unwrap();
+        assert_eq!(updates.is_empty(), fork_filter);
+    }
+}
+
+#[tokio::test]
+async fn verbatim_copy_after_finalized_local_compaction_uses_checkpoint_over_stale_cache() {
+    use crate::extensions::notification::{
+        CompactionCheckpointFile, CompactionCheckpointInfo,
+        FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("finalized-local-copy-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    let authoritative = vec![
+        ConversationItem::system("finalized local system"),
+        ConversationItem::user("summary of prior turns"),
+    ];
+    let checkpoint = CompactionCheckpointFile {
+        checkpoint_id: "finalized-local-copy-checkpoint".into(),
+        prompt_index_at_compaction: 3,
+        compacted_history: authoritative.clone(),
+        schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+    };
+    adapter
+        .write_compaction_checkpoint(&source, &checkpoint)
+        .await
+        .unwrap();
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            prompt_index_at_compaction: checkpoint.prompt_index_at_compaction,
+            checkpoint_file:
+                "compaction_checkpoints/finalized-local-copy-checkpoint.json".into(),
+            auto_continue: None,
+            schema_version: checkpoint.schema_version,
+            created_at: checkpoint.created_at.clone(),
+        })),
+        meta: None,
+    }));
+    adapter
+        .append_update_durable_commit_aware(&source, &marker)
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source, &[ConversationItem::system("stale cache")])
+        .await
+        .unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("finalized-local-copy-target"),
+        cwd: "/target/workspace".to_string(),
+    };
+    let result = adapter
+        .copy_session_data_sync(&source, &target, CopySessionOptions::default())
+        .unwrap();
+    let copied = adapter
+        .read_chat_history_sync(adapter.chat_file(&target), CHAT_FORMAT_VERSION)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(copied).unwrap(),
+        serde_json::to_value(authoritative).unwrap()
+    );
+    assert_eq!(result.compaction_checkpoints_copied, 1);
+}
+
+#[tokio::test]
+async fn verbatim_copy_after_native_compaction_then_rewind_uses_latest_marker() {
+    use crate::extensions::notification::{
+        CompactionCheckpointFile, CompactionCheckpointInfo,
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+    use xai_grok_sampling_types::{
+        NativeCompactionCompatibility, NativeCompactionItemKind,
+        NativeCompactionItemMetadata,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("native-copy-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter.init_session(&source, default_model_id()).await.unwrap();
+    let mut compatibility = NativeCompactionCompatibility::codex("test-model", None);
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: NativeCompactionItemKind::Compaction,
+        item_id: Some("cmp-copy".into()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let authoritative = vec![
+        ConversationItem::system("system"),
+        ConversationItem::NativeCompactionMetadata(compatibility),
+        ConversationItem::Compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-copy".into()),
+                encrypted_content: "cipher".into(),
+            },
+        ),
+    ];
+    let checkpoint = CompactionCheckpointFile {
+        checkpoint_id: "native-copy-checkpoint".into(),
+        prompt_index_at_compaction: 3,
+        compacted_history: authoritative.clone(),
+        schema_version: 1,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+    };
+    adapter
+        .write_compaction_checkpoint(&source, &checkpoint)
+        .await
+        .unwrap();
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            prompt_index_at_compaction: checkpoint.prompt_index_at_compaction,
+            checkpoint_file: "compaction_checkpoints/native-copy-checkpoint.json".into(),
+            auto_continue: None,
+            schema_version: checkpoint.schema_version,
+            created_at: checkpoint.created_at.clone(),
+        })),
+        meta: None,
+    }));
+    adapter
+        .append_update_durable_commit_aware(&source, &marker)
+        .await
+        .unwrap();
+    let rewind = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiSessionUpdate::RewindMarker {
+            target_prompt_index: 2,
+            transaction_id: Some("rewind-after-native-copy".into()),
+            rewound_history_json: Some(serde_json::to_string(&authoritative).unwrap()),
+            created_at: "2026-01-01T00:01:00Z".into(),
+        },
+        meta: None,
+    }));
+    adapter
+        .append_update_durable_commit_aware(&source, &rewind)
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source, &[ConversationItem::system("stale cache")])
+        .await
+        .unwrap();
+
+    let target = Info {
+        id: acp::SessionId::new("native-copy-target"),
+        cwd: "/target/workspace".to_string(),
+    };
+    let result = adapter
+        .copy_session_data_sync(&source, &target, CopySessionOptions::default())
+        .unwrap();
+    let copied = adapter
+        .read_chat_history_sync(adapter.chat_file(&target), CHAT_FORMAT_VERSION)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(copied).unwrap(),
+        serde_json::to_value(authoritative).unwrap()
+    );
+    assert_eq!(result.compaction_checkpoints_copied, 1);
+    assert!(
+        adapter
+            .session_dir(&target)
+            .join("compaction_checkpoints/native-copy-checkpoint.json")
+            .is_file()
+    );
+}
+
 #[tokio::test]
 async fn copy_session_data_copies_referenced_compaction_checkpoints() {
     let temp_dir = TempDir::new().unwrap();
@@ -852,6 +1152,79 @@ async fn copy_session_data_copies_referenced_compaction_checkpoints() {
     let original = std::fs::read(adapter.session_dir(&source_info).join(rel)).unwrap();
     assert_eq!(copied, original, "checkpoint file must be copied verbatim");
 }
+#[tokio::test]
+async fn fork_copy_transforms_checkpoint_and_cache_coherently() {
+    use crate::extensions::notification::CompactionCheckpointFile;
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source_info = Info {
+        id: acp::SessionId::new("ckpt-transform-src"),
+        cwd: "/source/workspace".to_string(),
+    };
+    adapter
+        .init_session(&source_info, default_model_id())
+        .await
+        .unwrap();
+    let history = vec![ConversationItem::system(
+        "Repository root: /source/workspace",
+    )];
+    adapter
+        .write_compaction_checkpoint(
+            &source_info,
+            &CompactionCheckpointFile {
+                checkpoint_id: "ckpt-transform".into(),
+                prompt_index_at_compaction: 1,
+                compacted_history: history.clone(),
+                schema_version: 1,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                original_user_info: None,
+                reread_file_paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    adapter
+        .append_update(
+            &source_info,
+            &checkpoint_record("ckpt-transform"),
+        )
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source_info, &history)
+        .await
+        .unwrap();
+    let target_info = Info {
+        id: acp::SessionId::new("ckpt-transform-dst"),
+        cwd: "/target/workspace".to_string(),
+    };
+    adapter
+        .copy_session_data(&source_info, &target_info, CopySessionOptions::default())
+        .await
+        .unwrap();
+
+    let loaded = adapter
+        .load_session_without_updates(&target_info)
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded.chat_history[0].text_content(),
+        "Repository root: /target/workspace"
+    );
+    let checkpoint = adapter
+        .read_compaction_checkpoint(
+            &target_info,
+            "compaction_checkpoints/ckpt-transform.json",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        checkpoint.compacted_history[0].text_content(),
+        loaded.chat_history[0].text_content()
+    );
+}
+
 #[tokio::test]
 async fn fork_filter_copy_skips_compaction_checkpoints() {
     let temp_dir = TempDir::new().unwrap();
@@ -933,7 +1306,7 @@ async fn target_prompt_index_truncation_gates_checkpoint_copy() {
         );
 }
 #[tokio::test]
-async fn dangling_checkpoint_record_copies_without_file() {
+async fn dangling_checkpoint_record_is_removed_from_copy() {
     let temp_dir = TempDir::new().unwrap();
     let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
     let source_info = Info {
@@ -951,7 +1324,7 @@ async fn dangling_checkpoint_record_copies_without_file() {
         .await
         .unwrap();
     assert_eq!(result.compaction_checkpoints_copied, 0);
-    assert_eq!(result.updates_copied, 1, "the record itself still copies");
+    assert_eq!(result.updates_copied, 0, "dangling metadata must not copy");
     assert!(
             !adapter
                 .session_dir(&target_info)
@@ -989,13 +1362,10 @@ async fn checkpoint_record_with_non_checkpoint_path_is_not_copied() {
         .unwrap();
     assert_eq!(result.compaction_checkpoints_copied, 0);
     let loaded = adapter.load_session(&target_info).await.unwrap();
-    assert_eq!(loaded.updates.len(), 1);
-    match &loaded.updates[0] {
-        SessionUpdate::Xai(notification) => {
-            assert_eq!(notification.session_id.0.as_ref(), "ckpt-dst");
-        }
-        other => panic!("Expected Xai update, got {other:?}"),
-    }
+    assert!(
+        loaded.updates.is_empty(),
+        "invalid checkpoint metadata must not be copied"
+    );
 }
 #[cfg(unix)]
 #[tokio::test]
@@ -1264,6 +1634,8 @@ fn fork_rewind_marker(session_id: &str, target_prompt_index: usize) -> SessionUp
             session_id: acp::SessionId::new(session_id),
             update: XaiSessionUpdateType::RewindMarker {
                 target_prompt_index,
+                transaction_id: None,
+                rewound_history_json: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
             },
             meta: None,
@@ -1566,6 +1938,8 @@ async fn test_load_prompts_only_applies_rewind_truncation() {
         session_id: info.id.clone(),
         update: XaiSessionUpdate::RewindMarker {
             target_prompt_index: 1,
+            transaction_id: None,
+            rewound_history_json: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
         },
         meta: None,
@@ -2156,6 +2530,7 @@ fn fork_filter_removes_synthetic_user_messages() {
                 content: vec![ContentPart::Text {
                     text: "doom loop".into(),
                 }],
+                response_item_id: None,
                 synthetic_reason: Some(SyntheticReason::SystemReminder),
                 ..Default::default()
             }),
@@ -2211,6 +2586,7 @@ fn fork_filter_consecutive_users_with_tool_calls() {
             ConversationItem::user("query"),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "bash".into(),
@@ -2238,6 +2614,7 @@ fn fork_filter_preserves_complete_tool_turn() {
             ConversationItem::user("q"),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "bash".into(),
@@ -2253,6 +2630,53 @@ fn fork_filter_preserves_complete_tool_turn() {
     assert_eq!(items.len(), 3, "complete tool turn should be preserved");
 }
 #[test]
+fn fork_filter_preserves_responses_metadata_for_complete_tool_turn() {
+    use xai_grok_sampling_types::conversation::*;
+    let metadata = |response_id: &str, kind, call_id: &str| {
+        ConversationItem::ResponseOutputMetadata(ResponseOutputItemMetadata {
+            response_id: response_id.into(),
+            output_items: 1,
+            items: vec![ResponseOutputItemOrder {
+                output_index: 0,
+                kind,
+                item_id: None,
+                call_id: Some(call_id.into()),
+                internal_chat_message_metadata_passthrough: Some(
+                    InternalChatMessageMetadataPassthrough {
+                        turn_id: Some(format!("turn-{response_id}")),
+                    },
+                ),
+            }],
+            origin: None,
+        })
+    };
+    let mut items = vec![
+            ConversationItem::user("q"),
+            metadata("call", ResponseOutputItemKind::FunctionCall, "tc1"),
+            ConversationItem::Assistant(AssistantItem {
+                content: String::new().into(),
+                response_item_id: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                model_id: None,
+                model_fingerprint: None,
+                reasoning_effort: None,
+            }),
+            metadata("output", ResponseOutputItemKind::FunctionCallOutput, "tc1"),
+            ConversationItem::tool_result("tc1", "output"),
+        ];
+    let expected = serde_json::to_value(&items).unwrap();
+    super::fork_filter_chat(&mut items);
+    assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            expected,
+            "complete tool turn must retain each adjacent Responses metadata owner"
+        );
+}
+#[test]
 fn fork_filter_strips_incomplete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
     let mut items = vec![
@@ -2261,6 +2685,7 @@ fn fork_filter_strips_incomplete_tool_turn() {
             ConversationItem::user("q2"),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "bash".into(),
@@ -2470,6 +2895,7 @@ fn fork_filter_keeps_multi_tool_cycle_turn_with_reasoning() {
             )),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "bash".into(),
@@ -2509,6 +2935,7 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
             )),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "tc1".into(),
@@ -3151,7 +3578,10 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
+            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(
@@ -3212,7 +3642,10 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
+            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(
@@ -3287,11 +3720,39 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
             ConversationItem::Reasoning(_) => "reasoning",
+            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
+            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);
 }
+
+/// Provider-authored compaction rows are durable opaque history. The JSONL
+/// loader must preserve both item identity and ciphertext for resume/rewind.
+#[test]
+fn read_chat_history_preserves_native_compaction_item() {
+    let items = load_lines(&[
+        r#"{"type":"system","content":"sys"}"#,
+        r#"{"type":"user","content":[{"type":"text","text":"q"}],"response_item_id":"msg_persisted"}"#,
+        r#"{"type":"compaction","id":"cmp_persisted","encrypted_content":"opaque-native-context"}"#,
+    ]);
+    assert_eq!(items.len(), 3);
+    assert!(matches!(
+        &items[1],
+        ConversationItem::User(user)
+            if user.response_item_id.as_deref() == Some("msg_persisted")
+    ));
+    match &items[2] {
+        ConversationItem::Compaction(item) => {
+            assert_eq!(item.id.as_deref(), Some("cmp_persisted"));
+            assert_eq!(item.encrypted_content, "opaque-native-context");
+        }
+        other => panic!("expected persisted compaction item, got {other:?}"),
+    }
+}
+
 /// Set up a session dir with a raw `chat_history.jsonl` and return
 /// (adapter, chat path, loaded items).
 fn load_raw_chat(

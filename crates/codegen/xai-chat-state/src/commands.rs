@@ -183,8 +183,26 @@ pub enum ChatStateCommand {
     /// Restore from a snapshot.
     RestoreSnapshot(Box<ChatStateSnapshot>),
 
+    /// Start a fresh process-local Codex routing scope for one prompt turn.
+    BeginCodexTurn,
+
     /// Start capturing turn messages. Clears any previous buffer.
     BeginTurnCapture,
+
+    /// Install history that an external persistence transaction already wrote.
+    /// This must not emit another `ReplaceHistory` persistence record.
+    InstallPersistedCompaction {
+        items: Vec<ConversationItem>,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Install a complete rewind snapshot after its durable marker committed.
+    /// This preserves all non-history snapshot fields and must not emit a
+    /// duplicate persistence replacement.
+    InstallPersistedRewind {
+        snapshot: Box<ChatStateSnapshot>,
+        reply: oneshot::Sender<()>,
+    },
 
     /// Append synthetic `task` pairs for a harness-spawned subagent (goal
     /// planner / verifier skeptic) to the in-progress harness trace phase.
@@ -222,6 +240,11 @@ pub enum ChatStateCommand {
 
     /// Get current prompt index.
     GetPromptIndex { reply: oneshot::Sender<usize> },
+
+    /// Clone the process-local sticky-routing state for the active turn.
+    GetCodexTurnState {
+        reply: oneshot::Sender<std::sync::Arc<std::sync::OnceLock<String>>>,
+    },
 
     /// Get the prompt index at which the last compaction occurred.
     /// `Some` means the context currently holds a compaction summary.

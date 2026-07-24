@@ -325,7 +325,13 @@ struct FlatErrorResponse {
     code: Option<String>,
 }
 
-/// Extract `(error_type, message)` from either error format.
+/// Codex/FastAPI error envelope: `{"detail":"..."}`.
+#[derive(Debug, Deserialize)]
+struct DetailErrorResponse {
+    detail: String,
+}
+
+/// Extract `(error_type, message)` from supported provider error formats.
 fn try_parse_error(data: &str) -> Option<(String, String)> {
     if let Ok(resp) = serde_json::from_str::<ErrorResponse>(data) {
         return Some((
@@ -340,6 +346,9 @@ fn try_parse_error(data: &str) -> Option<(String, String)> {
             flat.code.unwrap_or_else(|| "server_error".to_string()),
             flat.error,
         ));
+    }
+    if let Ok(detail) = serde_json::from_str::<DetailErrorResponse>(data) {
+        return Some(("unknown".to_string(), detail.detail));
     }
     None
 }
@@ -430,6 +439,8 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("maximum prompt length")
         || m.contains("maximum context length")
         || m.contains("context_length_exceeded")
+        || m.contains("exceeds the context window")
+        || m.contains("exceeded the available context")
 }
 
 /// Decide whether a [`reqwest::Error`] is worth retrying.
@@ -572,6 +583,41 @@ mod tests {
             try_parse_stream_error(data).is_none(),
             "valid chunk should not be parsed as error"
         );
+    }
+
+    #[test]
+    fn codex_detail_error_is_preserved_exactly() {
+        let detail = "Unsupported parameter: 'temperature' is not supported with this model.";
+        let body = serde_json::json!({ "detail": detail }).to_string();
+        assert_eq!(parse_error_bytes(body.as_bytes()), detail);
+        assert_eq!(
+            user_facing_api_error_message(StatusCode::BAD_REQUEST, body.as_bytes()),
+            detail
+        );
+
+        let stream = try_parse_stream_error(&body).expect("detail envelope should parse");
+        match stream {
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => {
+                assert_eq!(error_type, "unknown");
+                assert_eq!(message, detail);
+            }
+            other => panic!("expected StreamError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_context_detail_is_recognized_on_http_and_stream_paths() {
+        let detail = "The prompt is too long for this model's context window.";
+        let body = serde_json::json!({ "detail": detail }).to_string();
+        assert_eq!(
+            user_facing_api_error_message(StatusCode::BAD_REQUEST, body.as_bytes()),
+            detail
+        );
+        let stream = try_parse_stream_error(&body).expect("Codex detail stream error must parse");
+        assert!(stream.is_context_length_error());
     }
 
     #[test]

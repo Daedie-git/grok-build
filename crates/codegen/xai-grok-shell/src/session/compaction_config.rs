@@ -24,6 +24,15 @@ pub(crate) const SUPPRESS_UNTIL_SUCCESS: u8 = 3;
 /// (waiting for a sample deadlocks when context is already over the window).
 pub(crate) const SUPPRESS_AUTH: u8 = 4;
 
+/// No automatic compaction has been attempted in the current bounded subagent turn.
+pub(crate) const BOUNDED_COMPACT_NONE: u8 = 0;
+/// The bounded subagent's one allowed automatic compaction is in flight.
+pub(crate) const BOUNDED_COMPACT_IN_FLIGHT: u8 = 1;
+/// The bounded subagent compacted successfully and must now finalize without tools.
+pub(crate) const BOUNDED_COMPACT_FINALIZING: u8 = 2;
+/// The bounded subagent's automatic compaction failed; retrying in this turn is forbidden.
+pub(crate) const BOUNDED_COMPACT_FAILED: u8 = 3;
+
 /// Model slug and context window from the previous turn.
 #[derive(Clone, Debug)]
 pub struct PreviousModelInfo {
@@ -136,6 +145,9 @@ pub struct CompactionConfig {
     /// Auto-compaction suppression state (`SUPPRESS_*`) after a deterministic
     /// failure; the gates early-return unless `SUPPRESS_NONE`. Manual `/compact` ignores it.
     pub auto_compact_suppressed: AtomicU8,
+    /// Per-turn circuit breaker for bounded subagents. They may compact once,
+    /// then must synthesize a result without tools; a second cycle fails closed.
+    pub bounded_auto_compact_state: AtomicU8,
     /// Locks the context window when `GROK_DEBUG_CONTEXT_WINDOW` is set.
     pub context_window_override: Option<std::num::NonZeroU64>,
     pub count: AtomicU64,
@@ -152,11 +164,59 @@ pub struct CompactionConfig {
     pub prefire: PrefireState,
     /// Sticky once a forked session releases its inherited prefix under compaction pressure (see `run_compact_inner`), so it stops re-pinning it.
     pub prefix_released: AtomicBool,
+    /// Set when a lost native-compaction acknowledgement cannot be reconciled
+    /// from durable storage. Sampling stays disabled until the session reloads.
+    pub reconciliation_required: AtomicBool,
+}
+
+/// Resolve Codex's provider safety limit. Codex CLI caps an explicit limit at
+/// 90% of the active context window and uses that 90% value as its fallback.
+/// This also scales correctly when `GROK_DEBUG_CONTEXT_WINDOW` shrinks a model.
+pub(crate) fn resolve_codex_auto_compact_token_limit(
+    base_url: &str,
+    context_window: std::num::NonZeroU64,
+    configured_limit: Option<u64>,
+) -> Option<std::num::NonZeroU64> {
+    if !xai_grok_sampling_types::capabilities_for_base_url(base_url).provider_auto_compact_safety {
+        return None;
+    }
+    let ninety_percent = context_window.get().saturating_mul(9) / 10;
+    let limit = configured_limit
+        .filter(|limit| *limit > 0)
+        .map_or(ninety_percent, |limit| limit.min(ninety_percent));
+    std::num::NonZeroU64::new(limit)
 }
 
 #[cfg(test)]
 mod prefire_state_tests {
     use super::*;
+
+    #[test]
+    fn codex_limit_defaults_to_ninety_percent_and_clamps_metadata() {
+        let window = std::num::NonZeroU64::new(272_000).unwrap();
+        let codex = "https://chatgpt.com/backend-api/codex";
+        assert_eq!(
+            resolve_codex_auto_compact_token_limit(codex, window, None).map(|v| v.get()),
+            Some(244_800)
+        );
+        assert_eq!(
+            resolve_codex_auto_compact_token_limit(codex, window, Some(260_000)).map(|v| v.get()),
+            Some(244_800)
+        );
+        assert_eq!(
+            resolve_codex_auto_compact_token_limit(codex, window, Some(200_000)).map(|v| v.get()),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn grok_does_not_receive_codex_safety_limit() {
+        let window = std::num::NonZeroU64::new(500_000).unwrap();
+        assert_eq!(
+            resolve_codex_auto_compact_token_limit("https://api.x.ai/v1", window, Some(244_800),),
+            None
+        );
+    }
 
     fn dummy_cache() -> AsyncCompactionCache {
         AsyncCompactionCache {

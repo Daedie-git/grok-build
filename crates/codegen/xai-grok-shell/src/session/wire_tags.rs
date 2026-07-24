@@ -44,6 +44,8 @@ pub(crate) static AVAILABLE_COMMANDS_UPDATE: LazyLock<String> = LazyLock::new(||
 pub(crate) static REWIND_MARKER: LazyLock<String> = LazyLock::new(|| {
     tagged_discriminant(&XaiSessionUpdate::RewindMarker {
         target_prompt_index: 0,
+        transaction_id: None,
+        rewound_history_json: None,
         created_at: String::new(),
     })
 });

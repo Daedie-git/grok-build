@@ -464,6 +464,13 @@ impl SessionActor {
             }
         };
         self.events.begin_turn();
+        // A new prompt gets a fresh bounded-task compaction budget. A single
+        // subagent turn may compact once, then it must synthesize without tools.
+        self.reset_bounded_auto_compaction_for_turn();
+        // A prompt turn owns one fresh Codex sticky-routing token. Every
+        // ordinary request, retry, inline compaction, and continuation built
+        // below shares this scope; the next prompt replaces it.
+        self.chat_state_handle.begin_codex_turn();
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
@@ -2057,6 +2064,20 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none() {
                 self.refresh_token_if_expired().await;
             }
+            // Codex's effective input budget is a provider safety boundary,
+            // not a configurable soft threshold. Keep it active even when
+            // normal compaction is suppressed or this is a budgeted child.
+            // This executes at every model-loop iteration, including tool-call
+            // follow-ups after their results have entered chat state.
+            if let Some(trigger_info) = self.check_codex_auto_compact_needed().await
+                && let Err(e) = self.run_compact_only(trigger_info).await
+            {
+                tracing::error!(error = %e, "Codex safety-limit compaction failed");
+                if Self::is_auth_compact_error(&e) {
+                    return Err(self.surface_compact_auth_failure(e).await);
+                }
+                return Err(e);
+            }
             if self.tool_context.task_output_token_budget.is_none()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
@@ -2064,6 +2085,9 @@ impl SessionActor {
                 tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
                 if Self::is_auth_compact_error(&e) {
                     return Err(self.surface_compact_auth_failure(e).await);
+                }
+                if self.is_bounded_subagent_task() {
+                    return Err(e);
                 }
             }
             let backend_search_active = self.backend_search_active();
@@ -2077,6 +2101,13 @@ impl SessionActor {
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
                 };
+            let bounded_subagent_finalizing = self.bounded_subagent_must_finalize();
+            if bounded_subagent_finalizing {
+                // The first compaction is the convergence boundary for a bounded
+                // child task. Preserve a required structured-output completion
+                // tool below, but remove every exploratory tool.
+                effective_tools.clear();
+            }
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
@@ -2129,7 +2160,11 @@ impl SessionActor {
             if structured_output_native {
                 request.json_schema = json_schema.clone();
             }
-            request.hosted_tools = self.hosted_tools_for_turn();
+            request.hosted_tools = if bounded_subagent_finalizing {
+                Vec::new()
+            } else {
+                self.hosted_tools_for_turn()
+            };
             request.max_output_tokens = self
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
@@ -2607,6 +2642,9 @@ impl SessionActor {
                     tracing::error!(error = %e, "Preflight overflow compaction failed");
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
+                    }
+                    if self.is_bounded_subagent_task() {
+                        return Err(e);
                     }
                 }
                 continue;

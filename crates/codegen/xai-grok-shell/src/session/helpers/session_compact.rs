@@ -54,7 +54,9 @@ pub(crate) use xai_grok_sampling_types::is_context_length_error;
 /// request cannot change the outcome — auth state, config, payload shape,
 /// and stuck-model conditions all persist). 4xx API responses other than
 /// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
-/// transport errors, stream-level blips, and 5xx responses are transient.
+/// transport errors, non-size stream-level blips, and 5xx responses are transient.
+/// Context-window errors are deterministic regardless of whether they arrive
+/// as an HTTP `Api` error or a provider-specific SSE `StreamError`.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
     let deterministic = match &err {
@@ -70,10 +72,10 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::REQUEST_TIMEOUT
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
+        SamplingError::StreamError { message, .. } => is_context_length_error(message),
         SamplingError::MaxTokensTruncation => true,
         SamplingError::Http(_)
         | SamplingError::EventStreamError(_)
-        | SamplingError::StreamError { .. }
         | SamplingError::EmptyResponse { .. }
         | SamplingError::DoomLoopDetected { .. } => false,
     };
@@ -479,7 +481,10 @@ pub(crate) async fn generate_session_compact(
                 tools,
                 hosted_tools,
                 model: Some(sampling_config.model.to_owned()),
-                temperature: Some(1.0),
+                // Do not force a sampling value for summaries. In particular,
+                // Codex rejects this field and strips inherited defaults at
+                // its final wire-normalization boundary.
+                temperature: None,
                 x_grok_conv_id: Some(session_id.to_string()),
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
@@ -495,6 +500,7 @@ pub(crate) async fn generate_session_compact(
             let mut truncated = false;
             let mut stop_reason: Option<String> = None;
             let mut content = String::new();
+            let mut terminal_text = xai_grok_sampling_types::ResponsesStreamAccumulator::default();
             let mut last_progress_at = std::time::Instant::now();
             loop {
                 let idle_remaining = idle_timeout.saturating_sub(last_progress_at.elapsed());
@@ -529,6 +535,26 @@ pub(crate) async fn generate_session_compact(
                 }
                 match chunk_result {
                     Ok(chunk) => {
+                        let chunk = match chunk {
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(
+                                item,
+                            ) => {
+                                terminal_text.note_output_item_added(item);
+                                last_progress_at = std::time::Instant::now();
+                                continue;
+                            }
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(
+                                item,
+                            ) => {
+                                terminal_text.note_captured_output_item_done(item);
+                                last_progress_at = std::time::Instant::now();
+                                continue;
+                            }
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+                                event,
+                                ..
+                            } => event,
+                        };
                         if !matches!(
                             &chunk,
                             ResponseStreamEvent::ResponseCreated(_)
@@ -541,6 +567,16 @@ pub(crate) async fn generate_session_compact(
                             ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
                                 timing.record_delta();
                                 content.push_str(&text_delta_event.delta);
+                                terminal_text.note_text_delta(&text_delta_event.delta);
+                            }
+                            ResponseStreamEvent::ResponseOutputTextDone(done_event) => {
+                                terminal_text.note_text_done(&done_event.text);
+                            }
+                            ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                                terminal_text.note_output_item_done(
+                                    done_event.output_index,
+                                    done_event.item.clone(),
+                                );
                             }
                             ResponseStreamEvent::ResponseFailed(failed_event) => {
                                 let event_error = failed_event.response.error.as_ref();
@@ -588,6 +624,10 @@ pub(crate) async fn generate_session_compact(
                     Err(e) => return Err(classify_sampling_error(e)),
                 }
             }
+            // A finalized output item is authoritative; otherwise use the
+            // accumulated deltas/output-text-done fallback. This handles
+            // Codex terminal forms without appending the same text twice.
+            content = terminal_text.final_text();
             CompactOutput {
                 content,
                 stop_reason: stop_reason.or_else(|| Some("stop".to_string())),
@@ -789,6 +829,12 @@ mod classify_tests {
                 message: "try again".into(),
             }
         )));
+        assert!(is_det(&classify_sampling_error(
+            SamplingError::StreamError {
+                error_type: "unknown".into(),
+                message: "The prompt is too long for this model's context window.".into(),
+            }
+        )));
     }
     #[test]
     fn response_event_invalid_request_error_marker_is_deterministic() {
@@ -981,6 +1027,7 @@ mod compacted_history_shape_tests {
             ConversationItem::assistant("Let me look at the file."),
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll read the file now.".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "read_file".into(),
@@ -993,6 +1040,7 @@ mod compacted_history_shape_tests {
             ConversationItem::tool_result("tc1", "fn login() { /* buggy code */ }"),
             ConversationItem::Assistant(AssistantItem {
                 content: "Found the bug, applying fix.".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc2".into(),
                     name: "search_replace".into(),
@@ -1158,6 +1206,7 @@ mod compacted_history_shape_tests {
             ),
             ConversationItem::Assistant(AssistantItem {
                 content: "reading the file".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "read_file".into(),
@@ -1858,11 +1907,405 @@ mod reasoning_compaction_regression_tests {
             ),
         ]
     }
+    fn responses_all_terminal_text_forms_stream() -> Vec<Event> {
+        vec![
+            Event::default().data(
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": 0,
+                    "item_id": "msg_terminal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "<summary>terminal</summary>"
+                })
+                .to_string(),
+            ),
+            Event::default().data(
+                json!({
+                    "type": "response.output_text.done",
+                    "sequence_number": 1,
+                    "item_id": "msg_terminal",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "<summary>terminal</summary>"
+                })
+                .to_string(),
+            ),
+            Event::default().data(
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item": {
+                        "id": "msg_terminal",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "<summary>terminal</summary>",
+                            "annotations": []
+                        }]
+                    }
+                })
+                .to_string(),
+            ),
+            Event::default().data(
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 3,
+                    "response": {
+                        "id": "resp_terminal",
+                        "object": "response",
+                        "created_at": 1234567890,
+                        "model": "test-model",
+                        "status": "completed",
+                        "output": []
+                    }
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    fn responses_multiple_message_terminal_stream() -> Vec<Event> {
+        let message_done = |sequence_number: u32, output_index: u32, id: &str, text: &str| {
+            Event::default().data(
+                json!({
+                    "type": "response.output_item.done",
+                    "sequence_number": sequence_number,
+                    "output_index": output_index,
+                    "item": {
+                        "id": id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+        };
+        vec![
+            message_done(0, 1, "msg_second", "second</summary>"),
+            message_done(1, 0, "msg_first", "<summary>first "),
+            Event::default().data(
+                json!({
+                    "type": "response.completed",
+                    "sequence_number": 2,
+                    "response": {
+                        "id": "resp_multiple",
+                        "object": "response",
+                        "created_at": 1234567890,
+                        "model": "test-model",
+                        "status": "completed",
+                        "output": []
+                    }
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
     fn test_config_responses(base_url: &str) -> SamplerConfig {
         let mut config = test_config(base_url);
         config.api_backend = ApiBackend::Responses;
         config
     }
+
+    #[tokio::test]
+    async fn non_codex_responses_compaction_keeps_delta_only_terminal_text() {
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let stream = stream::iter(
+                    responses_summary_stream()
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{addr}/v1");
+        assert!(!xai_grok_sampling_types::is_codex_backend_url(&base_url));
+        let config = test_config_responses(&base_url);
+        let client = Client::new(config.clone()).unwrap();
+        let output = generate_session_compact(
+            vec![
+                ConversationItem::system("You are helpful."),
+                ConversationItem::user("Summarize."),
+            ],
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("non-codex-delta-only"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::None,
+        )
+        .await
+        .expect("delta-only Responses summary");
+        assert_eq!(output.content, "<summary>ok</summary>");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn non_codex_responses_compaction_concatenates_multiple_terminal_messages() {
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let stream = stream::iter(
+                    responses_multiple_message_terminal_stream()
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{addr}/v1");
+        assert!(!xai_grok_sampling_types::is_codex_backend_url(&base_url));
+        let config = test_config_responses(&base_url);
+        let client = Client::new(config.clone()).unwrap();
+        let output = generate_session_compact(
+            vec![
+                ConversationItem::system("You are helpful."),
+                ConversationItem::user("Summarize."),
+            ],
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("non-codex-multiple-messages"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::None,
+        )
+        .await
+        .expect("multiple terminal message summary");
+        assert_eq!(output.content, "<summary>first second</summary>");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn responses_compaction_reconstructs_terminal_text_without_duplication() {
+        let app = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let stream = stream::iter(
+                    responses_all_terminal_text_forms_stream()
+                        .into_iter()
+                        .map(Ok::<_, std::convert::Infallible>),
+                );
+                Sse::new(stream).keep_alive(KeepAlive::default())
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{addr}/v1");
+        let config = test_config_responses(&base_url);
+        let client = Client::new(config.clone()).unwrap();
+        let output = generate_session_compact(
+            vec![
+                ConversationItem::system("You are helpful."),
+                ConversationItem::user("Summarize."),
+            ],
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("terminal-forms"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::None,
+        )
+        .await
+        .expect("terminal forms must reconstruct a summary");
+        assert_eq!(output.content, "<summary>terminal</summary>");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn responses_sse_context_detail_reaches_deterministic_compaction_classifier() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let detail = "The prompt is too long for this model's context window.";
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let served_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                served_attempts.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    let events = stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                        Event::default().data(json!({ "detail": detail }).to_string()),
+                    )]);
+                    Sse::new(events).keep_alive(KeepAlive::default())
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{addr}/v1");
+        let config = test_config_responses(&base_url);
+        let client = Client::new(config.clone()).unwrap();
+        let sampler = crate::session::helpers::full_replace_compaction::ShellCompactionSampler::new(
+            false,
+            None,
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("sse-context-detail"),
+            config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::None,
+        );
+        let turns = vec![
+            ConversationItem::system("You are helpful."),
+            ConversationItem::user("Summarize."),
+        ];
+        let result = xai_grok_compaction::sample_full_replace_summary(
+            &sampler,
+            &turns,
+            None,
+            &xai_grok_compaction::FullReplaceConfig {
+                max_attempts: 3,
+                retry_delay_secs: 0,
+                sampling_timeout_secs: 0,
+            },
+            &(),
+        )
+        .await;
+
+        let failure = match result {
+            Err(failure) => failure,
+            Ok(_) => panic!("SSE context overflow must fail full-replace sampling"),
+        };
+        let xai_grok_compaction::FullReplaceError::Sampler {
+            message,
+            deterministic,
+            context_overflow,
+        } = failure
+        else {
+            panic!("expected sampler error")
+        };
+        assert!(deterministic, "same oversized payload must not be retried");
+        assert!(
+            context_overflow,
+            "outer loop must receive the signal that advances Verbatim -> VerbatimFitted -> Lossy"
+        );
+        assert!(message.contains(detail), "got: {message}");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "deterministic SSE overflow must not retry the identical payload"
+        );
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn responses_compaction_preserves_codex_detail_error_in_diagnostic() {
+        let detail = "Unsupported parameter: 'temperature' is not supported with this model.";
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || async move {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({ "detail": detail })),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let base_url = format!("http://{addr}/v1");
+        let config = test_config_responses(&base_url);
+        let client = Client::new(config.clone()).unwrap();
+        let result = generate_session_compact(
+            vec![
+                ConversationItem::system("You are helpful."),
+                ConversationItem::user("Summarize."),
+            ],
+            vec![],
+            vec![],
+            client,
+            acp::SessionId::new("codex-detail-diagnostic"),
+            &config,
+            std::time::Duration::from_secs(30),
+            0,
+            crate::util::config::CompactionToolChoice::None,
+        )
+        .await;
+
+        let err = match result {
+            Err(CompactFailure::Deterministic(err)) => err,
+            Err(CompactFailure::Transient(_)) => panic!("400 detail error must be deterministic"),
+            Ok(_) => panic!("400 detail error must fail compaction"),
+        };
+        let diagnostic = err
+            .data
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .expect("compaction diagnostic text");
+        assert!(diagnostic.contains(detail), "got: {diagnostic}");
+        assert!(!diagnostic.contains("Request failed (HTTP 400)"));
+        let _ = shutdown_tx.send(());
+    }
+
     #[tokio::test]
     async fn responses_compaction_attaches_tools_with_tool_choice_auto() {
         use std::sync::{Arc, Mutex};
@@ -1939,6 +2382,13 @@ mod reasoning_compaction_regression_tests {
         let bodies = captured.lock().unwrap();
         assert_eq!(bodies.len(), 2, "mock must have served both requests");
         let with_tools = &bodies[0];
+        let temperature = with_tools["temperature"]
+            .as_f64()
+            .expect("serialized temperature");
+        assert!(
+            (temperature - 0.7).abs() < 0.000_001,
+            "Responses compaction must inherit the configured default, not force 1.0: {temperature}"
+        );
         assert_eq!(
             with_tools["tool_choice"],
             json!("auto"),

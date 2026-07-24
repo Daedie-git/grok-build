@@ -104,11 +104,13 @@ Switch models. Accepts a model ID or display name (case-insensitive), and for re
 
 ### `/effort <level>`
 
-Set reasoning effort on the **current** model without reselecting it. Levels are `low`, `medium`, `high`, and `xhigh`, and it only applies when the active model supports reasoning effort.
+Set reasoning effort on the **current** model without reselecting it. Levels are model-specific (commonly `low`, `medium`, `high`, and `xhigh`), and it only applies when the active model supports reasoning effort.
 
 ```
 /effort high
 ```
+
+You can also cycle the current model's effort levels with **Ctrl+R**.
 
 ### `/always-approve` and `/auto`
 
@@ -387,11 +389,11 @@ Log out and return to the login screen.
 
 ### `/usage`
 
-View credit usage or manage billing. Alias: `/cost`.
+View session token usage and the active model provider's account limits. Grok models show Grok Build credits; Codex models show the ChatGPT/Codex five-hour and weekly windows. Alias: `/cost`.
 
 ```
 /usage
-/usage manage
+/usage manage  # Grok billing only
 ```
 
 ### `/privacy`

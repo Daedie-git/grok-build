@@ -4,6 +4,7 @@ pub mod billing;
 pub mod bundle;
 pub mod chat_conversation_history;
 pub mod code_nav;
+pub mod codex_usage;
 pub mod debug;
 pub mod feedback;
 pub mod fs;

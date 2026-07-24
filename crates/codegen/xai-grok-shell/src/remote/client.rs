@@ -893,6 +893,11 @@ pub fn parse_remote_model_value(
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
             .and_then(|v| u8::try_from(v).ok()),
+        auto_compact_token_limit: get_u64(obj, "autoCompactTokenLimit")
+            .or_else(|| get_u64(obj, "auto_compact_token_limit"))
+            .or_else(|| meta.and_then(|m| get_u64(m, "autoCompactTokenLimit")))
+            .or_else(|| meta.and_then(|m| get_u64(m, "auto_compact_token_limit")))
+            .and_then(std::num::NonZeroU64::new),
         system_prompt_label: get_string(obj, "systemPromptLabel")
             .or_else(|| get_string(obj, "system_prompt_label"))
             .filter(|s| !s.trim().is_empty()),
@@ -1600,6 +1605,30 @@ mod tests {
         );
         assert_eq!(result.agent_type, "concise");
     }
+    #[test]
+    fn parse_remote_model_value_reads_codex_auto_compact_limit() {
+        for value in [
+            serde_json::json!({
+                "model": "codex-model",
+                "context_window": 272_000,
+                "autoCompactTokenLimit": 244_800,
+            }),
+            serde_json::json!({
+                "model": "codex-model",
+                "context_window": 272_000,
+                "_meta": { "auto_compact_token_limit": 244_800 },
+            }),
+        ] {
+            let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+            assert_eq!(
+                result
+                    .auto_compact_token_limit
+                    .map(std::num::NonZeroU64::get),
+                Some(244_800)
+            );
+        }
+    }
+
     #[test]
     fn parse_remote_model_value_no_laziness_detector_block_yields_default() {
         let value = serde_json::json!({

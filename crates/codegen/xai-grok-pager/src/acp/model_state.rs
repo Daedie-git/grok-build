@@ -79,6 +79,20 @@ impl ModelState {
         Some(self.current.as_ref()?.0.as_ref())
     }
 
+    /// Whether the current model uses the ChatGPT/Codex account backend.
+    ///
+    /// `providerKind` is emitted by the shell from the resolved model URL, so
+    /// custom aliases work and model names cannot accidentally select a provider.
+    pub fn current_model_is_codex(&self) -> bool {
+        self.current
+            .as_ref()
+            .and_then(|id| self.available.get(id))
+            .and_then(|info| info.meta.as_ref())
+            .and_then(|meta| meta.get("providerKind"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("codex"))
+    }
+
     /// Total context window tokens for the current model (if available).
     fn current_context_window_tokens(&self) -> Option<u64> {
         let meta = self.available.get(self.current.as_ref()?)?.meta.as_ref()?;
@@ -300,6 +314,46 @@ impl ModelState {
             Some(self.available.first()?.0.clone())
         }
     }
+
+    /// Next reasoning effort among levels the current model offers (wraps).
+    ///
+    /// Always steps **weakest → strongest** (e.g. low → medium → high → xhigh
+    /// → low), independent of how the picker menu is ordered (menus often list
+    /// strongest first). Returns `None` when there is no active model or the
+    /// model has no effort menu. When the current effort is missing/unset,
+    /// starts at the weakest offered level.
+    pub fn next_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        let mut levels: Vec<ReasoningEffort> = self
+            .reasoning_effort_options()
+            .into_iter()
+            .map(|o| o.value)
+            .collect();
+        if levels.is_empty() {
+            return None;
+        }
+        levels.sort_by_key(|e| effort_cycle_rank(*e));
+        levels.dedup();
+        let idx = self
+            .reasoning_effort
+            .and_then(|cur| levels.iter().position(|&e| e == cur))
+            .map(|i| (i + 1) % levels.len())
+            .unwrap_or(0);
+        Some(levels[idx])
+    }
+}
+
+/// Ascending strength for [`ModelState::next_reasoning_effort`] (matches the
+/// declaration order of [`ReasoningEffort`]).
+fn effort_cycle_rank(e: ReasoningEffort) -> u8 {
+    match e {
+        ReasoningEffort::None => 0,
+        ReasoningEffort::Minimal => 1,
+        ReasoningEffort::Low => 2,
+        ReasoningEffort::Medium => 3,
+        ReasoningEffort::High => 4,
+        ReasoningEffort::Xhigh => 5,
+        ReasoningEffort::Max => 6,
+    }
 }
 
 impl From<Option<acp::SessionModelState>> for ModelState {
@@ -356,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn current_model_is_codex_uses_provider_meta_not_model_id() {
+        let mut state = ModelState::default();
+        let custom = acp::ModelId::new(Arc::from("my-custom-model"));
+        let info = acp::ModelInfo::new(custom.clone(), "Custom").meta(
+            serde_json::json!({ "providerKind": "codex" })
+                .as_object()
+                .cloned(),
+        );
+        state.available.insert(custom.clone(), info);
+        state.current = Some(custom);
+        assert!(state.current_model_is_codex());
+
+        state.current = Some(acp::ModelId::new(Arc::from("codex-name-only")));
+        assert!(!state.current_model_is_codex());
+    }
+
+    #[test]
     fn test_next_model_cycles() {
         let state = sample_models();
         let next = state.next_model().unwrap();
@@ -376,6 +447,45 @@ mod tests {
         assert!(state.is_empty());
         assert!(state.current_model_name().is_none());
         assert!(state.next_model().is_none());
+        assert!(state.next_reasoning_effort().is_none());
+    }
+
+    #[test]
+    fn next_reasoning_effort_cycles_weakest_to_strongest() {
+        let id = acp::ModelId::new(Arc::from("reasoning-x"));
+        let mut state = ModelState::default();
+        // Menu listed strongest-first (as the built-in fallback does).
+        let info = acp::ModelInfo::new(id.clone(), "Reasoning X".to_string()).meta(
+            serde_json::json!({
+                "supportsReasoningEffort": true,
+                "reasoningEfforts": [
+                    { "value": "xhigh", "label": "Extra High" },
+                    { "value": "high", "label": "High" },
+                    { "value": "medium", "label": "Medium", "default": true },
+                    { "value": "low", "label": "Low" },
+                ],
+            })
+            .as_object()
+            .cloned(),
+        );
+        state.available.insert(id.clone(), info);
+        state.current = Some(id);
+        state.reasoning_effort = Some(ReasoningEffort::Low);
+        assert_eq!(state.next_reasoning_effort(), Some(ReasoningEffort::Medium));
+        state.reasoning_effort = Some(ReasoningEffort::Medium);
+        assert_eq!(state.next_reasoning_effort(), Some(ReasoningEffort::High));
+        state.reasoning_effort = Some(ReasoningEffort::High);
+        assert_eq!(state.next_reasoning_effort(), Some(ReasoningEffort::Xhigh));
+        state.reasoning_effort = Some(ReasoningEffort::Xhigh);
+        assert_eq!(state.next_reasoning_effort(), Some(ReasoningEffort::Low));
+        state.reasoning_effort = None;
+        assert_eq!(state.next_reasoning_effort(), Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn next_reasoning_effort_none_without_support() {
+        let state = sample_models();
+        assert!(state.next_reasoning_effort().is_none());
     }
 
     fn model_with_effort(id: &str, name: &str, effort: &str) -> acp::ModelInfo {

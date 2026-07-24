@@ -124,7 +124,15 @@ pub fn prepare_conversation_for_verbatim_summarization(
 fn estimate_item_tokens(item: &ConversationItem) -> u64 {
     crate::actor::state::estimate_item_tokens(item)
 }
-/// Shrink a verbatim conversation to `max_tokens`: drop oldest whole turns (System kept, tool runs unsplit; the last turn is truncated in place rather than dropped).
+/// Best-effort shrink a verbatim conversation to `max_tokens`: drop oldest
+/// whole turns (System kept, tool runs unsplit; the last turn is truncated in
+/// place rather than dropped).
+///
+/// Retained structural fields have a non-zero minimum cost. If `max_tokens` is
+/// smaller than that minimum, the returned estimate can honestly remain above
+/// budget rather than dropping the required System message or orphaning a tool
+/// result from its call. Callers that report fit status must re-estimate the
+/// returned items.
 pub fn fit_conversation_to_budget(
     conversation: Vec<ConversationItem>,
     max_tokens: u64,
@@ -2700,6 +2708,7 @@ actual user question";
             // [3] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll read both files for you.".into(),
+                response_item_id: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call_1".into(),
@@ -2738,6 +2747,7 @@ actual user question";
             // [8] Assistant with 2 parallel tool calls
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll fix the typo and run tests.".into(),
+                response_item_id: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call_3".into(),
@@ -3086,6 +3096,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "response".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3110,6 +3121,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "response".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3156,6 +3168,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             mk_reasoning(),
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll search.".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "grep".into(),
@@ -3203,6 +3216,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "plain text response".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3235,6 +3249,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             mk_reasoning(),
             ConversationItem::Assistant(AssistantItem {
                 content: "calling grep".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "grep".into(),
@@ -3249,6 +3264,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             mk_reasoning(),
             ConversationItem::Assistant(AssistantItem {
                 content: "thinking only".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3258,6 +3274,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             ConversationItem::user("third turn"),
             ConversationItem::Assistant(AssistantItem {
                 content: "plain reply".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3323,6 +3340,7 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "hi".into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "ls".into(),
@@ -3667,6 +3685,90 @@ The user asked to read main.rs and lib.rs. main.rs prints hello world, lib.rs ha
             "truncated unit should fit budget (+ marker slack)"
         );
     }
+    /// A large single-result jump keeps the complete call/result unit and does
+    /// not orphan either side of a multi-call assistant turn.
+    #[test]
+    fn fit_large_tool_result_jump_preserves_all_call_result_boundaries() {
+        use xai_grok_sampling_types::ToolCall;
+        let huge = "tool output ".repeat(20_000);
+        let conv = vec![
+            ConversationItem::system("sys"),
+            ConversationItem::user("inspect both files"),
+            ConversationItem::assistant_tool_calls(vec![
+                ToolCall {
+                    id: "call-a".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"target_file":"a.rs"}"#.into(),
+                },
+                ToolCall {
+                    id: "call-b".into(),
+                    name: "read_file".into(),
+                    arguments: r#"{"target_file":"b.rs"}"#.into(),
+                },
+            ]),
+            ConversationItem::tool_result("call-a", huge.as_str()),
+            ConversationItem::tool_result("call-b", "small but useful result"),
+        ];
+        let out = fit_conversation_to_budget(conv, 256);
+        let calls: BTreeSet<String> = out
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(
+                    assistant
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.id.to_string())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let results: BTreeSet<String> = out
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::ToolResult(result) => Some(result.tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls, results,
+            "every retained tool result must retain its owning call"
+        );
+        assert_eq!(
+            calls,
+            BTreeSet::from(["call-a".to_string(), "call-b".to_string()])
+        );
+        assert!(out.iter().any(|item| matches!(
+            item,
+            ConversationItem::ToolResult(result)
+                if result.tool_call_id == "call-a" && result.content.contains("truncated")
+        )));
+
+        let request = xai_grok_sampling_types::ConversationRequest::from_items(out);
+        let created: xai_grok_sampling_types::rs::CreateResponse = (&request).into();
+        let wire = serde_json::to_value(&created).expect("serialize fitted Responses request");
+        let input = wire["input"]
+            .as_array()
+            .expect("serialized fitted request input array");
+        let serialized_calls: BTreeSet<String> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["call_id"].as_str().map(str::to_owned))
+            .collect();
+        let serialized_results: BTreeSet<String> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| item["call_id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(serialized_calls, calls);
+        assert_eq!(serialized_results, results);
+        assert_eq!(
+            serialized_calls, serialized_results,
+            "serialized fitted request must preserve every tool call/result ID pair"
+        );
+    }
+
     /// A single oversized trailing text turn is also truncated in place, not dropped.
     #[test]
     fn fit_truncates_oversized_tail_text_item() {

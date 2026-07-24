@@ -10,6 +10,47 @@ impl SessionActor {
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
+        // This guard is intentionally the first operation: rejected switches
+        // must not mutate thresholds, credentials, prompts, signals, or
+        // persistence/notification state.
+        let mut conversation = self.chat_state_handle.get_conversation().await;
+        let account = sampling_config
+            .extra_headers
+            .iter()
+            .rev()
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+            })
+            .map(|(_, value)| value.as_str());
+        let compatibility = xai_grok_sampling_types::native_compaction_compatibility(&conversation)
+            .map_err(|message| acp::Error::invalid_params().data(message))?;
+        if let Some(expected) = compatibility {
+            let compatible = expected.matches_origin(
+                &sampling_config.api_backend,
+                &sampling_config.base_url,
+                &sampling_config.model,
+                account,
+            );
+            if !compatible {
+                return Err(acp::Error::invalid_params().data(
+                    "session contains identity-bound native Codex compaction history; backend, API, model, and ChatGPT account must exactly match its origin",
+                ));
+            }
+        }
+        if xai_grok_sampling_types::strip_incompatible_response_metadata(
+            &mut conversation,
+            &sampling_config.api_backend,
+            &sampling_config.base_url,
+            &sampling_config.model,
+            account,
+        ) {
+            // Full replacement deliberately persists the one-way migration so
+            // stale provider metadata cannot return after a cold restart. The
+            // read barrier confirms the chat-state actor processed the replace
+            // before the model switch reports success.
+            self.chat_state_handle.replace_conversation(conversation);
+            let _ = self.chat_state_handle.get_conversation().await;
+        }
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {

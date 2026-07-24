@@ -212,11 +212,21 @@ mod tests {
     fn snapshot_round_trips_with_data() {
         use xai_grok_sampling_types::ConversationItem;
 
+        let mut retained_user = ConversationItem::user("Hello!");
+        if let ConversationItem::User(user) = &mut retained_user {
+            user.response_item_id = Some("msg_snapshot_user".into());
+        }
         let snapshot = ChatStateSnapshot {
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
-                ConversationItem::user("Hello!"),
+                retained_user,
                 ConversationItem::assistant("Hi there!"),
+                ConversationItem::Compaction(
+                    xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                        id: Some("cmp_snapshot".into()),
+                        encrypted_content: "encrypted-checkpoint-context".into(),
+                    },
+                ),
             ],
             sampling_config: SamplingConfig {
                 base_url: "https://api.example.com".to_string(),
@@ -251,7 +261,19 @@ mod tests {
 
         assert_eq!(deserialized.prompt_index, 5);
         assert_eq!(deserialized.total_tokens, 1234);
-        assert_eq!(deserialized.conversation.len(), 3);
+        assert_eq!(deserialized.conversation.len(), 4);
+        assert!(matches!(
+            &deserialized.conversation[1],
+            ConversationItem::User(user)
+                if user.response_item_id.as_deref() == Some("msg_snapshot_user")
+        ));
+        match &deserialized.conversation[3] {
+            ConversationItem::Compaction(item) => {
+                assert_eq!(item.id.as_deref(), Some("cmp_snapshot"));
+                assert_eq!(item.encrypted_content, "encrypted-checkpoint-context");
+            }
+            other => panic!("expected persisted native compaction item, got {other:?}"),
+        }
         assert_eq!(deserialized.agent_edited_paths.len(), 2);
         assert_eq!(deserialized.prompt_texts.len(), 2);
         assert_eq!(deserialized.stream_start_ms, Some(1234567890));

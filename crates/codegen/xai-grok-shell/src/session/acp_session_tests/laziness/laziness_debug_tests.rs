@@ -19,6 +19,7 @@ use xai_grok_sampling_types::{
 fn user_text(text: &str) -> ConversationItem {
     ConversationItem::User(UserItem {
         content: vec![ContentPart::Text { text: text.into() }],
+        response_item_id: None,
         synthetic_reason: None,
         ..Default::default()
     })
@@ -27,6 +28,7 @@ fn user_text(text: &str) -> ConversationItem {
 fn assistant_text(text: &str) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
         content: text.into(),
+        response_item_id: None,
         tool_calls: vec![],
         model_id: None,
         model_fingerprint: None,
@@ -37,6 +39,7 @@ fn assistant_text(text: &str) -> ConversationItem {
 fn assistant_with_tool_call(text: &str, name: &str, args: &str) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
         content: text.into(),
+        response_item_id: None,
         tool_calls: vec![ToolCall {
             id: "call-1".into(),
             name: name.to_string(),
@@ -82,6 +85,7 @@ fn assistant_with_reasoning_items(
     }
     out.push(ConversationItem::Assistant(AssistantItem {
         content: content.into(),
+        response_item_id: None,
         tool_calls,
         model_id: None,
         model_fingerprint: None,
@@ -201,6 +205,7 @@ fn flatten_skips_reasoning_when_encrypted_only() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "ok".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -233,6 +238,7 @@ fn flatten_skips_reasoning_when_text_is_empty() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "ok".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -373,6 +379,7 @@ fn synthetic_user_text(
 ) -> ConversationItem {
     ConversationItem::User(UserItem {
         content: vec![ContentPart::Text { text: text.into() }],
+        response_item_id: None,
         synthetic_reason: Some(reason),
         ..Default::default()
     })
@@ -534,6 +541,7 @@ fn window_assistant_text_pin_skips_empty_assistant_turns() {
     // — they have no prose for the classifier to interpret.
     let empty_asst = ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
         content: String::new().into(),
+        response_item_id: None,
         tool_calls: vec![xai_grok_sampling_types::ToolCall {
             id: "c".into(),
             name: "read_file".into(),

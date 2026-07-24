@@ -109,6 +109,7 @@ fn user_request(text: &str) -> ConversationRequest {
             content: vec![xai_grok_sampling_types::ContentPart::Text {
                 text: std::sync::Arc::<str>::from(text),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })],

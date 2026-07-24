@@ -967,6 +967,7 @@ fn verbatim_fork_keeps_items_byte_for_byte_when_small() {
                 content: vec![ContentPart::Text {
                     text: "SYNTHETIC_KEEP_ME".into(),
                 }],
+                response_item_id: None,
                 synthetic_reason: Some(SyntheticReason::SystemReminder),
                 ..Default::default()
             }),
@@ -1029,6 +1030,7 @@ fn verbatim_fork_falls_back_to_summary_on_incomplete_tail() {
             ConversationItem::user("q2"),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
                     name: "bash".into(),
@@ -1179,6 +1181,29 @@ fn fork_context_normalized_only_for_summarized() {
             summarized.verbatim_fork
         ));
 }
+fn bootstrap_sampler_config() -> xai_grok_sampler::SamplerConfig {
+    xai_grok_sampler::SamplerConfig {
+        model: "m".to_string(),
+        context_window: 128_000,
+        ..Default::default()
+    }
+}
+
+fn native_bootstrap_sampler_config(context_window: u64) -> xai_grok_sampler::SamplerConfig {
+    let mut config = xai_grok_sampler::SamplerConfig {
+        base_url: xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string(),
+        model: "gpt-native".to_string(),
+        api_backend: xai_grok_sampling_types::ApiBackend::Responses,
+        context_window,
+        ..Default::default()
+    };
+    config.extra_headers.insert(
+        xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+        "acct-native".to_string(),
+    );
+    config
+}
+
 fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
     SubagentRequest {
         id: "bootstrap-test".into(),
@@ -1213,7 +1238,7 @@ async fn bootstrap_no_fork_is_new() {
             &child,
             Path::new("/tmp"),
             "m",
-            128_000,
+            &bootstrap_sampler_config(),
         )
         .await;
     match out {
@@ -1242,7 +1267,7 @@ async fn bootstrap_fork_without_parent_fails_open() {
             &child,
             Path::new("/tmp"),
             "m",
-            128_000,
+            &bootstrap_sampler_config(),
         )
         .await;
     match out {
@@ -1282,7 +1307,7 @@ async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
             &child,
             Path::new("/tmp"),
             "m",
-            128_000,
+            &bootstrap_sampler_config(),
         )
         .await;
     match out {
@@ -1331,6 +1356,311 @@ async fn bootstrap_fork_live_parent_chat_state_is_forked_with_marker() {
         BootstrapInitialContext::ResumeAbort(m) => panic!("unexpected abort: {m}"),
     }
 }
+fn native_test_compatibility(
+    item_id: Option<&str>,
+) -> xai_grok_sampling_types::NativeCompactionCompatibility {
+    let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
+        "gpt-native",
+        Some("acct-native".to_string()),
+    );
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+        item_id: item_id.map(str::to_string),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    compatibility
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_native_fork_that_would_require_summarization() {
+    let req = bootstrap_test_request(true);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let chat = spawn_test_parent_chat_state("gpt-native");
+    chat.replace_conversation(vec![
+        ConversationItem::system("parent system"),
+        ConversationItem::NativeCompactionMetadata(native_test_compatibility(Some(
+            "cmp-native",
+        ))),
+        ConversationItem::Compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-native".to_string()),
+                encrypted_content: "opaque".to_string(),
+            },
+        ),
+        ConversationItem::assistant("complete tail"),
+    ]);
+    ctx.parent_chat_state = Some(chat);
+    ctx.parent_session_info = None;
+    let child = SessionInfo {
+        id: acp::SessionId::new("child-native-refusal"),
+        cwd: "/tmp".into(),
+    };
+
+    let out = bootstrap_initial_context(
+        &req,
+        None,
+        &ctx,
+        &child,
+        Path::new("/tmp"),
+        "gpt-native",
+        &native_bootstrap_sampler_config(1),
+    )
+    .await;
+
+    match out {
+        BootstrapInitialContext::ResumeAbort(message) => {
+            assert!(message.contains("can only be inherited verbatim"), "{message}");
+        }
+        BootstrapInitialContext::Ready(_) => {
+            panic!("summarized native fork must fail closed instead of omitting opaque context")
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn disk_bootstrap_decides_native_verbatim_from_authoritative_snapshot() {
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+    use crate::session::storage::{SessionUpdate, StorageAdapter};
+    use crate::session::storage::jsonl::JsonlStorageAdapter;
+    use xai_grok_test_support::env::EnvGuard;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let _home = EnvGuard::set("GROK_HOME", home.path());
+    let storage = JsonlStorageAdapter::with_root(home.path().to_path_buf());
+    let parent = SessionInfo {
+        id: acp::SessionId::new("authoritative-native-parent"),
+        cwd: "/workspace".into(),
+    };
+    storage.init_session(&parent, acp::ModelId::new("gpt-native")).await.unwrap();
+    let stale = vec![
+        ConversationItem::system("stale system"),
+        ConversationItem::user("stale ordinary cache"),
+        ConversationItem::assistant("stale answer"),
+    ];
+    storage.replace_chat_history(&parent, &stale).await.unwrap();
+    let authoritative = vec![
+        ConversationItem::system("native system"),
+        ConversationItem::NativeCompactionMetadata(native_test_compatibility(Some("cmp-auth"))),
+        ConversationItem::Compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+            id: Some("cmp-auth".into()),
+            encrypted_content: "authoritative cipher".into(),
+        }),
+        ConversationItem::User(xai_grok_sampling_types::UserItem {
+            content: vec![xai_grok_sampling_types::ContentPart::Text {
+                text: "synthetic must remain exact".into(),
+            }],
+            synthetic_reason: Some(xai_grok_sampling_types::SyntheticReason::SystemReminder),
+            ..Default::default()
+        }),
+        ConversationItem::assistant("complete native tail"),
+    ];
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: parent.id.clone(),
+        update: XaiSessionUpdate::RewindMarker {
+            target_prompt_index: 1,
+            transaction_id: Some("native-authoritative-rewind".into()),
+            rewound_history_json: Some(serde_json::to_string(&authoritative).unwrap()),
+            created_at: "2026-07-26T00:00:00Z".into(),
+        },
+        meta: None,
+    }));
+    storage.append_update_durable_commit_aware(&parent, &marker).await.unwrap();
+
+    let request = bootstrap_test_request(true);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.parent_session_info = Some(parent.clone());
+    let child = SessionInfo {
+        id: acp::SessionId::new("authoritative-native-child"),
+        cwd: "/workspace".into(),
+    };
+    let child_dir = crate::session::persistence::session_dir(&child);
+    let result = bootstrap_initial_context(
+        &request,
+        None,
+        &ctx,
+        &child,
+        &child_dir,
+        "gpt-native",
+        &native_bootstrap_sampler_config(128_000),
+    )
+    .await;
+    let BootstrapInitialContext::Ready(initial) = result else {
+        panic!("compatible authoritative native history must fork verbatim")
+    };
+    assert!(initial.verbatim_fork);
+    assert_eq!(
+        serde_json::to_value(&initial.conversation).unwrap(),
+        serde_json::to_value(&authoritative).unwrap()
+    );
+    let copied = storage.load_chat_history_from_dir(&child_dir).unwrap();
+    assert_eq!(
+        serde_json::to_value(copied).unwrap(),
+        serde_json::to_value(authoritative).unwrap()
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn disk_bootstrap_filters_authoritative_ordinary_snapshot_not_stale_cache() {
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+    use crate::session::storage::{SessionUpdate, StorageAdapter};
+    use crate::session::storage::jsonl::JsonlStorageAdapter;
+    use xai_grok_test_support::env::EnvGuard;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let _home = EnvGuard::set("GROK_HOME", home.path());
+    let storage = JsonlStorageAdapter::with_root(home.path().to_path_buf());
+    let parent = SessionInfo {
+        id: acp::SessionId::new("authoritative-ordinary-parent"),
+        cwd: "/workspace".into(),
+    };
+    storage.init_session(&parent, acp::ModelId::new("grok-test")).await.unwrap();
+    storage
+        .replace_chat_history(
+            &parent,
+            &[
+                ConversationItem::system("stale system"),
+                ConversationItem::user("STALE_CACHE_MUST_NOT_WIN"),
+                ConversationItem::assistant("stale"),
+            ],
+        )
+        .await
+        .unwrap();
+    let authoritative = vec![
+        ConversationItem::system("authoritative system"),
+        ConversationItem::user("AUTHORITATIVE_ORDINARY"),
+        ConversationItem::User(xai_grok_sampling_types::UserItem {
+            content: vec![xai_grok_sampling_types::ContentPart::Text {
+                text: "SYNTHETIC_FILTER_ME".into(),
+            }],
+            synthetic_reason: Some(xai_grok_sampling_types::SyntheticReason::SystemReminder),
+            ..Default::default()
+        }),
+        ConversationItem::ResponseOutputMetadata(
+            xai_grok_sampling_types::ResponseOutputItemMetadata {
+                response_id: "resp-authoritative".into(),
+                output_items: 1,
+                items: vec![xai_grok_sampling_types::ResponseOutputItemOrder {
+                    output_index: 0,
+                    kind: xai_grok_sampling_types::ResponseOutputItemKind::Message,
+                    item_id: Some("msg-authoritative".into()),
+                    call_id: None,
+                    internal_chat_message_metadata_passthrough: Some(
+                        xai_grok_sampling_types::InternalChatMessageMetadataPassthrough {
+                            turn_id: Some("turn-authoritative".into()),
+                        },
+                    ),
+                }],
+                origin: None,
+            },
+        ),
+        ConversationItem::Assistant(xai_grok_sampling_types::AssistantItem {
+            content: "authoritative answer".into(),
+            response_item_id: Some("msg-authoritative".into()),
+            tool_calls: vec![],
+            model_id: Some("grok-test".into()),
+            model_fingerprint: None,
+            reasoning_effort: None,
+        }),
+    ];
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: parent.id.clone(),
+        update: XaiSessionUpdate::RewindMarker {
+            target_prompt_index: 1,
+            transaction_id: Some("ordinary-authoritative-rewind".into()),
+            rewound_history_json: Some(serde_json::to_string(&authoritative).unwrap()),
+            created_at: "2026-07-26T00:00:00Z".into(),
+        },
+        meta: None,
+    }));
+    storage.append_update_durable_commit_aware(&parent, &marker).await.unwrap();
+
+    let request = bootstrap_test_request(true);
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    ctx.parent_chat_state = None;
+    ctx.parent_session_info = Some(parent.clone());
+    let child = SessionInfo {
+        id: acp::SessionId::new("authoritative-ordinary-child"),
+        cwd: "/workspace".into(),
+    };
+    let child_dir = crate::session::persistence::session_dir(&child);
+    let result = bootstrap_initial_context(
+        &request,
+        None,
+        &ctx,
+        &child,
+        &child_dir,
+        "grok-test",
+        &bootstrap_sampler_config(),
+    )
+    .await;
+    let initial = match result {
+        BootstrapInitialContext::Ready(initial) => initial,
+        BootstrapInitialContext::ResumeAbort(message) => {
+            panic!("ordinary authoritative history should use filtered fork: {message}")
+        }
+    };
+    assert!(
+        initial.copy_error.is_none(),
+        "ordinary authoritative copy unexpectedly failed: {:?}",
+        initial.copy_error
+    );
+    assert!(!initial.verbatim_fork);
+    let rendered = initial.conversation.iter().map(ConversationItem::text_content).collect::<String>();
+    assert!(rendered.contains("AUTHORITATIVE_ORDINARY"));
+    assert!(!rendered.contains("STALE_CACHE_MUST_NOT_WIN"));
+    assert!(!rendered.contains("SYNTHETIC_FILTER_ME"));
+    let copied = storage.load_chat_history_from_dir(&child_dir).unwrap();
+    let copied_text = copied.iter().map(ConversationItem::text_content).collect::<String>();
+    assert!(copied_text.contains("AUTHORITATIVE_ORDINARY"));
+    assert!(!copied_text.contains("STALE_CACHE_MUST_NOT_WIN"));
+    assert!(!copied_text.contains("SYNTHETIC_FILTER_ME"));
+    assert!(copied.iter().any(|item| matches!(
+        item,
+        ConversationItem::ResponseOutputMetadata(metadata)
+            if metadata.items[0].item_id.as_deref() == Some("msg-authoritative")
+                && metadata.items[0]
+                    .internal_chat_message_metadata_passthrough
+                    .as_ref()
+                    .and_then(|value| value.turn_id.as_deref())
+                    == Some("turn-authoritative")
+    )));
+}
+
+#[test]
+fn native_fork_identity_requires_exact_model_and_account() {
+    let items = vec![ConversationItem::NativeCompactionMetadata(
+        native_test_compatibility(None),
+    ),
+        ConversationItem::Compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: None,
+                encrypted_content: "opaque".to_string(),
+            },
+        ),
+    ];
+    let exact = native_bootstrap_sampler_config(128_000);
+    assert_eq!(native_history_replayability(&items, &exact), Ok(true));
+
+    let mut wrong_model = exact.clone();
+    wrong_model.model = "gpt-other".to_string();
+    assert!(native_history_replayability(&items, &wrong_model).is_err());
+    let mut wrong_account = exact;
+    wrong_account.extra_headers.insert(
+        xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+        "acct-other".to_string(),
+    );
+    assert!(native_history_replayability(&items, &wrong_account).is_err());
+}
+
 #[tokio::test]
 async fn copy_session_data_preserves_parent_chat_history() {
     use crate::sampling::ConversationItem;
@@ -1835,6 +2165,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(256_000).unwrap(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
             use_concise: false,
             agent_type: crate::agent::config::default_agent_type(),

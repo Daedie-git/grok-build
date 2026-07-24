@@ -1678,6 +1678,7 @@ fn make_entry_config_with_id(
         api_backend: Default::default(),
         context_window: std::num::NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
+        auto_compact_token_limit: None,
         system_prompt_label: None,
         extra_headers: IndexMap::new(),
         api_base_url: None,

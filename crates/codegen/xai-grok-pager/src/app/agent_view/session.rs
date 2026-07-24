@@ -117,7 +117,10 @@ impl AgentView {
             context_state: None,
             chat_kind: false,
             app_chat_mode: false,
+            tier_restricted_commands: Vec::new(),
             credit_balance: None,
+            codex_rate_limits: None,
+            codex_rate_limits_generation: 0,
             auto_topup: None,
             goal_state: None,
             workflow_blocks: std::collections::HashMap::new(),
@@ -851,6 +854,17 @@ impl AgentView {
         self.credit_balance = balance;
         self.auto_topup = auto_topup;
     }
+
+    /// Apply ChatGPT/Codex account rate-limit windows for Codex-backed models.
+    pub fn apply_codex_rate_limits(
+        &mut self,
+        limits: xai_grok_shell::extensions::codex_usage::CodexRateLimits,
+    ) {
+        if !self.chat_kind {
+            self.codex_rate_limits = Some(limits);
+        }
+    }
+
     /// Record a key event to the input flight recorder.
     ///
     /// Zero heap allocations — stores raw `Copy` types in the ring buffer.
@@ -921,7 +935,24 @@ impl AgentView {
     /// registry (e.g. `/usage` denied on the free / X Basic tiers). Deny
     /// wins over every `set_*_visible` gate.
     pub fn set_restricted_commands(&mut self, names: &[String]) {
-        self.prompt.set_restricted_commands(names);
+        self.tier_restricted_commands = names.to_vec();
+        self.refresh_restricted_commands_for_model();
+    }
+
+    /// Reapply the stored app-level deny list after a local or remote model switch.
+    pub fn refresh_restricted_commands_for_model(&mut self) {
+        if self.session.models.current_model_is_codex() {
+            let filtered: Vec<String> = self
+                .tier_restricted_commands
+                .iter()
+                .filter(|name| !name.eq_ignore_ascii_case("usage"))
+                .cloned()
+                .collect();
+            self.prompt.set_restricted_commands(&filtered);
+        } else {
+            self.prompt
+                .set_restricted_commands(&self.tier_restricted_commands);
+        }
     }
     /// Show or hide the `/dashboard` slash command in this agent's registry.
     /// Driven by the dashboard feature flag

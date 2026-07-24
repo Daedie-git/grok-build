@@ -584,6 +584,7 @@ pub fn build_classifier_request(
                      === END TRANSCRIPT ===\n"
                 )),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }),
@@ -1367,6 +1368,7 @@ mod tests {
     fn assistant_with_tool_calls(tool_calls: Vec<ToolCall>) -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls,
             model_id: None,
             model_fingerprint: None,
@@ -1926,11 +1928,13 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: format!("u{i}").into(),
                 }],
+                response_item_id: None,
                 synthetic_reason: None,
                 ..Default::default()
             }));
             hist.push(ConversationItem::Assistant(AssistantItem {
                 content: format!("a{i}").into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -1941,6 +1945,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "ulast-MARKER-tail".into(),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }));
@@ -2523,11 +2528,13 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: format!("u{i}").into(),
                 }],
+                response_item_id: None,
                 synthetic_reason: None,
                 ..Default::default()
             }));
             hist.push(ConversationItem::Assistant(AssistantItem {
                 content: format!("a{i}").into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -2538,6 +2545,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "ulast".into(),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }));
@@ -2923,6 +2931,7 @@ mod tests {
                     },
                     after_state_history: vec![ConversationItem::User(UserItem {
                         content: vec![ContentPart::Text { text: "hi".into() }],
+                        response_item_id: None,
                         synthetic_reason: None,
                         ..Default::default()
                     })],
@@ -2939,6 +2948,7 @@ mod tests {
                     },
                     after_state_history: vec![ConversationItem::User(UserItem {
                         content: vec![ContentPart::Text { text: "hi".into() }],
+                        response_item_id: None,
                         synthetic_reason: None,
                         ..Default::default()
                     })],

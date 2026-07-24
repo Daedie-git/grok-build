@@ -164,12 +164,14 @@ async fn create_test_actor_with_memory(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
         },
         memory: crate::session::memory_state::SessionMemory {
             flush_config: memory_config

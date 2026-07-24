@@ -732,16 +732,15 @@ fn session_token_auth_gate_truth_table() {
         assert!(!gate(false, ModelByok::NotByok, fp));
         assert!(!gate(false, ModelByok::Byok, fp));
         assert!(!gate(false, ModelByok::Unknown, fp));
-        // Session method: a definite classification ignores the endpoint —
-        // NotByok always refreshes (only ever routes to the session endpoint),
-        // a genuine per-model Byok never does.
-        assert!(gate(true, ModelByok::NotByok, fp));
+        // A genuine per-model Byok never attaches the session resolver.
         assert!(!gate(true, ModelByok::Byok, fp));
     }
-    // Session method + Unknown BYOK: refresh only against a first-party xAI
-    // host, so a transiently-unclassifiable config can't demote a live session
-    // (the stale-token 401 regression) yet the session token never leaks to a
-    // third-party BYOK endpoint. This arm was unconditionally `false` pre-fix.
+    // Session method + NotByok / Unknown: refresh only against a first-party
+    // xAI host. Non-first-party bases (Codex ChatGPT backend, third-party BYOK
+    // hosts) keep their own credentials — the live OIDC bearer must not
+    // overwrite them on the wire.
+    assert!(gate(true, ModelByok::NotByok, true));
+    assert!(!gate(true, ModelByok::NotByok, false));
     assert!(gate(true, ModelByok::Unknown, true));
     assert!(!gate(true, ModelByok::Unknown, false));
 }

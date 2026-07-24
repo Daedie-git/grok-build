@@ -2207,6 +2207,7 @@ fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
             env_http_headers: IndexMap::new(),
             context_window: std::num::NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
             use_concise: false,
             agent_type: config::default_agent_type(),

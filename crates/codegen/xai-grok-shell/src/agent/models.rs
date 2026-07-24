@@ -529,7 +529,20 @@ impl ModelsManager {
             .read()
             .models
             .get(model_id)
-            .and_then(|e| e.info().compaction_at_tokens)
+            .and_then(|entry| {
+                let info = entry.info();
+                if xai_grok_sampling_types::capabilities_for_base_url(&info.base_url)
+                    .provider_auto_compact_safety
+                {
+                    info.auto_compact_token_limit
+                        .map(|limit| {
+                            xai_grok_sampling_types::CompactionAtTokens::Fixed(limit.get())
+                        })
+                        .or(info.compaction_at_tokens)
+                } else {
+                    info.compaction_at_tokens
+                }
+            })
     }
 
     /// Catalog opt-in to display the served-checkpoint fingerprint for this model.

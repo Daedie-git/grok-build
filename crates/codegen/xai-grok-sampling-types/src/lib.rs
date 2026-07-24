@@ -6,14 +6,32 @@
 //! no file system access) so it can be depended on by downstream crates
 //! (e.g., `xai-chat-state`) without pulling in the full `xai-grok-shell`.
 
+pub mod codex;
 pub mod conversation;
 pub mod doom_loop;
 pub mod error;
 pub mod messages;
+pub mod provider_capabilities;
 pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
 
+pub use self::codex::{
+    CHATGPT_ACCOUNT_ID_HEADER, CODEX_ACCOUNT_USAGE_URL, CODEX_BACKEND_BASE_URL,
+    CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL, CapturedResponseOutputItem,
+    CapturedResponseOutputItemValue, CodexCompactInputItem, CodexCompactMessage,
+    CodexCompactMessageContent, CodexCompactOutputItem, CodexCompactRequest, CodexCompactResponse,
+    CodexCompactTypedInputItem, CodexStreamAccumulator, DecodedResponse,
+    DecodedResponseStreamEvent, ResponsesStreamAccumulator,
+    captured_response_to_conversation_items, codex_compact_output_to_conversation,
+    conversation_request_to_codex_compact_request,
+    conversation_request_to_codex_compact_request_for_origin,
+    conversation_request_to_codex_create_response, is_codex_backend_url,
+    model_rejects_reasoning_summary, normalize_create_response_for_codex,
+    patch_response_item_metadata_passthrough, patch_response_message_item_ids,
+    response_item_metadata_passthrough, response_item_metadata_passthrough_for_origin,
+    response_message_item_ids,
+};
 pub use self::conversation::*;
 pub use self::doom_loop::{
     DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER, DoomLoopPeek, DoomLoopRecoveryPolicy,
@@ -22,6 +40,9 @@ pub use self::doom_loop::{
 pub use self::error::{
     EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
     is_context_length_error, status_user_message, user_facing_api_error_message,
+};
+pub use self::provider_capabilities::{
+    HostedToolPolicy, ProviderCapabilities, capabilities_for_base_url,
 };
 pub use self::tool_overrides::{
     ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,

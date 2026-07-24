@@ -464,7 +464,10 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if compactions_remaining.is_some() || compaction_at_tokens.is_some() {
+        if !xai_grok_sampling_types::capabilities_for_base_url(&cfg.base_url)
+            .skip_grok_compaction_headers
+            && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
+        {
             let has_compaction_summary = self
                 .chat_state_handle
                 .get_last_compaction_prompt_index()
@@ -724,6 +727,15 @@ impl SessionActor {
         &self,
         force_http1: bool,
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
+        if self
+            .compaction
+            .reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(acp::Error::internal_error().data(
+                "session persistence outcome is ambiguous; reload the session before sampling again",
+            ));
+        }
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
@@ -825,6 +837,7 @@ impl SessionActor {
                     tokens_used: total_tokens,
                     context_window: cw,
                     percentage,
+                    kind: compaction::AutoCompactTriggerKind::SoftThreshold,
                 };
                 if let Err(e) = self.run_compact_only(trigger_info).await {
                     if Self::is_auth_compact_error(&e) {
@@ -1119,6 +1132,15 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        if self
+            .compaction
+            .reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(acp::Error::internal_error().data(
+                "session persistence outcome is ambiguous; reload the session before sampling again",
+            ));
+        }
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();

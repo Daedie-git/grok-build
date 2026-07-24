@@ -99,10 +99,11 @@ pub fn normalize_forked_context(items: Vec<ConversationItem>) -> (Vec<Conversati
 /// Returns a vec of indices where each complete turn ends (exclusive).
 /// A turn is: one or more consecutive User messages, followed by an
 /// Assistant message, followed by zero or more ToolResult messages.
-/// Real histories interleave `Reasoning` (and `BackendToolCall`) siblings,
-/// so those are skipped both before the Assistant and within the
-/// post-assistant tool-result run — otherwise long forked histories would
-/// register zero turns and never summarize, blowing up token usage.
+/// Real histories interleave Responses metadata, `Reasoning`, and
+/// `BackendToolCall` siblings, so those are skipped both before the Assistant
+/// and within the post-assistant tool-result run — otherwise long forked
+/// histories would register zero turns and never summarize, blowing up token
+/// usage.
 ///
 /// NOTE: this is one of two reasoning-aware turn-boundary scanners that must move
 /// together — the other is `fork_filter_chat` in
@@ -122,11 +123,14 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
         while i < items.len() && matches!(items[i], ConversationItem::User(_)) {
             i += 1;
         }
-        // Skip Reasoning / BackendToolCall siblings that precede the Assistant.
+        // Skip transport metadata / Reasoning / BackendToolCall siblings that
+        // precede the Assistant.
         while i < items.len()
             && matches!(
                 items[i],
-                ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+                ConversationItem::ResponseOutputMetadata(_)
+                    | ConversationItem::Reasoning(_)
+                    | ConversationItem::BackendToolCall(_)
             )
         {
             i += 1;
@@ -137,11 +141,13 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
         }
         i += 1; // skip past Assistant
         // Consume the post-assistant run: ToolResults plus interleaved
-        // Reasoning / BackendToolCall siblings, until the next User/Assistant.
+        // transport metadata / Reasoning / BackendToolCall siblings, until the
+        // next User/Assistant.
         while i < items.len()
             && matches!(
                 items[i],
                 ConversationItem::ToolResult(_)
+                    | ConversationItem::ResponseOutputMetadata(_)
                     | ConversationItem::Reasoning(_)
                     | ConversationItem::BackendToolCall(_)
             )
@@ -332,7 +338,10 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
         // Reasoning siblings don't enter the fork-background rendering —
         // they're rendered (when needed) inline with the surrounding
         // assistant turn elsewhere.
-        ConversationItem::Reasoning(_) => {}
+        ConversationItem::ResponseOutputMetadata(_)
+        | ConversationItem::Reasoning(_)
+        | ConversationItem::NativeCompactionMetadata(_)
+        | ConversationItem::Compaction(_) => {}
     }
 }
 

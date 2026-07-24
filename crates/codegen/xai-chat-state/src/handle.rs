@@ -202,6 +202,29 @@ impl ChatStateHandle {
         self.send_replace(items, true);
     }
 
+    /// Install a compaction replacement already persisted by an acknowledged
+    /// transaction. Returns only after the actor has made it live and never
+    /// emits a duplicate persistence replacement.
+    pub async fn install_persisted_compaction(&self, items: Vec<ConversationItem>) -> Option<()> {
+        self.query("InstallPersistedCompaction", |reply| {
+            ChatStateCommand::InstallPersistedCompaction { items, reply }
+        })
+        .await
+    }
+
+    /// Install a complete rewind snapshot whose durable marker already
+    /// committed. Returns only after the actor made the snapshot live and does
+    /// not persist history a second time.
+    pub async fn install_persisted_rewind(&self, snapshot: ChatStateSnapshot) -> Option<()> {
+        self.query("InstallPersistedRewind", |reply| {
+            ChatStateCommand::InstallPersistedRewind {
+                snapshot: Box::new(snapshot),
+                reply,
+            }
+        })
+        .await
+    }
+
     fn send_replace(&self, items: Vec<ConversationItem>, is_compaction: bool) {
         let _ = self.cmd_tx.send(ChatStateCommand::ReplaceConversation {
             items,
@@ -266,6 +289,12 @@ impl ChatStateHandle {
         let _ = self
             .cmd_tx
             .send(ChatStateCommand::RestoreSnapshot(Box::new(snapshot)));
+    }
+
+    /// Start a fresh process-local Codex sticky-routing scope. Call exactly
+    /// once before the first model request of every prompt turn.
+    pub fn begin_codex_turn(&self) {
+        let _ = self.cmd_tx.send(ChatStateCommand::BeginCodexTurn);
     }
 
     /// Begin capturing turn messages. Call at the start of a real user turn
@@ -370,6 +399,16 @@ impl ChatStateHandle {
         })
         .await
         .unwrap_or(0)
+    }
+
+    /// Clone the current turn's process-local Codex sticky-routing state.
+    pub async fn get_codex_turn_state(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::OnceLock<String>>> {
+        self.query("GetCodexTurnState", |reply| {
+            ChatStateCommand::GetCodexTurnState { reply }
+        })
+        .await
     }
 
     /// Get the prompt index at which the last compaction occurred.

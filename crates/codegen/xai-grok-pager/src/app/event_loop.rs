@@ -2274,11 +2274,12 @@ pub(crate) async fn run(
 
             _ = billing_poll => {
                 billing_poll_at = None;
-                if let ActiveView::Agent(id) = app.active_view {
-                    let effs = vec![Effect::FetchBilling {
-                        agent_id: id,
-                        silent: true,
-                    }];
+                if let ActiveView::Agent(id) = app.active_view
+                    && let Some(agent) = app.agents.get_mut(&id)
+                {
+                    let effs = vec![super::dispatch::account_usage_refresh_effect(
+                        agent, id, true,
+                    )];
                     if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                         break;
                     }

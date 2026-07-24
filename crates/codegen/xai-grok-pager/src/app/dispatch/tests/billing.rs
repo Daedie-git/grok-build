@@ -541,6 +541,142 @@ fn show_usage_schedules_session_fetch_only() {
 }
 
 #[test]
+fn show_usage_on_codex_model_fetches_codex_limits_not_grok_billing() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let id = acp::ModelId::new(std::sync::Arc::from("custom-provider-model"));
+    let info = acp::ModelInfo::new(id.clone(), "Codex".to_string()).meta(
+        serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned(),
+    );
+    agent.session.models.available.insert(id.clone(), info);
+    agent.session.models.current = Some(id);
+
+    let effects = dispatch(Action::ShowUsage, &mut app);
+    assert!(is_session_usage_fetch(&effects));
+    let follow_up = complete_session_usage(&mut app, "test-session", Default::default());
+    assert!(matches!(
+        follow_up.as_slice(),
+        [Effect::FetchCodexRateLimits {
+            agent_id: AgentId(0),
+            silent: false,
+            generation: 1,
+        }]
+    ));
+}
+
+#[test]
+fn codex_rate_limit_result_renders_codex_windows() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex-test-model"));
+    let info = acp::ModelInfo::new(model_id.clone(), "Codex").meta(
+        serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned(),
+    );
+    agent
+        .session
+        .models
+        .available
+        .insert(model_id.clone(), info);
+    agent.session.models.current = Some(model_id);
+    agent.codex_rate_limits_generation = 1;
+    let limits = xai_grok_shell::extensions::codex_usage::CodexRateLimits {
+        plan_type: Some("plus".into()),
+        primary: Some(
+            xai_grok_shell::extensions::codex_usage::CodexRateLimitWindow {
+                used_percent: 11.0,
+                window_duration_mins: Some(300),
+                resets_at: None,
+            },
+        ),
+        secondary: Some(
+            xai_grok_shell::extensions::codex_usage::CodexRateLimitWindow {
+                used_percent: 42.0,
+                window_duration_mins: Some(10_080),
+                resets_at: None,
+            },
+        ),
+        credits: None,
+    };
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexRateLimitsFetched {
+            agent_id: AgentId(0),
+            limits,
+            silent: false,
+            generation: 1,
+        }),
+        &mut app,
+    );
+    let text = last_system_text(&app, AgentId(0));
+    assert!(text.contains("5-hour limit: 11% used"), "{text}");
+    assert!(text.contains("Weekly limit: 42% used"), "{text}");
+    assert!(!text.contains("Grok"), "{text}");
+}
+
+#[test]
+fn stale_codex_rate_limit_result_is_discarded() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex-test-model"));
+    let info = acp::ModelInfo::new(model_id.clone(), "Codex").meta(
+        serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned(),
+    );
+    agent
+        .session
+        .models
+        .available
+        .insert(model_id.clone(), info);
+    agent.session.models.current = Some(model_id);
+    agent.codex_rate_limits_generation = 2;
+    let before = agent_scrollback_len(&app);
+
+    dispatch(
+        Action::TaskComplete(TaskResult::CodexRateLimitsFetched {
+            agent_id: AgentId(0),
+            limits: xai_grok_shell::extensions::codex_usage::CodexRateLimits {
+                plan_type: None,
+                primary: None,
+                secondary: None,
+                credits: None,
+            },
+            silent: false,
+            generation: 1,
+        }),
+        &mut app,
+    );
+    assert_eq!(agent_scrollback_len(&app), before);
+    assert!(app.agents[&AgentId(0)].codex_rate_limits.is_none());
+}
+
+#[test]
+fn codex_model_removes_grok_tier_restriction_from_usage() {
+    let mut app = test_app_with_agent();
+    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+    let model_id = acp::ModelId::new(std::sync::Arc::from("codex-test-model"));
+    let info = acp::ModelInfo::new(model_id.clone(), "Codex").meta(
+        serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned(),
+    );
+    agent
+        .session
+        .models
+        .available
+        .insert(model_id.clone(), info);
+    agent.session.models.current = Some(model_id);
+    agent.set_restricted_commands(&["usage".to_string(), "voice".to_string()]);
+
+    let registry = agent.prompt.slash_controller.registry();
+    assert!(registry.get("usage").is_some());
+    assert_eq!(registry.restricted_commands(), vec!["voice"]);
+}
+
+#[test]
 fn show_usage_without_session_still_surfaces_credits() {
     let mut app = test_app_with_agent();
     app.agents.get_mut(&AgentId(0)).unwrap().session.session_id = None;

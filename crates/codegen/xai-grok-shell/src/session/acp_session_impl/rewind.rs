@@ -118,40 +118,6 @@ impl SessionActor {
         Ok(prompts)
     }
 
-    /// Check whether rewinding to `target_index` needs replay because a
-    /// compaction has occurred, meaning we need to replay `updates.jsonl`
-    /// to reconstruct the conversation.
-    ///
-    /// Always use replay when compaction has occurred, regardless of whether
-    /// the target is before, at, or after the compaction point.
-    ///
-    /// Post-compaction, the in-memory conversation has a different number of
-    /// User messages than `prompt_index` implies (compaction collapses N+1
-    /// user messages into ~3). `truncate_to_prompt_index` counts User items
-    /// to find the cut point, so it produces wrong results for ALL
-    /// post-compaction targets — not just at the boundary.
-    ///
-    /// `replay_to_prompt` reads `updates.jsonl` from scratch and handles
-    /// compaction checkpoints correctly, so it always produces the right
-    /// conversation regardless of target position.
-    async fn needs_compaction_replay(&self) -> bool {
-        let last = self
-            .chat_state_handle
-            .snapshot()
-            .await
-            .and_then(|s| s.last_compaction_prompt_index);
-        match last {
-            Some(compaction_at) => {
-                tracing::info!(
-                    compaction_at,
-                    "Compaction detected — using replay for rewind"
-                );
-                true
-            }
-            None => false,
-        }
-    }
-
     /// Handle a rewind request with mode support.
     ///
     /// Semantics: "restore state before prompt N ran" — prompts 0..N-1 are kept.
@@ -174,7 +140,13 @@ impl SessionActor {
         // reverts the on-disk snapshot index (bounded by `get_rewind_points`,
         // not the conversation), so it is exempt — the chat-state prompt index
         // is empty in bridge mode, where the conversation lives server-side.
-        let current_prompt_index = self.chat_state_handle.get_prompt_index().await;
+        // Capture one immutable source snapshot up front. The prepared rewind
+        // is derived from this clone and live state remains untouched until the
+        // durable marker commit has been acknowledged or exactly verified.
+        let live_snapshot = self.chat_state_handle.snapshot().await;
+        let current_prompt_index = live_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.prompt_index);
         if mode != RewindMode::FilesOnly && target_index >= current_prompt_index {
             return Ok(RewindResponse {
                 success: false,
@@ -281,8 +253,202 @@ impl SessionActor {
 
         // ── Commit mode (force=true): execute the rewind ─────────────
 
-        // Execute file revert
+        // File mutations are intentionally delayed until after a conversation
+        // marker commits, so a NotCommitted conversation rewind leaves both
+        // the old chat authority and the working tree untouched.
         let mut reverted_files = Vec::new();
+
+        // Prepare and commit the conversation rewind without mutating live state.
+        let mut prompt_text: Option<String> = None;
+        if wants_conversation_rewind {
+            use crate::extensions::notification::{
+                SessionNotification, SessionUpdate as XaiSessionUpdate,
+            };
+
+            let session_dir = crate::session::persistence::session_dir(&self.session_info);
+            let updates_path = session_dir.join("updates.jsonl");
+            let mut prepared_snapshot = live_snapshot.clone().ok_or_else(|| {
+                anyhow::anyhow!("chat-state actor unavailable while preparing rewind")
+            })?;
+            prompt_text = prepared_snapshot.prompt_texts.get(target_index).cloned();
+            let mut conversation = prepared_snapshot.conversation.clone();
+
+            // Cross-compaction replay recomputes whether a compaction summary
+            // survives; `None` keeps the existing marker (standard truncation).
+            let mut replay_compaction_marker: Option<Option<usize>> = None;
+            if prepared_snapshot.last_compaction_prompt_index.is_some() {
+                // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
+                // Run on the blocking pool since replay does synchronous file I/O
+                // (reading checkpoint files + scanning updates.jsonl).
+                let replay_updates = updates_path.clone();
+                let replay_session_dir = session_dir.clone();
+                let replay_result = tokio::task::spawn_blocking(move || {
+                    crate::session::helpers::replay::replay_to_prompt(
+                        &replay_updates,
+                        &replay_session_dir,
+                        target_index,
+                    )
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
+                match replay_result {
+                    Ok(replay_result) => {
+                        tracing::info!(
+                            target_index,
+                            prompt_index_reached = replay_result.prompt_index_reached,
+                            conversation_len = replay_result.conversation.len(),
+                            "Cross-compaction rewind: conversation reconstructed via replay"
+                        );
+                        replay_compaction_marker = Some(replay_result.last_compaction_prompt_index);
+                        if matches!(
+                            replay_result.conversation.first(),
+                            Some(ConversationItem::System(_))
+                        ) {
+                            conversation = replay_result.conversation;
+                        } else {
+                            if let Some(ui0) = replay_result.original_user_info {
+                                conversation.truncate(1);
+                                conversation.push(ConversationItem::user(ui0));
+                            } else {
+                                conversation.truncate(2);
+                            }
+                            conversation.extend(replay_result.conversation);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            ?e,
+                            target_index,
+                            "Cross-compaction replay failed — rewind aborted"
+                        );
+                        return Ok(RewindResponse {
+                            success: false,
+                            target_prompt_index: target_index,
+                            mode,
+                            reverted_files: vec![],
+                            clean_files: vec![],
+                            conflicts: vec![],
+                            prompt_text: None,
+                            error: Some(format!(
+                                "Cannot rewind to prompt #{} — compaction checkpoint data is \
+                                 unavailable ({e}). Try rewinding to a prompt after the \
+                                 compaction point instead.",
+                                target_index,
+                            )),
+                        });
+                    }
+                }
+            } else {
+                let keep_count = conversation_truncate_for_prompt(&conversation, target_index);
+                conversation.truncate(keep_count);
+            }
+
+            prepared_snapshot.conversation = conversation.clone();
+            prepared_snapshot.prompt_index = target_index;
+            prepared_snapshot.prompt_texts.truncate(target_index);
+            prepared_snapshot.last_compaction_prompt_index =
+                replay_compaction_marker.unwrap_or(prepared_snapshot.last_compaction_prompt_index);
+
+            let transaction_id = uuid::Uuid::new_v4().to_string();
+            let created_at = chrono::Utc::now().to_rfc3339();
+            let rewound_history_json = serde_json::to_string(&conversation).map_err(|error| {
+                anyhow::anyhow!("failed to serialize rewind transaction history: {error}")
+            })?;
+            let marker =
+                crate::session::storage::SessionUpdate::Xai(Box::new(SessionNotification {
+                    session_id: self.session_info.id.clone(),
+                    update: XaiSessionUpdate::RewindMarker {
+                        target_prompt_index: target_index,
+                        transaction_id: Some(transaction_id.clone()),
+                        rewound_history_json: Some(rewound_history_json),
+                        created_at: created_at.clone(),
+                    },
+                    meta: Some(self.build_notification_meta()),
+                }));
+            let (respond_to, response) = tokio::sync::oneshot::channel();
+            self.notifications
+                .persistence_tx
+                .send(PersistenceMsg::InstallRewindAndAck {
+                    marker,
+                    replacement: conversation.clone(),
+                    respond_to,
+                })
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "rewind persistence channel closed before marker commit; original history remains live"
+                    )
+                })?;
+
+            let verification_updates = updates_path.clone();
+            let verification_id = transaction_id.clone();
+            let verification_created_at = created_at.clone();
+            let verification_history = conversation.clone();
+            let verification_target = target_index;
+            let outcome =
+                crate::session::helpers::timeline_transaction::await_timeline_transaction(
+                    response,
+                    "rewind",
+                    move || {
+                        crate::session::helpers::replay::verify_rewind_commit(
+                            &verification_updates,
+                            &verification_id,
+                            verification_target,
+                            &verification_created_at,
+                            &verification_history,
+                        )
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    if error.requires_reconciliation() {
+                        self.compaction
+                            .reconciliation_required
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    anyhow::anyhow!("{}", error.message())
+                })?;
+            crate::session::helpers::timeline_transaction::ensure_timeline_committed(
+                outcome,
+                "rewind",
+                self.session_info.id.0.as_ref(),
+            )
+            .map_err(anyhow::Error::msg)?;
+
+            // The marker is now authoritative. Install the complete prepared
+            // snapshot with an acknowledged no-persistence actor command.
+            if self
+                .chat_state_handle
+                .install_persisted_rewind(prepared_snapshot)
+                .await
+                .is_none()
+            {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                anyhow::bail!(
+                    "rewind committed but could not be installed in live chat state; reload required"
+                );
+            }
+
+            if let Ok(mut pending) = self.rewind_pending_prompt.lock() {
+                *pending = prompt_text.clone();
+            }
+            if self
+                .compaction
+                .auto_compact_suppressed
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS
+            {
+                self.compaction.auto_compact_suppressed.store(
+                    crate::session::compaction_config::SUPPRESS_NONE,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+        }
+
+        // Apply working-tree changes only after the conversation commit/live
+        // install. FilesOnly has no conversation transaction and retains its
+        // existing independent behavior.
         if wants_file_revert {
             for (rel_path, content) in files_to_revert {
                 match &content {
@@ -307,171 +473,12 @@ impl SessionActor {
                             && let Err(e) = self.tool_context.fs.delete_file(&rel_path).await
                         {
                             tracing::warn!(?e, "Failed to delete file during rewind");
+                            continue;
                         }
                     }
                 }
                 reverted_files.push(rel_path.to_string());
             }
-        }
-
-        // Execute conversation rewind
-        let mut prompt_text: Option<String> = None;
-        if wants_conversation_rewind {
-            let session_dir = crate::session::persistence::session_dir(&self.session_info);
-            let updates_path = session_dir.join("updates.jsonl");
-
-            if let Some(snap) = self.chat_state_handle.snapshot().await {
-                prompt_text = snap.prompt_texts.get(target_index).cloned();
-            }
-
-            // Store for edit-and-retry detection in the next prompt() call
-            if let Ok(mut pending) = self.rewind_pending_prompt.lock() {
-                *pending = prompt_text.clone();
-            }
-
-            // Check cross-compaction before rewinding.
-            let needs_replay = self.needs_compaction_replay().await;
-
-            // Get conversation from the chat state actor for truncation logic.
-            let mut conversation = self.chat_state_handle.get_conversation().await;
-
-            // Cross-compaction replay recomputes whether a compaction summary
-            // survives; `None` keeps the existing marker (standard truncation).
-            let mut replay_compaction_marker: Option<Option<usize>> = None;
-
-            if needs_replay {
-                // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
-                // Run on the blocking pool since replay does synchronous file I/O
-                // (reading checkpoint files + scanning updates.jsonl).
-                let replay_updates = updates_path.clone();
-                let replay_session_dir = session_dir.clone();
-                let replay_target = target_index;
-                let replay_result = tokio::task::spawn_blocking(move || {
-                    crate::session::helpers::replay::replay_to_prompt(
-                        &replay_updates,
-                        &replay_session_dir,
-                        replay_target,
-                    )
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
-                match replay_result {
-                    Ok(replay_result) => {
-                        tracing::info!(
-                            target_index,
-                            prompt_index_reached = replay_result.prompt_index_reached,
-                            conversation_len = replay_result.conversation.len(),
-                            "Cross-compaction rewind: conversation reconstructed via replay"
-                        );
-                        // The rebuilt conversation drops the summary unless a
-                        // checkpoint survived; carry the recomputed marker to
-                        // the snapshot restore so the stale value isn't reused.
-                        replay_compaction_marker = Some(replay_result.last_compaction_prompt_index);
-                        // The replay result may or may not include the session
-                        // preamble (System + User(user_info)):
-                        // - Checkpoint loaded (target >= compaction_at): the
-                        //   checkpoint's compacted_history already has System +
-                        //   User prefix. Use directly.
-                        // - Raw updates (target < compaction_at): replay only
-                        //   accumulates user/agent turns from updates.jsonl.
-                        //   Prepend System + original User(user_info) so the
-                        //   model sees the same preamble it originally saw.
-                        if matches!(
-                            replay_result.conversation.first(),
-                            Some(ConversationItem::System(_))
-                        ) {
-                            conversation = replay_result.conversation;
-                        } else {
-                            // Keep System (index 0). Replace User(user_info) at
-                            // index 1 with the original from the checkpoint if
-                            // available, otherwise keep the current one.
-                            if let Some(ui0) = replay_result.original_user_info {
-                                conversation.truncate(1); // keep System only
-                                conversation.push(ConversationItem::user(ui0));
-                            } else {
-                                conversation.truncate(2); // keep System + current user_info
-                            }
-                            conversation.extend(replay_result.conversation);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            ?e,
-                            target_index,
-                            "Cross-compaction replay failed — rewind aborted"
-                        );
-                        // Do NOT fall back to truncation: the post-compaction
-                        // conversation has wrong user-message counts, and raw
-                        // replay without a checkpoint produces an oversized
-                        // conversation that will exceed the context window.
-                        // Return a clear error so the user can rewind to a
-                        // different (post-compaction) prompt instead.
-                        return Ok(RewindResponse {
-                            success: false,
-                            target_prompt_index: target_index,
-                            mode,
-                            reverted_files: vec![],
-                            clean_files: vec![],
-                            conflicts: vec![],
-                            prompt_text: None,
-                            error: Some(format!(
-                                "Cannot rewind to prompt #{} — compaction checkpoint data is \
-                                 unavailable ({e}). Try rewinding to a prompt after the \
-                                 compaction point instead.",
-                                target_index,
-                            )),
-                        });
-                    }
-                }
-            } else {
-                // Standard rewind: truncate in-memory conversation. "Rewind
-                // to N" = restore state before prompt N ran, keeping 0..N-1;
-                // target 0 keeps only the session preamble.
-                let keep_count = conversation_truncate_for_prompt(&conversation, target_index);
-                conversation.truncate(keep_count);
-            }
-
-            // Write the truncated conversation back via the actor
-            // (handles both state update + persistence).
-            self.chat_state_handle.replace_conversation(conversation);
-            // Use a snapshot to set the correct prompt_index and truncated prompt_texts.
-            // The actor's TruncateToPromptIndex doesn't apply here because the
-            // conversation was already truncated locally. Instead, snapshot + restore
-            // with the corrected fields.
-            if let Some(mut snap) = self.chat_state_handle.snapshot().await {
-                snap.prompt_index = target_index;
-                snap.prompt_texts.truncate(target_index);
-                // Cross-compaction rewind recomputes the marker (the rebuilt
-                // conversation may have dropped the summary); standard
-                // truncation keeps the existing marker.
-                let new_marker =
-                    replay_compaction_marker.unwrap_or(snap.last_compaction_prompt_index);
-                snap.last_compaction_prompt_index = new_marker;
-                self.chat_state_handle.restore_snapshot(snap);
-            }
-
-            // Conversation shrank — clear budget-based (size/schema) and stale
-            // per-turn suppression so compaction can run against the smaller context.
-            // Account-state suppression (credit/auth → SUPPRESS_UNTIL_SUCCESS) isn't
-            // budget-related, so it persists until a successful model call.
-            if self
-                .compaction
-                .auto_compact_suppressed
-                .load(std::sync::atomic::Ordering::Relaxed)
-                != crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS
-            {
-                self.compaction.auto_compact_suppressed.store(
-                    crate::session::compaction_config::SUPPRESS_NONE,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
-
-            // Append a RewindMarker to updates.jsonl so the replay pipeline can
-            // handle timeline branching (updates.jsonl is append-only).
-            self.persist_xai_update_only(XaiSessionUpdate::RewindMarker {
-                target_prompt_index: target_index,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            });
         }
 
         // Update the file state tracker to reflect the rewind.

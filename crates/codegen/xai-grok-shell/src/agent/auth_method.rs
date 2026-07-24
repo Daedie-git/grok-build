@@ -372,8 +372,12 @@ impl ModelByok {
 /// demote on `Unknown`). It refreshes when `endpoint_is_first_party` — the
 /// request targets a first-party host (cli-chat-proxy / first-party API),
 /// where sending the session token cannot leak to a third-party BYOK
-/// endpoint. A definite `NotByok` always refreshes (it only ever routes to
-/// the session endpoint); a definite `Byok` never does.
+/// endpoint.
+///
+/// A definite `Byok` never attaches the session resolver. A definite
+/// `NotByok` refreshes only on first-party hosts: built-in models with a
+/// non-xAI `base_url` (e.g. Codex ChatGPT backend) resolve their own
+/// credentials and must not have the live OIDC bearer overwrite them.
 pub fn session_token_auth_gate(
     is_session_based_method: bool,
     model_byok: ModelByok,
@@ -381,7 +385,7 @@ pub fn session_token_auth_gate(
 ) -> bool {
     is_session_based_method
         && match model_byok {
-            ModelByok::NotByok => true,
+            ModelByok::NotByok => endpoint_is_first_party,
             ModelByok::Byok => false,
             ModelByok::Unknown => endpoint_is_first_party,
         }

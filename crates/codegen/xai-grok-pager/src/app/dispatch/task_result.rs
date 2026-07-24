@@ -298,12 +298,42 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             subscription_tier,
             autotopup,
         } => handle_billing_fetched(app, agent_id, balance, silent, subscription_tier, autotopup),
+        TaskResult::CodexRateLimitsFetched {
+            agent_id,
+            limits,
+            silent,
+            generation,
+        } => super::billing::handle_codex_rate_limits_fetched(
+            app, agent_id, limits, silent, generation,
+        ),
+        TaskResult::CodexRateLimitsError {
+            agent_id,
+            error,
+            silent,
+            generation,
+        } => {
+            if !silent
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && agent.session.models.current_model_is_codex()
+                && generation == agent.codex_rate_limits_generation
+            {
+                agent.scrollback.push_block(RenderBlock::System(
+                    crate::scrollback::blocks::SystemMessageBlock::new(format!(
+                        "Codex usage error: {error}"
+                    )),
+                ));
+            }
+            vec![]
+        }
         TaskResult::BillingError {
             agent_id,
             error,
             silent,
         } => {
-            if !silent && let Some(agent) = app.agents.get_mut(&agent_id) {
+            if !silent
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+                && !agent.session.models.current_model_is_codex()
+            {
                 agent.scrollback.push_block(RenderBlock::System(
                     crate::scrollback::blocks::SystemMessageBlock::new(format!(
                         "Billing error: {error}"

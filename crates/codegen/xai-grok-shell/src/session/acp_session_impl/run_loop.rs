@@ -688,6 +688,41 @@ pub(super) async fn run_session(
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
                             // Update the actor's SamplingConfig model + headers + context window.
                             if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
+                                let mut conversation = session.chat_state_handle.get_conversation().await;
+                                let compatibility = xai_grok_sampling_types::native_compaction_compatibility(&conversation);
+                                let mut proposed_headers = cfg.extra_headers.clone();
+                                proposed_headers.extend(extra_headers.clone());
+                                let proposed_account = proposed_headers
+                                    .iter()
+                                    .rev()
+                                    .find(|(name, _)| name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER))
+                                    .map(|(_, value)| value.as_str());
+                                let compatible = matches!(compatibility, Ok(None))
+                                    || matches!(compatibility, Ok(Some(expected))
+                                        if expected.matches_origin(
+                                            &cfg.api_backend,
+                                            &cfg.base_url,
+                                            &model_name,
+                                            proposed_account,
+                                        ));
+                                if !compatible {
+                                    tracing::error!(
+                                        session_id = %session.session_info.id,
+                                        proposed_model = %model_name,
+                                        "OVERRIDE_MODEL rejected: identity-bound native Codex history is incompatible"
+                                    );
+                                    continue;
+                                }
+                                if xai_grok_sampling_types::strip_incompatible_response_metadata(
+                                    &mut conversation,
+                                    &cfg.api_backend,
+                                    &cfg.base_url,
+                                    &model_name,
+                                    proposed_account,
+                                ) {
+                                    session.chat_state_handle.replace_conversation(conversation);
+                                    let _ = session.chat_state_handle.get_conversation().await;
+                                }
                                 tracing::info!(
                                     target: SESSION_LOG,
                                     session_id = %session.session_info.id,

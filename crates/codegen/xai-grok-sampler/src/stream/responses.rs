@@ -14,8 +14,8 @@ use futures_util::StreamExt;
 use futures_util::stream::{BoxStream, Stream};
 
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationResponse, ResponseModelMetadata, SamplingError, StopReason,
-    TokenUsage, rs,
+    ConversationItem, ConversationResponse, ResponseModelMetadata, ResponsesStreamAccumulator,
+    SamplingError, StopReason, TokenUsage, rs,
 };
 
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
@@ -107,13 +107,16 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
 /// `SamplingClient::conversation_stream_responses`; any signals the SSE
 /// decoder recorded are drained onto the final `ConversationResponse`.
 /// `None` (check disabled) leaves the response untouched.
-pub fn stream_responses<'a>(
-    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+pub fn stream_responses<'a, E>(
+    raw_stream: BoxStream<'a, Result<E, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
     request_id: RequestId,
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
-) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+) -> impl Stream<Item = SamplingEvent> + Send + 'a
+where
+    E: Into<xai_grok_sampling_types::DecodedResponseStreamEvent> + Send + 'a,
+{
     stream_responses_tracked(
         raw_stream,
         model_metadata,
@@ -124,14 +127,17 @@ pub fn stream_responses<'a>(
     )
 }
 
-pub(crate) fn stream_responses_tracked<'a>(
-    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+pub(crate) fn stream_responses_tracked<'a, E>(
+    raw_stream: BoxStream<'a, Result<E, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
     request_id: RequestId,
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     output_observed: Arc<AtomicBool>,
-) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+) -> impl Stream<Item = SamplingEvent> + Send + 'a
+where
+    E: Into<xai_grok_sampling_types::DecodedResponseStreamEvent> + Send + 'a,
+{
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
 
@@ -151,6 +157,7 @@ pub(crate) fn stream_responses_tracked<'a>(
         }
 
         let mut final_response: Option<rs::Response> = None;
+        let mut terminal_output = None;
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
@@ -163,8 +170,13 @@ pub(crate) fn stream_responses_tracked<'a>(
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut next_tool_index: u32 = 0;
+        // All Responses backends: text may stream correctly while
+        // `response.completed` ships `output: []`. Rebuild from stream state
+        // so empty-response retries do not fire. Codex metadata/manifests
+        // still require `metadata_origin` on captured items.
+        let mut responses_acc = ResponsesStreamAccumulator::default();
 
-        let mut stream = raw_stream;
+        let mut stream = raw_stream.map(|result| result.map(Into::into)).boxed();
         loop {
             let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(event_result)) => event_result,
@@ -181,7 +193,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 }
             };
 
-            let event = match event_result {
+            let decoded = match event_result {
                 Ok(event) => event,
                 Err(err) => {
                     yield SamplingEvent::Failed {
@@ -189,6 +201,68 @@ pub(crate) fn stream_responses_tracked<'a>(
                         error: SamplingErrorInfo::from(&err),
                     };
                     return;
+                }
+            };
+
+            let event = match decoded {
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(item) => {
+                    output_observed.store(true, Ordering::Relaxed);
+                    if let xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                        rs::OutputItem::FunctionCall(call),
+                    ) = &item.value
+                    {
+                        let tool_index = next_tool_index;
+                        next_tool_index += 1;
+                        output_to_tool_index.insert(item.output_index, tool_index);
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: Some(call.call_id.clone()),
+                            name: Some(call.name.clone()),
+                            arguments_delta: None,
+                        };
+                    }
+                    responses_acc.note_output_item_added(item);
+                    last_content_chunk_at = Instant::now();
+                    continue;
+                }
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(item) => {
+                    output_observed.store(true, Ordering::Relaxed);
+                    match &item.value {
+                        xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                            rs::OutputItem::WebSearchCall(call),
+                        ) => {
+                            yield SamplingEvent::BackendToolCallCompleted {
+                                request_id: request_id.clone(),
+                                call_id: call.id.clone(),
+                                name: "web_search".to_string(),
+                                result: serde_json::to_value(call).ok(),
+                            };
+                        }
+                        xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                            rs::OutputItem::CustomToolCall(call),
+                        ) => {
+                            yield SamplingEvent::BackendToolCallCompleted {
+                                request_id: request_id.clone(),
+                                call_id: call.id.clone(),
+                                name: "x_search".to_string(),
+                                result: serde_json::to_value(call).ok(),
+                            };
+                        }
+                        _ => {}
+                    }
+                    responses_acc.note_captured_output_item_done(item);
+                    last_content_chunk_at = Instant::now();
+                    continue;
+                }
+                xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+                    event,
+                    terminal_output: captured,
+                } => {
+                    if captured.is_some() {
+                        terminal_output = captured;
+                    }
+                    event
                 }
             };
 
@@ -223,6 +297,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
                     let delta = text_delta_event.delta;
                     if !delta.is_empty() {
+                        responses_acc.note_text_delta(&delta);
                         if !first_token_emitted {
                             first_token_emitted = true;
                             yield SamplingEvent::FirstToken {
@@ -238,6 +313,12 @@ pub(crate) fn stream_responses_tracked<'a>(
                             text: delta,
                             chunk_index,
                         };
+                    }
+                }
+
+                ResponseStreamEvent::ResponseOutputTextDone(text_done) => {
+                    if !text_done.text.is_empty() {
+                        responses_acc.note_text_done(&text_done.text);
                     }
                 }
 
@@ -283,6 +364,16 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // Start of a Responses FunctionCall — emit initial id+name
                 // and remember the output_index → tool_index mapping.
                 ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
+                    responses_acc.note_output_item_added(
+                        xai_grok_sampling_types::CapturedResponseOutputItem {
+                            output_index: added_event.output_index,
+                            value: xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                                added_event.item.clone(),
+                            ),
+                            internal_chat_message_metadata_passthrough: None,
+                            metadata_origin: None,
+                        },
+                    );
                     if let rs::OutputItem::FunctionCall(fc) = added_event.item {
                         let tool_index = next_tool_index;
                         next_tool_index += 1;
@@ -384,7 +475,12 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // OutputItemDone carries the full result for backend tools.
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
+                // Also feeds the shared Responses empty-completed rebuild accumulator.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                    responses_acc.note_output_item_done(
+                        done_event.output_index,
+                        done_event.item.clone(),
+                    );
                     match &done_event.item {
                         rs::OutputItem::WebSearchCall(ws) => {
                             let result = serde_json::to_value(ws).ok();
@@ -495,11 +591,40 @@ pub(crate) fn stream_responses_tracked<'a>(
 
         let status = response.status.clone();
 
-        // Convert to ConversationItem(s); patch in accumulated reasoning
-        // text as a fallback when the final response lacks `content` /
-        // `summary` (the streaming deltas may have arrived out of band).
-        // Splice policy lives in `inject_streaming_reasoning_fallback`.
-        let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        // Convert through the raw-aware ordered output list. Terminal output
+        // wins when present; otherwise output_item.done (including metadata
+        // observed only on added) rebuilds an empty completed response.
+        let typed_terminal_fallback = terminal_output.or_else(|| {
+            (!response.output.is_empty()).then(|| {
+                response
+                    .output
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(output_index, item)| xai_grok_sampling_types::CapturedResponseOutputItem {
+                        output_index: output_index as u32,
+                        value: xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(item),
+                        internal_chat_message_metadata_passthrough: None,
+                        metadata_origin: None,
+                    })
+                    .collect()
+            })
+        });
+        let captured = responses_acc.terminal_output(typed_terminal_fallback);
+        let mut items = match xai_grok_sampling_types::captured_response_to_conversation_items(
+            response,
+            captured,
+        ) {
+            Ok(items) => items,
+            Err(message) => {
+                let error = SamplingError::serialization_message(message);
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&error),
+                };
+                return;
+            }
+        };
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {
@@ -691,6 +816,10 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+                // Codex-style empty `response.completed.output` is rebuilt from
+                // streamed text deltas so empty_response retries do not fire.
+                assert_eq!(response.empty_reason(), None);
+                assert_eq!(response.assistant_text(), "hello");
             }
             other => panic!("expected Completed, got {other:?}"),
         }

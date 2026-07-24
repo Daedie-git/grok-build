@@ -878,8 +878,14 @@ pub struct AgentView {
     /// Unlike `chat_kind`, stays `false` for a `/chat` one-shot session in
     /// a Build process, whose picker still lists local sessions.
     pub app_chat_mode: bool,
-    /// Mocked credit balance for the status bar indicator.
+    /// App-level tier restrictions before model-provider filtering.
+    pub tier_restricted_commands: Vec<String>,
+    /// Grok Build credit balance used for Grok-backed models.
     pub credit_balance: Option<crate::views::credit_bar::CreditBalance>,
+    /// ChatGPT/Codex account windows used for Codex-backed models.
+    pub codex_rate_limits: Option<xai_grok_shell::extensions::codex_usage::CodexRateLimits>,
+    /// Monotonic request generation; stale async completions are discarded.
+    pub codex_rate_limits_generation: u64,
     /// Auto top-up rule paired with `credit_balance` for the prompt warning.
     pub auto_topup: Option<crate::views::credit_bar::AutoTopupInfo>,
     /// Current goal orchestration state. Set by `GoalUpdated` session
@@ -2069,6 +2075,7 @@ fn resolve_action(action_id: Option<ActionId>) -> Option<InputOutcome> {
         ActionId::FocusPrompt => Action::FocusPrompt,
         ActionId::FocusScrollback => Action::FocusScrollback,
         ActionId::NextModel => Action::NextModel,
+        ActionId::CycleEffort => Action::CycleEffort,
         ActionId::CycleMode => Action::CycleMode,
         ActionId::CancelTurn
         | ActionId::Quit

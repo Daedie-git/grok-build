@@ -259,12 +259,23 @@ impl ChatStateActor {
             ChatStateCommand::RestoreSnapshot(snapshot) => {
                 self.restore_snapshot(*snapshot);
             }
+            ChatStateCommand::BeginCodexTurn => {
+                self.state.codex_turn_state = std::sync::Arc::new(std::sync::OnceLock::new());
+            }
             ChatStateCommand::BeginTurnCapture => {
                 self.state.turn_capture = Some(state::TurnCaptureState {
                     turn_start_offset: self.state.conversation.len(),
                     pre_replacement_messages: Vec::new(),
                     compaction_occurred: false,
                 });
+            }
+            ChatStateCommand::InstallPersistedCompaction { items, reply } => {
+                self.replace_conversation_without_persistence(items, true);
+                let _ = reply.send(());
+            }
+            ChatStateCommand::InstallPersistedRewind { snapshot, reply } => {
+                self.install_persisted_rewind(*snapshot);
+                let _ = reply.send(());
             }
             ChatStateCommand::AppendHarnessTraceItems { items } => {
                 self.state.harness_trace_buffer.extend(items);
@@ -311,6 +322,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetPromptIndex { reply } => {
                 let _ = reply.send(self.state.prompt_index);
+            }
+            ChatStateCommand::GetCodexTurnState { reply } => {
+                let _ = reply.send(self.state.codex_turn_state.clone());
             }
             ChatStateCommand::GetLastCompactionPromptIndex { reply } => {
                 let _ = reply.send(self.state.last_compaction_prompt_index);

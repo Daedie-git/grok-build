@@ -145,6 +145,7 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            codex_turn_state: Some(self.state.codex_turn_state.clone()),
         }
     }
 }

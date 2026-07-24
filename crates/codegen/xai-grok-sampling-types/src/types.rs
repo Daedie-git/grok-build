@@ -1090,6 +1090,21 @@ pub struct CreateResponseWrapper {
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
+
+    /// Provider message IDs aligned with serialized user/assistant messages.
+    /// Used only to bridge the pinned async-openai `InputMessage` type, which
+    /// omits the Responses API's optional message `id` field.
+    pub response_message_item_ids: Vec<Option<String>>,
+
+    /// Provider-owned metadata aligned to exact Responses input positions.
+    /// Bridges the pinned async-openai request model without broad raw JSON.
+    pub response_item_metadata_passthrough: Vec<crate::ResponsesInputItemMetadata>,
+
+    /// Exact provider identity to stamp on metadata captured from this response.
+    pub response_metadata_origin: Option<crate::ResponseMetadataOrigin>,
+
+    /// Process-local turn-scoped Codex sticky-routing token.
+    pub codex_turn_state: Option<std::sync::Arc<std::sync::OnceLock<String>>>,
 }
 
 impl CreateResponseWrapper {
@@ -1106,6 +1121,10 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
+            response_message_item_ids: vec![],
+            response_item_metadata_passthrough: vec![],
+            response_metadata_origin: None,
+            codex_turn_state: None,
         }
     }
 

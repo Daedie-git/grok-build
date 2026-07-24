@@ -511,7 +511,7 @@ pub(crate) async fn run_shell_child(
         &child_session_info,
         &child_session_dir,
         effective_model_id.0.as_ref(),
-        effective_sampling_config.context_window,
+        &effective_sampling_config,
     )
     .await
     {
@@ -1411,6 +1411,11 @@ pub(crate) async fn run_shell_child(
                         } else {
                             format!("Session error: {e}")
                         }),
+                        // Preserve any answer committed before the terminal
+                        // failure (including forced post-compaction synthesis)
+                        // instead of replacing usable partial findings with an
+                        // empty failure result.
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,
@@ -1432,6 +1437,7 @@ pub(crate) async fn run_shell_child(
                         } else {
                             "Child session dropped unexpectedly".to_string()
                         }),
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,

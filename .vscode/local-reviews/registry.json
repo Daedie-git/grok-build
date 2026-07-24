@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "reviews": [
+    {
+      "id": "c0a908ad-aba1-4cab-ac01-9daf54149688",
+      "sourceBranch": "main",
+      "targetBranch": "feat/first-class-codex-support",
+      "sourceCommit": "6e386420825bd44ae648c63e7c8cba12fcec9401",
+      "targetCommit": "50b9160121d52b03406dd9e76c0a66fdbcf8a704",
+      "createdAt": "2026-07-25T20:39:47.332Z"
+    },
+    {
+      "id": "b2549fa2-67fc-49e0-bea7-ae1784016e41",
+      "sourceBranch": "feat/first-class-codex-support",
+      "targetBranch": "feat/first-class-codex-support",
+      "sourceCommit": "d1ec66d9540f2fa6ffbaf6ac40f6cef0371641d8",
+      "targetCommit": "d1ec66d9540f2fa6ffbaf6ac40f6cef0371641d8",
+      "createdAt": "2026-07-25T22:04:11.542Z"
+    }
+  ],
+  "preferredBaseBranch": "main",
+  "activeMode": "branch",
+  "activeReviewId": "c0a908ad-aba1-4cab-ac01-9daf54149688"
+}

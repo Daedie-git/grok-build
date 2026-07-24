@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
-    ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage, FinishReason,
-    ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition, TraceContext,
-    Usage,
+    ApiBackend, ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage,
+    FinishReason, ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition,
+    TraceContext, Usage,
 };
 
 // ============================================================================
@@ -43,6 +43,11 @@ pub enum ConversationItem {
     /// 2. Sent back to the Responses API as input items for context continuity
     /// 3. Rendered by the pager (search queries, sources, etc.)
     BackendToolCall(BackendToolCallItem),
+    /// Complete provider-order manifest for the immediately following
+    /// ordinary Responses output group. Message/function-call output items may
+    /// collapse into one Assistant semantically; this persistence-only sidecar
+    /// restores their exact order only at the Codex wire boundary.
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
     /// A reasoning item from the Responses API, stored as a sibling of the
     /// assistant message so that:
     ///
@@ -56,6 +61,382 @@ pub enum ConversationItem {
     /// wrapping `rs::WebSearchToolCall` etc.) so no field is dropped on the
     /// way through.
     Reasoning(rs::ReasoningItem),
+    /// Durable identity scope for the immediately following native compaction
+    /// segment. This item is persistence-only and is never sent on the wire.
+    NativeCompactionMetadata(NativeCompactionCompatibility),
+    /// Opaque replacement-history item returned by Codex `/responses/compact`.
+    /// The id and encrypted payload must round-trip unchanged into the next
+    /// Responses request and through persistence/checkpoint/rewind flows.
+    Compaction(rs::CompactionSummaryItemParam),
+}
+
+/// Internal Responses transport metadata that Codex requires clients to replay
+/// unchanged with provider-authored compact output items.
+///
+/// Keep this strongly typed and fail closed when the provider expands the
+/// payload: unlike arbitrary response fields, this is the one explicitly
+/// approved opaque metadata envelope we persist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InternalChatMessageMetadataPassthrough {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// Ordinary Responses item shape used to bind provider metadata to the
+/// durable owner and to the exact subsequent input item.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseOutputItemKind {
+    Message,
+    Reasoning,
+    FunctionCall,
+    FunctionCallOutput,
+    WebSearchCall,
+    CustomToolCall,
+    CodeInterpreterCall,
+    Compaction,
+}
+
+/// Exact provider identity under which ordinary Codex Responses transport
+/// metadata may be replayed. The canonical URL is a public backend identifier;
+/// credentials and bearer tokens must never be stored here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseMetadataOrigin {
+    pub schema_version: u8,
+    pub backend_family: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_account_id: Option<String>,
+}
+
+impl ResponseMetadataOrigin {
+    pub const SCHEMA_VERSION: u8 = 1;
+    pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
+
+    pub fn codex(
+        base_url: &str,
+        model: impl Into<String>,
+        chatgpt_account_id: Option<String>,
+    ) -> Option<Self> {
+        crate::capabilities_for_base_url(base_url)
+            .preserve_response_metadata
+            .then(|| Self {
+                schema_version: Self::SCHEMA_VERSION,
+                backend_family: Self::CODEX_RESPONSES_FAMILY.into(),
+                // Both supported public host spellings identify the same backend.
+                // Persisting the fixed canonical URL also prevents accidental
+                // persistence of path-carried credentials from custom URLs.
+                base_url: crate::CODEX_BACKEND_BASE_URL.into(),
+                model: model.into(),
+                chatgpt_account_id,
+            })
+    }
+
+    pub fn matches(
+        &self,
+        api_backend: &ApiBackend,
+        base_url: &str,
+        model: &str,
+        chatgpt_account_id: Option<&str>,
+    ) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
+            && self.base_url == crate::CODEX_BACKEND_BASE_URL
+            && *api_backend == ApiBackend::Responses
+            && crate::capabilities_for_base_url(base_url).preserve_response_metadata
+            && self.model == model
+            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
+    }
+}
+
+/// Complete ordered manifest for one ordinary Codex Responses output group.
+///
+/// The semantic conversation model intentionally keeps function calls grouped
+/// on an [`AssistantItem`]. This persistence-only sidecar records the original
+/// provider order so Codex wire serialization can restore it without changing
+/// tool execution or UI grouping. `output_items` is stored independently from
+/// the entries so deleted entries fail closed after a cold resume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseOutputItemMetadata {
+    /// Defaults retain readability of the short-lived legacy per-item sidecar;
+    /// a matching Codex request rejects empty/incomplete group fields.
+    #[serde(default)]
+    pub response_id: String,
+    #[serde(default)]
+    pub output_items: u32,
+    #[serde(default)]
+    pub items: Vec<ResponseOutputItemOrder>,
+    /// `None` represents history written before origin scoping. Such metadata
+    /// remains readable for migration but is never replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ResponseMetadataOrigin>,
+}
+
+/// One position and owner binding in an ordinary Responses output manifest.
+/// The passthrough field is a required nullable field: every supported output
+/// item has an entry even when the provider supplied no metadata envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseOutputItemOrder {
+    pub output_index: u32,
+    pub kind: ResponseOutputItemKind,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub item_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub call_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+}
+
+/// Remove ordinary provider transport sidecars that do not belong to the
+/// proposed sampler identity. Semantic messages/tool history remain portable;
+/// opaque native compaction descriptors are deliberately untouched and retain
+/// their separate fail-closed compatibility checks.
+pub fn strip_incompatible_response_metadata(
+    items: &mut Vec<ConversationItem>,
+    api_backend: &ApiBackend,
+    base_url: &str,
+    model: &str,
+    chatgpt_account_id: Option<&str>,
+) -> bool {
+    let original_len = items.len();
+    items.retain(|item| {
+        !matches!(
+            item,
+            ConversationItem::ResponseOutputMetadata(metadata)
+                if !metadata.origin.as_ref().is_some_and(|origin| {
+                    origin.matches(
+                        api_backend,
+                        base_url,
+                        model,
+                        chatgpt_account_id,
+                    )
+                })
+        )
+    });
+    items.len() != original_len
+}
+
+/// Request-side binding after durable conversation items have expanded back
+/// into the Responses input array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesInputItemMetadata {
+    pub input_index: usize,
+    pub kind: ResponseOutputItemKind,
+    pub item_id: Option<String>,
+    pub call_id: Option<String>,
+    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+    /// Present only for ordinary output items. Native compact replacement
+    /// bindings use their separate immutable segment manifest.
+    pub response_order: Option<ResponsesInputItemOrder>,
+}
+
+/// Original position of an ordinary output item within one provider response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesInputItemOrder {
+    pub response_id: String,
+    pub output_index: u32,
+    pub output_items: u32,
+}
+
+/// Compact-output item kind used to bind passthrough metadata to its exact
+/// replay position without weakening the pinned Responses request types.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCompactionItemKind {
+    Message,
+    Reasoning,
+    Compaction,
+}
+
+/// Complete manifest entry for one provider-authored compact output item.
+/// `input_index` is the item's zero-based position in the subsequent Responses
+/// `input` array (canonical system instructions are excluded). Entries with no
+/// provider metadata are retained so deletion and reordering remain detectable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeCompactionItemMetadata {
+    pub input_index: usize,
+    pub kind: NativeCompactionItemKind,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub item_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Exact identity under which opaque native Codex history may be replayed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeCompactionCompatibility {
+    pub schema_version: u8,
+    pub backend_family: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_account_id: Option<String>,
+    /// First Responses input position owned by the compact replacement. This is
+    /// zero today, but persisting it makes the segment boundary explicit.
+    pub replacement_segment_start: usize,
+    /// Number of provider-authored replay items in the replacement segment.
+    pub replacement_segment_items: usize,
+    /// Complete ordered manifest for the replacement segment, including items
+    /// whose passthrough metadata is `None`. This field is intentionally not
+    /// serde-defaulted: schema-v2 history without it is invalid.
+    pub item_metadata: Vec<NativeCompactionItemMetadata>,
+}
+
+impl NativeCompactionCompatibility {
+    /// Version 2 adds the mandatory durable passthrough-metadata side table.
+    /// Older clients reject it rather than replaying native history lossily.
+    pub const SCHEMA_VERSION: u8 = 2;
+    pub const LEGACY_SCHEMA_VERSION: u8 = 1;
+    pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
+
+    pub fn codex(model: impl Into<String>, chatgpt_account_id: Option<String>) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            backend_family: Self::CODEX_RESPONSES_FAMILY.into(),
+            model: model.into(),
+            chatgpt_account_id,
+            replacement_segment_start: 0,
+            replacement_segment_items: 0,
+            item_metadata: Vec::new(),
+        }
+    }
+
+    /// Whether a proposed sampler identity can safely replay this opaque
+    /// history. Every known identity component is exact-match only.
+    pub fn matches_origin(
+        &self,
+        api_backend: &ApiBackend,
+        base_url: &str,
+        model: &str,
+        chatgpt_account_id: Option<&str>,
+    ) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
+            && *api_backend == ApiBackend::Responses
+            && crate::is_codex_backend_url(base_url)
+            && self.model == model
+            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
+    }
+}
+
+/// Return the single durable native identity, rejecting malformed/legacy
+/// opaque history rather than guessing whether it is portable.
+pub fn native_compaction_compatibility(
+    items: &[ConversationItem],
+) -> Result<Option<&NativeCompactionCompatibility>, String> {
+    let mut descriptor = None;
+    let mut metadata_pending = false;
+    for item in items {
+        match item {
+            ConversationItem::NativeCompactionMetadata(value) => {
+                if metadata_pending || descriptor.is_some() {
+                    return Err(
+                        "native compaction history contains conflicting identity metadata".into(),
+                    );
+                }
+                descriptor = Some(value);
+                metadata_pending = true;
+            }
+            ConversationItem::Compaction(_) => {
+                if !metadata_pending {
+                    return Err("native compaction history is missing durable identity metadata; resume with the original client or start a new session".into());
+                }
+                metadata_pending = false;
+            }
+            _ if metadata_pending => {
+                return Err(
+                    "native compaction identity metadata is not adjacent to its opaque item".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if metadata_pending {
+        return Err("native compaction identity metadata has no opaque item".into());
+    }
+    if let Some(descriptor) = descriptor {
+        if descriptor.schema_version != NativeCompactionCompatibility::SCHEMA_VERSION {
+            return Err("legacy native compaction history cannot be replayed safely".into());
+        }
+        if descriptor.replacement_segment_start != 0 {
+            return Err("native compaction manifest has an invalid segment start".into());
+        }
+        if descriptor.replacement_segment_items == 0 {
+            return Err("native compaction manifest has an empty replacement segment".into());
+        }
+        if descriptor.item_metadata.len() != descriptor.replacement_segment_items {
+            return Err("native compaction manifest length does not match its segment".into());
+        }
+
+        let mut replay_items = Vec::with_capacity(descriptor.replacement_segment_items);
+        for item in items {
+            // The manifest binds only the immutable provider-authored
+            // replacement prefix. Turns appended after compaction are outside
+            // that segment and must never shift or extend this binding.
+            if replay_items.len() == descriptor.replacement_segment_items {
+                break;
+            }
+            match item {
+                ConversationItem::System(_) | ConversationItem::NativeCompactionMetadata(_) => {}
+                ConversationItem::User(user) => replay_items.push((
+                    NativeCompactionItemKind::Message,
+                    user.response_item_id.as_deref(),
+                )),
+                ConversationItem::Reasoning(reasoning) => replay_items.push((
+                    NativeCompactionItemKind::Reasoning,
+                    Some(reasoning.id.as_str()),
+                )),
+                ConversationItem::Compaction(compaction) => replay_items.push((
+                    NativeCompactionItemKind::Compaction,
+                    compaction.id.as_deref(),
+                )),
+                _ => {
+                    return Err(
+                        "native compaction manifest crosses an unsupported replay item".into(),
+                    );
+                }
+            }
+        }
+        if replay_items.len() != descriptor.replacement_segment_items {
+            return Err("native compaction replacement segment is truncated".into());
+        }
+        if replay_items
+            .iter()
+            .filter(|(kind, _)| *kind == NativeCompactionItemKind::Compaction)
+            .count()
+            != 1
+        {
+            return Err("native compaction segment must contain exactly one opaque item".into());
+        }
+
+        let mut seen_indices = std::collections::BTreeSet::new();
+        for (expected_index, metadata) in descriptor.item_metadata.iter().enumerate() {
+            if !seen_indices.insert(metadata.input_index) {
+                return Err("native compaction manifest contains duplicate input indices".into());
+            }
+            if metadata.input_index != descriptor.replacement_segment_start + expected_index {
+                return Err(
+                    "native compaction manifest has missing, extra, or unordered indices".into(),
+                );
+            }
+            let Some((kind, item_id)) = replay_items.get(expected_index) else {
+                return Err("native compaction manifest input index is out of range".into());
+            };
+            if *kind != metadata.kind || *item_id != metadata.item_id.as_deref() {
+                return Err("native compaction manifest does not match its replay item".into());
+            }
+        }
+    }
+    Ok(descriptor)
 }
 
 /// System message content
@@ -197,6 +578,11 @@ pub enum PriorTurnInterrupt {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserItem {
     pub content: Vec<ContentPart>,
+    /// Provider-assigned Responses item ID. Native Codex compaction returns
+    /// retained messages with IDs that must survive persistence and the next
+    /// request. Ordinary locally-created messages leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_item_id: Option<String>,
     /// Set when this item was synthesized by the runtime rather than typed by
     /// a real user.  `None` for all genuine user messages.
     ///
@@ -246,6 +632,9 @@ pub struct UserItem {
 pub struct AssistantItem {
     /// Text content of the response
     pub content: Arc<str>,
+    /// Provider-assigned Responses item ID retained by native compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_item_id: Option<String>,
     /// Tool calls made by the assistant (client must execute these locally)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -583,6 +972,9 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Process-local, first-value-wins Codex sticky-routing token for one user
+    /// turn. Callers must create a fresh lock per turn; it is never persisted.
+    pub codex_turn_state: Option<Arc<std::sync::OnceLock<String>>>,
 }
 
 impl ConversationRequest {
@@ -897,6 +1289,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -910,6 +1303,7 @@ impl ConversationItem {
     pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
         Self::User(UserItem {
             content: parts,
+            response_item_id: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -927,6 +1321,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -945,6 +1340,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::SystemReminder),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -974,6 +1370,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -987,6 +1384,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
             cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
@@ -1004,6 +1402,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::AutoContinue),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1021,6 +1420,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1039,6 +1439,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::Interjection),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1052,6 +1453,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1065,6 +1467,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1078,6 +1481,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1091,6 +1495,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::GoalSummary),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1108,6 +1513,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1121,6 +1527,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1134,6 +1541,7 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
             synthetic_reason: Some(SyntheticReason::StopHookFeedback),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1145,6 +1553,7 @@ impl ConversationItem {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(content.into()),
+            response_item_id: None,
             tool_calls: Vec::new(),
             model_id: None,
             model_fingerprint: None,
@@ -1160,6 +1569,7 @@ impl ConversationItem {
     pub fn assistant_with_model(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(content.into()),
+            response_item_id: None,
             tool_calls: Vec::new(),
             model_id: Some(model_id.into()),
             model_fingerprint: None,
@@ -1171,6 +1581,7 @@ impl ConversationItem {
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(""),
+            response_item_id: None,
             tool_calls,
             model_id: None,
             model_fingerprint: None,
@@ -1211,8 +1622,11 @@ impl ConversationItem {
             Self::Assistant(_) => Role::Assistant,
             Self::ToolResult(_) => Role::Tool,
             Self::BackendToolCall(_) => Role::Assistant,
-            // Reasoning is semantically part of the assistant's turn.
-            Self::Reasoning(_) => Role::Assistant,
+            // Metadata, reasoning, and native compaction are semantically part of the assistant's turn.
+            Self::ResponseOutputMetadata(_)
+            | Self::Reasoning(_)
+            | Self::NativeCompactionMetadata(_)
+            | Self::Compaction(_) => Role::Assistant,
         }
     }
 
@@ -1242,6 +1656,10 @@ impl ConversationItem {
             Self::ToolResult(t) => t.content.as_ref().to_owned(),
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
+            // Transport/native metadata and payload are intentionally opaque locally.
+            Self::ResponseOutputMetadata(_)
+            | Self::NativeCompactionMetadata(_)
+            | Self::Compaction(_) => String::new(),
         }
     }
 }
@@ -1655,6 +2073,7 @@ impl From<ChatRequestMessage> for ConversationItem {
                     .collect();
                 ConversationItem::User(UserItem {
                     content: parts,
+                    response_item_id: None,
                     synthetic_reason: None,
                     ..Default::default()
                 })
@@ -1682,6 +2101,7 @@ impl From<ChatRequestMessage> for ConversationItem {
 
                 ConversationItem::Assistant(AssistantItem {
                     content: Arc::<str>::from(content),
+                    response_item_id: None,
                     tool_calls,
                     model_id,
                     model_fingerprint: None,
@@ -1898,6 +2318,12 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             "conversation_to_chat_messages folds Reasoning siblings; \
                  conversation_item_to_chat_message is never called with one"
         ),
+        ConversationItem::ResponseOutputMetadata(_) => {
+            unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
+        }
+        ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
+            panic!("opaque native Codex compaction history cannot be projected to Chat Completions")
+        }
     }
 }
 
@@ -1922,6 +2348,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
 
     for item in items {
         match item {
+            ConversationItem::ResponseOutputMetadata(_) => {}
             ConversationItem::Reasoning(r) => {
                 let text = reasoning_item_text(&r);
                 if !text.is_empty() {
@@ -1990,6 +2417,7 @@ impl From<ChatResponseMessage> for ConversationItem {
 
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(content),
+            response_item_id: None,
             tool_calls,
             model_id: None,
             model_fingerprint: None,
@@ -2032,12 +2460,14 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
 
     let mut items: Vec<ConversationItem> = Vec::with_capacity(response.output.len() + 1);
     let mut content = String::new();
+    let mut response_item_id = None;
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut backend_tool_count: usize = 0;
 
     for item in response.output {
         match item {
             rs::OutputItem::Message(msg) => {
+                response_item_id = Some(msg.id.clone());
                 // Accumulate output text into the trailing Assistant item;
                 // there is at most one Message per response in practice.
                 for content_part in msg.content {
@@ -2105,6 +2535,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
     tracing::info!(model_id = %model_id, ?model_fingerprint, ?reasoning_effort, "response_to_conversation_items setting model metadata on AssistantItem");
     items.push(ConversationItem::Assistant(AssistantItem {
         content: Arc::<str>::from(content),
+        response_item_id,
         tool_calls,
         model_id: Some(model_id),
         model_fingerprint,
@@ -2411,6 +2842,11 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                     rs::InputItem::Item(rs::Item::CodeInterpreterCall(ci.clone()))
                 }
             }]
+        }
+        ConversationItem::ResponseOutputMetadata(_)
+        | ConversationItem::NativeCompactionMetadata(_) => Vec::new(),
+        ConversationItem::Compaction(item) => {
+            vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))]
         }
     }
 }
@@ -2821,6 +3257,10 @@ pub fn transform_conversation_cwd(
                     }
                 }
             }
+            // Provider/native metadata and encrypted content are immutable.
+            ConversationItem::ResponseOutputMetadata(_)
+            | ConversationItem::NativeCompactionMetadata(_)
+            | ConversationItem::Compaction(_) => {}
         }
     }
 }
@@ -3276,6 +3716,10 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     });
                 }
             }
+            ConversationItem::ResponseOutputMetadata(_) => {}
+            ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
+                panic!("opaque native Codex compaction history cannot be projected to Messages")
+            }
         }
     }
 
@@ -3411,6 +3855,7 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
 
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(content),
+            response_item_id: None,
             tool_calls,
             model_id: Some(resp.model),
             model_fingerprint: None,
@@ -4313,6 +4758,7 @@ mod tests {
         // Assistant can have both text content and tool calls
         let assistant = AssistantItem {
             content: "Let me help you with that.".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "read_file".to_string(),
@@ -4772,6 +5218,7 @@ mod tests {
         });
         let assistant_item = ConversationItem::Assistant(AssistantItem {
             content: "The answer is 42.".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
             model_fingerprint: None,
@@ -4804,6 +5251,7 @@ mod tests {
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "The answer is 4.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("grok-3".to_string()),
                 model_fingerprint: None,
@@ -4864,6 +5312,7 @@ mod tests {
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: "Hi!".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -5505,6 +5954,7 @@ mod tests {
         // Simulate a conversation where the model responded with thinking.
         let with_reasoning = ConversationItem::Assistant(AssistantItem {
             content: "Here is the answer.".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
             model_fingerprint: None,
@@ -5701,6 +6151,7 @@ mod tests {
             // Completed turn with thinking
             ConversationItem::Assistant(AssistantItem {
                 content: "I'll look at the code.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
                 model_fingerprint: None,
@@ -5709,6 +6160,7 @@ mod tests {
             // Completed tool pair
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -5721,6 +6173,7 @@ mod tests {
             ConversationItem::tool_result("call_1", "fn main() {}"),
             ConversationItem::Assistant(AssistantItem {
                 content: "I see the issue.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("messages-compatible-model".into()),
                 model_fingerprint: None,
@@ -5729,6 +6182,7 @@ mod tests {
             // Mid-turn: orphaned tool_use (no result yet)
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_2".into(),
                     name: "search_replace".to_string(),
@@ -6448,6 +6902,7 @@ mod tests {
 
         let mut items = vec![ConversationItem::Assistant(AssistantItem {
             content: format!("I'll read the file at {worktree}/src/main.rs").into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".into(),
@@ -6534,6 +6989,7 @@ mod tests {
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: format!("I edited {worktree}/src/main.rs").into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("grok-3".to_string()),
                 model_fingerprint: None,
@@ -6585,6 +7041,7 @@ mod tests {
             // Assistant with tool calls for the fix
             ConversationItem::Assistant(AssistantItem {
                 content: format!("I'll fix the bug in {worktree}/src/main.rs").into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_2".into(),
                     name: "search_replace".to_string(),
@@ -6638,6 +7095,7 @@ mod tests {
             ConversationItem::system(format!("Working in {root}.")),
             ConversationItem::Assistant(AssistantItem {
                 content: format!("I previously edited {root}/src/main.rs").into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -6746,6 +7204,7 @@ mod tests {
         // Tool calls that don't contain any paths should be unaffected
         let mut items = vec![ConversationItem::Assistant(AssistantItem {
             content: "Running a command".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "run_terminal_cmd".to_string(),
@@ -6865,6 +7324,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("test-model".to_string()),
                 model_fingerprint: None,
@@ -6886,6 +7346,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: "Here is my answer.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -6907,6 +7368,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -7108,6 +7570,7 @@ mod tests {
     fn test_assistant_item_with_model_id() {
         let item = AssistantItem {
             content: "Hello".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -7190,6 +7653,7 @@ mod tests {
     fn assistant_with_calls(calls: &[(&str, &str)]) -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: calls
                 .iter()
                 .map(|(id, name)| ToolCall {
@@ -7895,6 +8359,7 @@ mod tests {
             ConversationItem::user("Read this"),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -8433,6 +8898,7 @@ mod tests {
                 }),
                 ConversationItem::Assistant(AssistantItem {
                     content: String::new().into(),
+                    response_item_id: None,
                     tool_calls: Vec::new(),
                     model_id: None,
                     model_fingerprint: None,
@@ -9662,6 +10128,7 @@ mod tests {
             reasoning_sibling("r1", "must call a tool", Some("enc_pre_tool")),
             ConversationItem::Assistant(AssistantItem {
                 content: Arc::<str>::from(""),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: Arc::<str>::from("call_1"),
                     name: "read_file".to_string(),

@@ -27,15 +27,25 @@ pub enum Command {
         #[arg(long, hide = true)]
         legacy: bool,
         /// Use Grok OAuth via auth.x.ai.
-        #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
+        #[arg(
+            long = "oauth",
+            alias = "oidc",
+            conflicts_with_all = ["device_auth", "codex"]
+        )]
         oauth: bool,
         /// Use device-code authentication for headless/remote environments.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",
-            conflicts_with_all = ["oauth"]
+            conflicts_with_all = ["oauth", "codex"]
         )]
         device_auth: bool,
+        /// Use ChatGPT/Codex subscription credentials (`~/.codex/auth.json`).
+        ///
+        /// Validates and refreshes an existing Codex CLI login. Run
+        /// `codex login` first if no ChatGPT auth file is present.
+        #[arg(long = "codex", conflicts_with_all = ["oauth", "device_auth"])]
+        codex: bool,
         /// Authenticate for remote development environments (hidden).
         ///
         /// Field is always present so match arms stay feature-unification-safe
@@ -1406,5 +1416,38 @@ mod tests {
             panic!("expected agent subcommand");
         };
         assert_eq!(agent.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn login_codex_flag_parses() {
+        let args =
+            PagerArgs::try_parse_from(["grok", "login", "--codex"]).expect("login --codex parses");
+        let Command::Login {
+            codex,
+            oauth,
+            device_auth,
+            ..
+        } = args.command.expect("login subcommand")
+        else {
+            panic!("expected login");
+        };
+        assert!(codex);
+        assert!(!oauth);
+        assert!(!device_auth);
+    }
+
+    #[test]
+    fn login_codex_help_mentions_codex() {
+        use clap::CommandFactory;
+        let mut cmd = PagerArgs::command();
+        let help = cmd
+            .find_subcommand_mut("login")
+            .expect("login")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("--codex"),
+            "login help should list --codex: {help}"
+        );
     }
 }

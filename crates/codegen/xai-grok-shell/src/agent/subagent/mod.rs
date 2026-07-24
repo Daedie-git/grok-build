@@ -973,8 +973,7 @@ fn verbatim_or_normalize_fork(
         };
     }
     let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&items);
-    const SAFE_FORK_PERCENT: u64 = 80;
-    let threshold = child_context_window * SAFE_FORK_PERCENT / 100;
+    let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
     if estimated_tokens <= threshold && conversation_tail_is_complete(&items) {
         let prefix_len = items.len();
         return InitialContext {
@@ -1051,9 +1050,82 @@ fn stamp_live_fork_session_metadata(
         tracing::warn!(error = %e, "live fork: failed to write forked session summary");
     }
 }
+fn native_history_replayability(
+    items: &[ConversationItem],
+    sampling_config: &xai_grok_sampler::SamplerConfig,
+) -> Result<bool, String> {
+    let compatibility = xai_grok_sampling_types::native_compaction_compatibility(items)?;
+    let Some(expected) = compatibility else {
+        return Ok(false);
+    };
+    let account = sampling_config
+        .extra_headers
+        .iter()
+        .rev()
+        .find(|(name, _)| {
+            name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+        })
+        .map(|(_, value)| value.as_str());
+    if expected.matches_origin(
+        &sampling_config.api_backend,
+        &sampling_config.base_url,
+        &sampling_config.model,
+        account,
+    ) {
+        Ok(true)
+    } else {
+        Err(
+            "identity-bound native Codex history requires the exact original backend, model, and ChatGPT account"
+                .to_string(),
+        )
+    }
+}
+
+/// Shared inherit budget for resume/fork of large transcripts (percent of
+/// child context window). Native opaque history may only pass when it also
+/// fits this budget with a complete tail — otherwise inheritance must abort
+/// rather than summarize.
+const SAFE_INHERIT_PERCENT: u64 = 80;
+
+/// Whether a transcript needs summarized/partial inheritance (oversize or
+/// incomplete tool-call tail). Ordinary forks may summarize; native opaque
+/// history must abort instead.
+fn requires_summarized_inheritance(items: &[ConversationItem], child_context_window: u64) -> bool {
+    let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
+    xai_chat_state::estimate_conversation_tokens(items) > threshold
+        || !conversation_tail_is_complete(items)
+}
+
+/// Fork policy for identity-bound native Codex history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeHistoryForkPolicy {
+    /// No identity-bound native history — ordinary summarize/verbatim rules apply.
+    Ordinary,
+    /// Native history present and safe to inherit only as a verbatim mirror.
+    VerbatimOnly,
+}
+
+/// Evaluate whether parent/source history may be forked into a child with the
+/// given sampling identity. Fail-closed on origin mismatch; abort when native
+/// history would require summarized or partial inheritance.
+fn evaluate_native_history_fork_policy(
+    items: &[ConversationItem],
+    sampling_config: &xai_grok_sampler::SamplerConfig,
+    child_context_window: u64,
+) -> Result<NativeHistoryForkPolicy, String> {
+    match native_history_replayability(items, sampling_config)? {
+        false => Ok(NativeHistoryForkPolicy::Ordinary),
+        true if requires_summarized_inheritance(items, child_context_window) => Err(
+            "identity-bound native Codex history can only be inherited verbatim; this parent transcript requires summarized or partial inheritance"
+                .to_string(),
+        ),
+        true => Ok(NativeHistoryForkPolicy::VerbatimOnly),
+    }
+}
+
 enum BootstrapInitialContext {
     Ready(InitialContext),
-    /// Explicit resume_from failed — abort spawn (fail closed).
+    /// Explicit resume or requested fork cannot safely inherit context.
     ResumeAbort(String),
 }
 /// Phase 3: resume (fail-closed on copy error) > fork (live then disk, fail-open) > New.
@@ -1065,8 +1137,9 @@ async fn bootstrap_initial_context(
     child_session_info: &SessionInfo,
     child_session_dir: &std::path::Path,
     effective_model_id: &str,
-    child_context_window: u64,
+    effective_sampling_config: &xai_grok_sampler::SamplerConfig,
 ) -> BootstrapInitialContext {
+    let child_context_window = effective_sampling_config.context_window;
     if request.fork_context && request.resume_from.is_some() {
         tracing::info!(
             subagent_id = %request.id,
@@ -1119,13 +1192,20 @@ async fn bootstrap_initial_context(
                         ));
                     }
                 };
+                if let Err(error) =
+                    native_history_replayability(&conversation, effective_sampling_config)
+                {
+                    return BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot resume from subagent '{}': {error}",
+                        source.subagent_id,
+                    ));
+                }
                 let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
-                const SAFE_RESUME_PERCENT: u64 = 80;
-                let threshold = child_context_window * SAFE_RESUME_PERCENT / 100;
+                let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
                 if estimated_tokens > threshold {
                     return BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot resume from subagent '{}': source transcript \
-                         (~{estimated_tokens} tokens) exceeds {SAFE_RESUME_PERCENT}% of \
+                         (~{estimated_tokens} tokens) exceeds {SAFE_INHERIT_PERCENT}% of \
                          the model's context window ({child_context_window} tokens). \
                          The source conversation is too large for the current model.",
                         source.subagent_id,
@@ -1164,6 +1244,15 @@ async fn bootstrap_initial_context(
         None => None,
     };
     if let Some(items) = live_items {
+        if let Err(error) = evaluate_native_history_fork_policy(
+            &items,
+            effective_sampling_config,
+            child_context_window,
+        ) {
+            return BootstrapInitialContext::ResumeAbort(format!(
+                "Cannot fork parent context: {error}"
+            ));
+        }
         let ctx_out = verbatim_or_normalize_fork(items, child_context_window);
         tracing::info!(
             subagent_id = %request.id,
@@ -1194,6 +1283,28 @@ async fn bootstrap_initial_context(
         let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
             crate::util::grok_home::grok_home(),
         );
+        let source_items = match storage.load_authoritative_chat_history_for_copy(parent_info) {
+            Ok(items) => items,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: failed to inspect authoritative source transcript before inheritance: {error}"
+                ));
+            }
+        };
+        let source_native_policy = match evaluate_native_history_fork_policy(
+            &source_items,
+            effective_sampling_config,
+            child_context_window,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: {error}"
+                ));
+            }
+        };
+        let source_has_native_history =
+            matches!(source_native_policy, NativeHistoryForkPolicy::VerbatimOnly);
         let copy_options = crate::session::storage::CopySessionOptions {
             parent_session_id: Some(ctx.parent_session_id.clone()),
             new_model_id: Some(effective_model_id.to_string()),
@@ -1204,7 +1315,11 @@ async fn bootstrap_initial_context(
             copy_plan_mode_state: false,
             copy_signals: false,
             copy_tool_state: false,
-            fork_filter: true,
+            // The decision and copy share this exact authoritative snapshot.
+            // Opaque native history must remain byte-for-byte; ordinary
+            // history keeps the established filtered disk-fork behavior.
+            source_chat_history: Some(source_items),
+            fork_filter: !source_has_native_history,
             ..Default::default()
         };
         return match storage.copy_session_data_sync(parent_info, child_session_info, copy_options) {
@@ -1216,32 +1331,51 @@ async fn bootstrap_initial_context(
                     tool_state = result.tool_state_copied,
                     "Fork-copied parent session data into child (disk fallback)"
                 );
-                let items = storage
-                    .load_chat_history_from_dir(child_session_dir)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to load forked chat history, starting with empty context"
-                        );
-                        vec![]
-                    });
-                BootstrapInitialContext::Ready(forked_initial_context(items))
+                let items = match storage.load_chat_history_from_dir(child_session_dir) {
+                    Ok(items) => items,
+                    Err(error) => {
+                        return BootstrapInitialContext::ResumeAbort(format!(
+                            "Cannot fork parent context: failed to inspect copied transcript before inheritance: {error}"
+                        ));
+                    }
+                };
+                match evaluate_native_history_fork_policy(
+                    &items,
+                    effective_sampling_config,
+                    child_context_window,
+                ) {
+                    Err(error) => BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot fork parent context: {error}"
+                    )),
+                    Ok(NativeHistoryForkPolicy::VerbatimOnly) => BootstrapInitialContext::Ready(
+                        verbatim_or_normalize_fork(items, child_context_window),
+                    ),
+                    Ok(NativeHistoryForkPolicy::Ordinary) => {
+                        BootstrapInitialContext::Ready(forked_initial_context(items))
+                    }
+                }
             }
             Err(e) => {
                 let err_msg = format!("{e}");
-                tracing::warn!(
-                    subagent_id = %request.id,
-                    subagent_type = %request.subagent_type,
-                    error = %e,
-                    "Failed to fork-copy parent session, falling back to fresh"
-                );
-                BootstrapInitialContext::Ready(InitialContext {
-                    source: InitialContextSource::New,
-                    copy_error: Some(err_msg),
-                    prefix_len: None,
-                    conversation: vec![],
-                    verbatim_fork: false,
-                })
+                if source_has_native_history {
+                    BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot fork parent context with identity-bound native Codex history: verbatim copy failed: {err_msg}"
+                    ))
+                } else {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        subagent_type = %request.subagent_type,
+                        error = %e,
+                        "Failed to fork-copy parent session, falling back to fresh"
+                    );
+                    BootstrapInitialContext::Ready(InitialContext {
+                        source: InitialContextSource::New,
+                        copy_error: Some(err_msg),
+                        prefix_len: None,
+                        conversation: vec![],
+                        verbatim_fork: false,
+                    })
+                }
             }
         };
     }

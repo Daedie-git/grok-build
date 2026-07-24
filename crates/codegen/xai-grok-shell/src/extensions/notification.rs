@@ -565,6 +565,13 @@ pub enum SessionUpdate {
     RewindMarker {
         /// The prompt index being rewound to (0-based).
         target_prompt_index: usize,
+        /// Unique rewind transaction identity for cache recovery diagnostics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_id: Option<String>,
+        /// Exact conversation JSON at the rewind commit point. New markers
+        /// persist this so startup can rebuild a cache that failed independently.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rewound_history_json: Option<String>,
         /// When the rewind occurred.
         created_at: String,
     },
@@ -1132,6 +1139,15 @@ impl From<FeedbackRequestData> for FeedbackRequestNotification {
 }
 
 // ── Compaction checkpoint types ────────────────────────────────────────
+
+/// Legacy checkpoints may contain a pre-install local summary rather than the
+/// exact transformed history that was installed into the live session.
+pub const LEGACY_COMPACTION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+/// Checkpoints at this version contain the exact finalized replacement history.
+pub const FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+/// Newest compaction checkpoint schema this binary can safely replay.
+pub const MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION: u32 =
+    FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION;
 
 /// Metadata stored in `updates.jsonl` as a `CompactionCheckpoint` session update.
 ///

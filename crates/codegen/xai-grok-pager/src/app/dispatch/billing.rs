@@ -368,6 +368,11 @@ pub(super) fn handle_billing_fetched(
     // Render the `/usage` summary from the now-current cached rule.
     let summary_topup = app.auto_topup.clone();
     if let Some(agent) = app.agents.get_mut(&agent_id) {
+        // A fetch can race a model switch. Keep the app-level Grok cache, but
+        // never attach or render Grok billing on a now-Codex agent.
+        if agent.session.models.current_model_is_codex() {
+            return vec![];
+        }
         // Gateway/chat-kind: do not attach Build coding credits.
         let mut topup = agent.auto_topup.clone();
         apply_auto_topup(&mut topup, &autotopup);
@@ -383,6 +388,51 @@ pub(super) fn handle_billing_fetched(
                 crate::scrollback::blocks::SystemMessageBlock::new(msg),
             ));
         }
+    }
+    vec![]
+}
+
+/// Select the account-usage backend from the active model provider.
+pub(crate) fn account_usage_refresh_effect(
+    agent: &mut AgentView,
+    agent_id: AgentId,
+    silent: bool,
+) -> Effect {
+    if agent.session.models.current_model_is_codex() {
+        agent.codex_rate_limits_generation = agent.codex_rate_limits_generation.wrapping_add(1);
+        Effect::FetchCodexRateLimits {
+            agent_id,
+            silent,
+            generation: agent.codex_rate_limits_generation,
+        }
+    } else {
+        Effect::FetchBilling { agent_id, silent }
+    }
+}
+
+pub(super) fn handle_codex_rate_limits_fetched(
+    app: &mut AppView,
+    agent_id: AgentId,
+    limits: xai_grok_shell::extensions::codex_usage::CodexRateLimits,
+    silent: bool,
+    generation: u64,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    // Drop a stale completion that raced a switch back to a non-Codex model.
+    if !agent.session.models.current_model_is_codex()
+        || generation != agent.codex_rate_limits_generation
+    {
+        return vec![];
+    }
+    agent.apply_codex_rate_limits(limits.clone());
+    if !silent && !agent.chat_kind {
+        agent.scrollback.push_block(RenderBlock::System(
+            crate::scrollback::blocks::SystemMessageBlock::new(
+                crate::views::codex_usage::format_usage_summary(&limits),
+            ),
+        ));
     }
     vec![]
 }
@@ -521,10 +571,9 @@ pub(super) fn handle_credit_limit_recheck_complete(
     agent.credit_limit_stashed_prompt = None;
 
     let mut drain = maybe_drain_queue(agent);
-    drain.effects.push(Effect::FetchBilling {
-        agent_id,
-        silent: true,
-    });
+    drain
+        .effects
+        .push(account_usage_refresh_effect(agent, agent_id, true));
     note_peek_page_flip(app, agent_id, drain.page_flip_entry);
     drain.effects
 }

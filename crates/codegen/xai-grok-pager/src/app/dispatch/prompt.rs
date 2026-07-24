@@ -501,6 +501,29 @@ pub(super) fn dispatch_send_prompt_inner(
 
     let mut effects = Vec::new();
 
+    // A Grok subscription tier must not gate Codex's own account-usage
+    // surface. The registry deny-list is app-global, so bypass it for the
+    // read-only Codex usage aliases when the active model is Codex-backed.
+    if !literal
+        && let Some(invocation) = crate::slash::parse_invocation(trimmed)
+        && agent.session.models.current_model_is_codex()
+        && matches!(
+            invocation.token.to_ascii_lowercase().as_str(),
+            "usage" | "cost"
+        )
+        && matches!(invocation.args, "" | "show")
+        && agent
+            .prompt
+            .slash_controller
+            .registry()
+            .is_restricted(invocation.token)
+    {
+        if consume_input {
+            agent.prompt.set_text("");
+        }
+        return super::status::dispatch_show_usage(app);
+    }
+
     // ── Tier-restricted command upsell ─────────────────────────────
     // Restricted commands (`/usage`, `/imagine`, …) are hidden from the
     // registry's `get()`, so a typed invocation would otherwise fall
@@ -1591,10 +1614,9 @@ pub(super) fn handle_prompt_response(
             });
         }
 
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-        });
+        effects.push(super::billing::account_usage_refresh_effect(
+            agent, agent_id, true,
+        ));
         note_peek_page_flip(app, agent_id, page_flip_entry);
         return effects;
     }

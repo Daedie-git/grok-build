@@ -1,5 +1,6 @@
 pub(crate) mod attribution;
 mod auth_provider;
+pub mod codex;
 mod config;
 pub mod credential_provider;
 #[path = "devbox_login_stub.rs"]
@@ -24,6 +25,10 @@ pub(crate) use auth_provider::{
 };
 #[cfg(test)]
 pub(crate) use auth_provider::{test_backdate_provider_mint, test_counting_provider};
+pub use codex::{
+    CodexAuthError, CodexCredentials, default_auth_path as codex_auth_path, load_codex_credentials,
+    load_codex_credentials_async, run_cli_login_codex,
+};
 pub(crate) use config::LEGACY_AUTH_SCOPE;
 pub use config::{
     ForceLoginTeam, GrokComConfig, OAuth2ProviderConfig, OidcAuthConfig, PreferredAuthMethod,

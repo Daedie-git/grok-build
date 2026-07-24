@@ -1171,6 +1171,7 @@ fn token_estimation_accounts_for_images() {
             content: vec![ContentPart::Text {
                 text: "describe this".into(),
             }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })];
@@ -1184,6 +1185,7 @@ fn token_estimation_accounts_for_images() {
                     url: "data:image/png;base64,abc".into(),
                 },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })];
@@ -1199,6 +1201,7 @@ fn token_estimation_accounts_for_images() {
                 ContentPart::Image { url: "img2".into() },
                 ContentPart::Image { url: "img3".into() },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })];

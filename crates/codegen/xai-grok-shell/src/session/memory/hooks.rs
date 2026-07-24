@@ -200,6 +200,7 @@ mod tests {
     fn make_user(text: &str) -> ConversationItem {
         ConversationItem::User(UserItem {
             content: vec![ContentPart::Text { text: text.into() }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })
@@ -225,6 +226,7 @@ mod tests {
     fn make_assistant(text: &str) -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: text.into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,

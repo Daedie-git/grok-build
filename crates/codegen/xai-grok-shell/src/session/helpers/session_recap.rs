@@ -387,6 +387,7 @@ mod tests {
                 content: vec![ContentPart::Text {
                     text: Arc::from("injected"),
                 }],
+                response_item_id: None,
                 synthetic_reason: Some(SyntheticReason::SystemReminder),
                 ..Default::default()
             }),

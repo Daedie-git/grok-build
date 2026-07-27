@@ -132,6 +132,7 @@ impl ResponsesWireAdapter {
 mod codex {
     use super::*;
 
+    const KEEPALIVE_EVENT: &str = "keepalive";
     const RESPONSE_METADATA_EVENT: &str = "response.metadata";
 
     pub(super) fn decode_sideband(
@@ -139,15 +140,17 @@ mod codex {
         turn_routing: TurnRoutingPolicy,
     ) -> Result<Option<ResponsesSideband>> {
         // Avoid parsing every ordinary delta twice. The JSON discriminator
-        // below remains authoritative when the cheap prefilter matches.
-        if !data.contains(RESPONSE_METADATA_EVENT) {
+        // below remains authoritative when either cheap prefilter matches.
+        if !data.contains(RESPONSE_METADATA_EVENT) && !data.contains(KEEPALIVE_EVENT) {
             return Ok(None);
         }
 
         let value = serde_json::from_str::<serde_json::Value>(data)
             .map_err(SamplingError::Serialization)?;
-        if value.get("type").and_then(serde_json::Value::as_str) != Some(RESPONSE_METADATA_EVENT) {
-            return Ok(None);
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some(KEEPALIVE_EVENT) => return Ok(Some(ResponsesSideband::default())),
+            Some(RESPONSE_METADATA_EVENT) => {}
+            _ => return Ok(None),
         }
 
         let Some(headers) = value.get("headers") else {
@@ -225,13 +228,24 @@ mod tests {
     }
 
     #[test]
-    fn standard_protocol_leaves_codex_metadata_for_fail_closed_decoder() {
-        assert!(
-            ResponsesWireAdapter::new(ResponsesWireProtocol::Standard, TurnRoutingPolicy::None)
-                .decode_sideband(METADATA_FRAME)
-                .unwrap()
-                .is_none()
-        );
+    fn codex_consumes_keepalive_as_noop_sideband() {
+        let sideband = ResponsesWireAdapter::new(
+            ResponsesWireProtocol::Codex,
+            TurnRoutingPolicy::FirstValueWinsHeader("x-codex-turn-state"),
+        )
+        .decode_sideband(r#"{"type":"keepalive"}"#)
+        .unwrap()
+        .expect("recognized heartbeat");
+        assert_eq!(sideband, ResponsesSideband::default());
+    }
+
+    #[test]
+    fn standard_protocol_leaves_codex_sidebands_for_fail_closed_decoder() {
+        let adapter =
+            ResponsesWireAdapter::new(ResponsesWireProtocol::Standard, TurnRoutingPolicy::None);
+        for frame in [METADATA_FRAME, r#"{"type":"keepalive"}"#] {
+            assert!(adapter.decode_sideband(frame).unwrap().is_none(), "{frame}");
+        }
     }
 
     #[test]
@@ -239,6 +253,8 @@ mod tests {
         for frame in [
             r#"{"type":"response.metadata.delta"}"#,
             r#"{"type":"response.failed","message":"response.metadata"}"#,
+            r#"{"type":"keepalive.delta"}"#,
+            r#"{"type":"response.failed","message":"keepalive"}"#,
         ] {
             assert!(
                 ResponsesWireAdapter::new(

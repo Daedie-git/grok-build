@@ -51,6 +51,7 @@ impl SessionActor {
             temperature: sampling_config.temperature,
             top_p: sampling_config.top_p,
             api_backend: sampling_config.api_backend.clone(),
+            provider_id: sampling_config.provider_id,
             extra_headers: sampling_config.extra_headers.clone(),
             query_params: sampling_config.query_params.clone(),
             env_http_headers: sampling_config.env_http_headers.clone(),
@@ -72,9 +73,14 @@ impl SessionActor {
             alpha_test_key: current.credentials.alpha_test_key,
             client_version: sampling_config.client_version.clone(),
         };
+        let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+            proposed_config,
+            sampling_identity,
+        )
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
         let transition = self
             .chat_state_handle
-            .transition_sampling_state(proposed_config, proposed_credentials, sampling_identity)
+            .transition_sampling_state(target, proposed_credentials)
             .await
             .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
         match transition {
@@ -198,7 +204,8 @@ impl SessionActor {
             proposed_credentials.auth_type = resolved.auth_type;
         }
 
-        let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+        let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+            proposed_config.provider_id,
             proposed_config.api_backend.clone(),
             &proposed_config.base_url,
             &proposed_config.model,
@@ -206,9 +213,14 @@ impl SessionActor {
             &proposed_config.env_http_headers,
         )
         .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+            proposed_config,
+            sampling_identity,
+        )
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
         let transition = self
             .chat_state_handle
-            .transition_sampling_state(proposed_config, proposed_credentials, sampling_identity)
+            .transition_sampling_state(target, proposed_credentials)
             .await
             .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
         match transition {

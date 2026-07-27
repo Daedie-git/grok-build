@@ -38,11 +38,11 @@ impl CompactionStrategy {
 /// `/compact <context>` remains local because the native endpoint has no field
 /// for user-authored summary guidance; silently discarding it is unsafe.
 pub(in super::super) fn select_compaction_strategy(
-    base_url: &str,
+    capabilities: xai_grok_sampling_types::ProviderCapabilities,
     override_value: Option<&str>,
     user_context_supplied: bool,
 ) -> CompactionStrategy {
-    if !xai_grok_sampling_types::capabilities_for_base_url(base_url).native_compact {
+    if !capabilities.supports_native_compact() {
         return CompactionStrategy::LocalSummary;
     }
 
@@ -412,7 +412,19 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
     use xai_grok_sampler::{SamplerConfig, SamplingClient};
-    use xai_grok_sampling_types::{CODEX_BACKEND_BASE_URL, ConversationItem, SamplingError};
+    use xai_grok_sampling_types::{
+        ApiBackend, CODEX_BACKEND_BASE_URL, ConversationItem, ProviderCapabilities, ProviderId,
+        SamplingError, resolve_provider,
+    };
+
+    fn provider_capabilities(provider_id: ProviderId) -> ProviderCapabilities {
+        resolve_provider(
+            Some(provider_id),
+            ApiBackend::Responses,
+            "http://127.0.0.1:3210/v1",
+        )
+        .capabilities()
+    }
 
     fn api_error(status: StatusCode) -> SamplingError {
         SamplingError::Api {
@@ -428,13 +440,13 @@ mod tests {
     fn native_requires_an_explicit_valid_opt_in() {
         for value in [None, Some(""), Some("local"), Some("bogus")] {
             assert_eq!(
-                select_compaction_strategy(CODEX_BACKEND_BASE_URL, value, false),
+                select_compaction_strategy(provider_capabilities(ProviderId::Codex), value, false,),
                 CompactionStrategy::LocalSummary
             );
         }
         for value in [Some("native"), Some(" native_codex ")] {
             assert_eq!(
-                select_compaction_strategy(CODEX_BACKEND_BASE_URL, value, false),
+                select_compaction_strategy(provider_capabilities(ProviderId::Codex), value, false,),
                 CompactionStrategy::NativeCodex
             );
         }
@@ -443,11 +455,15 @@ mod tests {
     #[test]
     fn non_codex_and_manual_guidance_remain_local() {
         assert_eq!(
-            select_compaction_strategy("https://api.openai.com/v1", Some("native"), false),
+            select_compaction_strategy(
+                provider_capabilities(ProviderId::OpenAiCompatible),
+                Some("native"),
+                false,
+            ),
             CompactionStrategy::LocalSummary
         );
         assert_eq!(
-            select_compaction_strategy(CODEX_BACKEND_BASE_URL, None, true),
+            select_compaction_strategy(provider_capabilities(ProviderId::Codex), None, true,),
             CompactionStrategy::LocalSummary
         );
     }

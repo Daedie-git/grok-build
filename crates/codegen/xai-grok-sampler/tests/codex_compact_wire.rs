@@ -23,6 +23,13 @@ struct CapturedRequest {
     body: Value,
 }
 
+fn codex_test_config(base_url: &str, api_key: &str) -> xai_grok_sampler::SamplerConfig {
+    let mut config = support::test_config(base_url, api_key);
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+    config
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
     let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
@@ -75,7 +82,7 @@ async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let mut cfg = support::test_config(&format!("http://{addr}/v1"), "test-codex-token");
+    let mut cfg = codex_test_config(&format!("http://{addr}/v1"), "test-codex-token");
     cfg.extra_headers
         .insert(CHATGPT_ACCOUNT_ID_HEADER.into(), "acct_test_native".into());
     let client = SamplingClient::new(cfg).expect("client builds");
@@ -236,13 +243,12 @@ async fn unsupported_provider_neither_sends_nor_captures_turn_routing_state() {
         let _ = axum::serve(listener, app).await;
     });
 
-    // A loopback URL has the default capability set, even though these test
-    // routes emulate Responses endpoints and return the Codex-specific header.
-    let client = SamplingClient::new(support::test_config(
-        &format!("http://{addr}/v1"),
-        "test-token",
-    ))
-    .unwrap();
+    // Explicit non-Codex identity must win even though these test routes emit
+    // Codex-specific headers.
+    let mut config = support::test_config(&format!("http://{addr}/v1"), "test-token");
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.provider_id = Some(xai_grok_sampling_types::ProviderId::Custom);
+    let client = SamplingClient::new(config).unwrap();
     let populated = TurnRoutingState::fresh();
     assert!(populated.capture_first("client-state".to_string()));
     let request = ConversationRequest {
@@ -255,10 +261,10 @@ async fn unsupported_provider_neither_sends_nor_captures_turn_routing_state() {
         .await
         .expect("ordinary request succeeds");
     drop(stream);
-    client
-        .conversation_compact_responses(request)
-        .await
-        .expect("compact request succeeds");
+    assert!(matches!(
+        client.conversation_compact_responses(request).await,
+        Err(SamplingError::InvalidConfiguration(_))
+    ));
     assert_eq!(populated.value(), Some("client-state"));
 
     let fresh = TurnRoutingState::fresh();
@@ -277,7 +283,10 @@ async fn unsupported_provider_neither_sends_nor_captures_turn_routing_state() {
         "unsupported response must not capture"
     );
     assert_eq!(*ordinary_headers.lock().unwrap(), vec![None, None]);
-    assert_eq!(*compact_headers.lock().unwrap(), vec![None]);
+    assert!(
+        compact_headers.lock().unwrap().is_empty(),
+        "unsupported provider must reject native compact before HTTP"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -307,7 +316,7 @@ async fn invalid_native_manifest_is_rejected_by_both_endpoints_before_http() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))
@@ -435,7 +444,7 @@ async fn native_compact_preserves_actionable_detail_error() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))
@@ -478,7 +487,7 @@ async fn native_compact_classifies_unauthorized_as_auth() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))

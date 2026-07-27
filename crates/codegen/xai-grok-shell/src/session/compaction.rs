@@ -586,7 +586,7 @@ fn codex_auto_compaction_needs_prefit(
 fn initial_compaction_input_stage(
     verbatim_input_enabled: bool,
     auto_trigger: bool,
-    base_url: &str,
+    capabilities: xai_grok_sampling_types::ProviderCapabilities,
     prepared_history_tokens: u64,
     context_window: u64,
     tool_tokens: u64,
@@ -596,7 +596,7 @@ fn initial_compaction_input_stage(
         return CompactionInputStage::Lossy;
     }
     if auto_trigger
-        && xai_grok_sampling_types::capabilities_for_base_url(base_url).provider_auto_compact_safety
+        && capabilities.enforces_auto_compact_safety()
         && codex_auto_compaction_needs_prefit(
             prepared_history_tokens,
             context_window,
@@ -650,11 +650,17 @@ mod codex_prefit_tests {
         let prompt_tokens = 2_000;
         let over_budget =
             fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens) + 1;
-        let stage = |verbatim, auto, base_url| {
+        let stage = |verbatim, auto, provider_id| {
+            let capabilities = xai_grok_sampling_types::resolve_provider(
+                Some(provider_id),
+                xai_grok_sampling_types::ApiBackend::Responses,
+                "http://127.0.0.1:3210/v1",
+            )
+            .capabilities();
             initial_compaction_input_stage(
                 verbatim,
                 auto,
-                base_url,
+                capabilities,
                 over_budget,
                 context_window,
                 tool_tokens,
@@ -663,22 +669,26 @@ mod codex_prefit_tests {
         };
 
         assert_eq!(
-            stage(true, true, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(true, true, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::VerbatimFitted,
             "automatic over-budget Codex must prefit"
         );
         assert_eq!(
-            stage(true, false, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(true, false, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::Verbatim,
             "manual Codex keeps the normal ladder entry"
         );
         assert_eq!(
-            stage(true, true, "https://api.openai.com/v1"),
+            stage(
+                true,
+                true,
+                xai_grok_sampling_types::ProviderId::OpenAiCompatible,
+            ),
             CompactionInputStage::Verbatim,
             "automatic non-Codex keeps the normal ladder entry"
         );
         assert_eq!(
-            stage(false, true, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(false, true, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::Lossy,
             "disabled verbatim input starts lossy"
         );
@@ -698,10 +708,16 @@ mod codex_prefit_tests {
         let tool_tokens = 2_000;
         let prompt_tokens = 1_000;
         let budget = fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens);
+        let capabilities = xai_grok_sampling_types::resolve_provider(
+            Some(xai_grok_sampling_types::ProviderId::Codex),
+            xai_grok_sampling_types::ApiBackend::Responses,
+            "http://127.0.0.1:3210/v1",
+        )
+        .capabilities();
         let stage = initial_compaction_input_stage(
             true,
             true,
-            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            capabilities,
             history_tokens,
             context_window,
             tool_tokens,
@@ -1407,6 +1423,11 @@ impl SessionActor {
                 .data("Compaction failed: no system message in simplified conversation"));
         }
         let sampling_config = self.reconstruct_full_config().await;
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_config.provider_id,
+            sampling_config.api_backend.clone(),
+            &sampling_config.base_url,
+        );
         let sampling_client = self.prepare_chat_completion(false).await?;
         let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
@@ -1433,7 +1454,7 @@ impl SessionActor {
         let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let strategy_override = std::env::var("GROK_CODEX_COMPACTION_STRATEGY").ok();
         let mut strategy = select_compaction_strategy(
-            &sampling_config.base_url,
+            provider.capabilities(),
             strategy_override.as_deref(),
             user_context.is_some(),
         );
@@ -1546,7 +1567,7 @@ impl SessionActor {
             initial_compaction_input_stage(
                 verbatim_input_enabled,
                 auto_trigger,
-                &sampling_config.base_url,
+                provider.capabilities(),
                 estimated_input_tokens,
                 context_window,
                 compaction_tool_tokens,
@@ -2405,8 +2426,15 @@ impl SessionActor {
             .compaction_at_tokens
             .get()
             .and_then(|limit| limit.resolve(cfg.context_window.get(), 90));
-        crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+        let safety = xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
             &cfg.base_url,
+        )
+        .capabilities()
+        .auto_compact_safety();
+        crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+            safety,
             cfg.context_window,
             configured_limit,
         )
@@ -2488,9 +2516,12 @@ impl SessionActor {
         // Keep this hard provider gate live during FINALIZING so post-compact
         // refill hits claim_bounded and fail-closes before another model call.
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await?;
-        if !xai_grok_sampling_types::capabilities_for_base_url(&sampling_cfg.base_url)
-            .provider_auto_compact_safety
-        {
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_cfg.provider_id,
+            sampling_cfg.api_backend.clone(),
+            &sampling_cfg.base_url,
+        );
+        if !provider.capabilities().enforces_auto_compact_safety() {
             return None;
         }
         let context_window = sampling_cfg.context_window;
@@ -2499,7 +2530,7 @@ impl SessionActor {
             .get()
             .and_then(|limit| limit.resolve(context_window.get(), 90));
         let limit = crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
-            &sampling_cfg.base_url,
+            provider.capabilities().auto_compact_safety(),
             context_window,
             configured_limit,
         )?
@@ -3077,6 +3108,7 @@ mod inline_auto_compact_flow_tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

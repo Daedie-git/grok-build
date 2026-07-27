@@ -1245,24 +1245,21 @@ pub fn captured_response_to_conversation_items(
     let mut items = Vec::with_capacity(output.len() + 2);
     let mut content = String::new();
     let mut response_item_id = None;
+    let mut exact_message_indices = Vec::new();
+    let mut exact_message_ids = std::collections::BTreeSet::new();
     let mut tool_calls = Vec::new();
 
     for captured in output {
         match captured.value {
             CapturedResponseOutputItemValue::Typed(rs::OutputItem::Message(message)) => {
-                if response_item_id.is_some() && require_exact {
-                    return Err(
-                        "multiple Codex Responses messages cannot collapse losslessly".into(),
-                    );
-                }
-                response_item_id = Some(message.id);
+                let mut message_content = String::new();
                 for part in message.content {
                     match part {
                         rs::OutputMessageContent::OutputText(text) => {
-                            if !content.is_empty() {
-                                content.push('\n');
+                            if !message_content.is_empty() {
+                                message_content.push('\n');
                             }
-                            content.push_str(&text.text);
+                            message_content.push_str(&text.text);
                         }
                         _ if require_exact => {
                             return Err(
@@ -1272,8 +1269,34 @@ pub fn captured_response_to_conversation_items(
                         _ => {}
                     }
                 }
-                if content.is_empty() && require_exact {
-                    return Err("empty Codex Responses message cannot be replayed exactly".into());
+
+                if require_exact {
+                    if message_content.is_empty() {
+                        return Err(
+                            "empty Codex Responses message cannot be replayed exactly".into()
+                        );
+                    }
+                    if message.id.is_empty() {
+                        return Err("Codex Responses message id is empty".into());
+                    }
+                    if !exact_message_ids.insert(message.id.clone()) {
+                        return Err("Codex Responses message id is duplicated".into());
+                    }
+                    exact_message_indices.push(items.len());
+                    items.push(ConversationItem::Assistant(AssistantItem {
+                        content: std::sync::Arc::<str>::from(message_content),
+                        response_item_id: Some(message.id),
+                        tool_calls: Vec::new(),
+                        model_id: None,
+                        model_fingerprint: None,
+                        reasoning_effort: None,
+                    }));
+                } else {
+                    response_item_id = Some(message.id);
+                    if !content.is_empty() && !message_content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&message_content);
                 }
             }
             CapturedResponseOutputItemValue::Typed(rs::OutputItem::FunctionCall(call)) => {
@@ -1318,14 +1341,35 @@ pub fn captured_response_to_conversation_items(
         }
     }
 
-    items.push(ConversationItem::Assistant(AssistantItem {
-        content: std::sync::Arc::<str>::from(content),
-        response_item_id,
-        tool_calls,
-        model_id: Some(model_id),
-        model_fingerprint,
-        reasoning_effort,
-    }));
+    if require_exact {
+        if let Some(last_message_index) = exact_message_indices.last().copied() {
+            let ConversationItem::Assistant(assistant) = &mut items[last_message_index] else {
+                unreachable!("exact message index must identify an assistant item");
+            };
+            assistant.tool_calls = tool_calls;
+            assistant.model_id = Some(model_id);
+            assistant.model_fingerprint = model_fingerprint;
+            assistant.reasoning_effort = reasoning_effort;
+        } else {
+            items.push(ConversationItem::Assistant(AssistantItem {
+                content: std::sync::Arc::<str>::from(content),
+                response_item_id,
+                tool_calls,
+                model_id: Some(model_id),
+                model_fingerprint,
+                reasoning_effort,
+            }));
+        }
+    } else {
+        items.push(ConversationItem::Assistant(AssistantItem {
+            content: std::sync::Arc::<str>::from(content),
+            response_item_id,
+            tool_calls,
+            model_id: Some(model_id),
+            model_fingerprint,
+            reasoning_effort,
+        }));
+    }
     if let Some(manifest) = response_manifest {
         items.insert(
             0,
@@ -1921,12 +1965,9 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .iter_mut()
-            .find(|item| item["type"] == "provider" && item["kind"] == "native_compaction_metadata")
+            .find(|item| item["type"] == "native_compaction_metadata")
             .unwrap();
-        descriptor["payload"]
-            .as_object_mut()
-            .unwrap()
-            .remove("item_metadata");
+        descriptor.as_object_mut().unwrap().remove("item_metadata");
         assert!(
             serde_json::from_value::<Vec<ConversationItem>>(persisted).is_err(),
             "schema-v2 manifest must not disappear through a serde default"
@@ -2412,6 +2453,204 @@ mod tests {
                 "turn-4"
             );
         }
+    }
+
+    #[test]
+    fn multiple_exact_messages_round_trip_as_distinct_assistants() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs_multi_0", "summary": [],
+                    "encrypted_content": "cipher-0", "status": "completed",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-0"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "message", "id": "msg_multi_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "progress", "annotations": []}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                2,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc_multi_2", "call_id": "call_multi_2",
+                    "name": "read_file", "arguments": "{}",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-2"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                3,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs_multi_3", "summary": [],
+                    "encrypted_content": "cipher-3", "status": "completed"
+                }),
+                &origin,
+            ),
+            captured_item(
+                4,
+                serde_json::json!({
+                    "type": "message", "id": "msg_multi_4", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "final", "annotations": []}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-4"}
+                }),
+                &origin,
+            ),
+        ];
+        let mut response = completed_response();
+        response.id = "resp-multi-message".into();
+        let durable = captured_response_to_conversation_items(response, output).unwrap();
+        let assistants = durable
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0].content.as_ref(), "progress");
+        assert_eq!(
+            assistants[0].response_item_id.as_deref(),
+            Some("msg_multi_1")
+        );
+        assert!(assistants[0].tool_calls.is_empty());
+        assert!(assistants[0].model_id.is_none());
+        assert_eq!(assistants[1].content.as_ref(), "final");
+        assert_eq!(
+            assistants[1].response_item_id.as_deref(),
+            Some("msg_multi_4")
+        );
+        assert_eq!(assistants[1].tool_calls.len(), 1);
+        assert_eq!(assistants[1].tool_calls[0].id.as_ref(), "call_multi_2");
+        assert_eq!(assistants[1].model_id.as_deref(), Some("gpt-codex"));
+
+        let cold: Vec<ConversationItem> =
+            serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+        let request = ConversationRequest {
+            items: cold,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = [
+            ("reasoning", Some("rs_multi_0"), None),
+            ("message", Some("msg_multi_1"), None),
+            ("function_call", Some("fc_multi_2"), Some("call_multi_2")),
+            ("reasoning", Some("rs_multi_3"), None),
+            ("message", Some("msg_multi_4"), None),
+        ];
+        for wire in [&ordinary, &compact] {
+            let input = wire["input"].as_array().unwrap();
+            assert_eq!(
+                input.iter().map(input_identity).collect::<Vec<_>>(),
+                expected
+            );
+            for (index, turn_id) in [(0, "turn-0"), (1, "turn-1"), (2, "turn-2"), (4, "turn-4")] {
+                assert_eq!(
+                    input[index]["internal_chat_message_metadata_passthrough"]["turn_id"],
+                    turn_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_multi_message_conversion_keeps_legacy_collapsing_behavior() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let mut output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "message", "id": "msg-generic-0", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "first", "annotations": []}]
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "message", "id": "msg-generic-1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "second", "annotations": []}]
+                }),
+                &origin,
+            ),
+        ];
+        for item in &mut output {
+            item.metadata_origin = None;
+        }
+        let durable =
+            captured_response_to_conversation_items(completed_response(), output).unwrap();
+        assert_eq!(durable.len(), 1);
+        let ConversationItem::Assistant(assistant) = &durable[0] else {
+            panic!("generic response must retain one collapsed assistant");
+        };
+        assert_eq!(assistant.content.as_ref(), "first\nsecond");
+        assert_eq!(assistant.response_item_id.as_deref(), Some("msg-generic-1"));
+    }
+
+    #[test]
+    fn duplicate_exact_message_ids_fail_closed() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                captured_item(
+                    index as u32,
+                    serde_json::json!({
+                        "type": "message", "id": "msg-duplicate", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}]
+                    }),
+                    &origin,
+                )
+            })
+            .collect();
+        let error = captured_response_to_conversation_items(completed_response(), output)
+            .expect_err("duplicate provider message ids cannot bind uniquely");
+        assert!(error.contains("duplicated"), "{error}");
+    }
+
+    #[test]
+    fn empty_exact_message_id_fails_closed() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![captured_item(
+            0,
+            serde_json::json!({
+                "type": "message", "id": "", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+            }),
+            &origin,
+        )];
+
+        let error = captured_response_to_conversation_items(completed_response(), output)
+            .expect_err("empty provider message ids cannot bind uniquely");
+        assert!(error.contains("id is empty"), "{error}");
     }
 
     #[test]

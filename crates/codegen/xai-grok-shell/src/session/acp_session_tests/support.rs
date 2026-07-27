@@ -219,6 +219,7 @@ pub(crate) async fn create_test_actor_ex(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

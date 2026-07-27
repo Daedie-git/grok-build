@@ -1683,6 +1683,7 @@ mod reasoning_compaction_regression_tests {
             temperature: Some(0.7),
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
             query_params: Default::default(),

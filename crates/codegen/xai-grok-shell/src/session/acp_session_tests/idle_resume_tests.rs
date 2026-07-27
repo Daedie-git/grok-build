@@ -109,6 +109,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),

@@ -432,6 +432,7 @@ impl SessionActor {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -468,8 +469,13 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if !xai_grok_sampling_types::capabilities_for_base_url(&cfg.base_url)
-            .skip_grok_compaction_headers
+        if !xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
+            &cfg.base_url,
+        )
+        .capabilities()
+        .skips_grok_compaction_headers()
             && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
         {
             let has_compaction_summary = self
@@ -501,6 +507,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            provider_id: cfg.provider_id,
             auth_scheme,
             extra_headers,
             query_params: cfg.query_params.clone(),

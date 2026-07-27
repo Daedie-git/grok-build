@@ -175,15 +175,13 @@ impl ChatStateHandle {
     /// history against the caller's effective runtime sampling identity.
     pub async fn transition_sampling_state(
         &self,
-        config: SamplingConfig,
+        target: xai_grok_sampling_types::ResolvedSamplingTarget,
         credentials: Credentials,
-        identity: xai_grok_sampling_types::SamplingIdentity,
     ) -> Option<SamplingTransitionResult> {
         self.query("TransitionSamplingState", |reply| {
             ChatStateCommand::TransitionSamplingState {
-                config,
+                target,
                 credentials,
-                identity,
                 reply,
             }
         })

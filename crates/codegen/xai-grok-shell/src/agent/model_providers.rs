@@ -3,6 +3,7 @@ use indexmap::IndexMap;
 use super::config::{ConfigModelOverride, EnvKeys};
 use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
 use crate::sampling::ApiBackend;
+use xai_grok_sampling_types::ProviderId;
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(default)]
@@ -12,6 +13,7 @@ pub struct ModelProviderConfig {
     pub env_key: Option<EnvKeys>,
     pub api_key: Option<String>,
     pub api_backend: Option<ApiBackend>,
+    pub provider_id: Option<ProviderId>,
     pub extra_headers: IndexMap<String, String>,
     /// Query parameters folded into every request URL; inherited by models.
     pub query_params: IndexMap<String, String>,
@@ -179,6 +181,7 @@ impl ConfigModelOverride {
             env_key,
             api_key,
             api_backend,
+            provider_id: logical_provider_id,
             extra_headers,
             query_params,
             env_http_headers,
@@ -192,6 +195,7 @@ impl ConfigModelOverride {
         merged.base_url = merged.base_url.or_else(|| base_url.clone());
         merged.api_base_url = merged.api_base_url.or_else(|| api_base_url.clone());
         merged.api_backend = merged.api_backend.or_else(|| api_backend.clone());
+        merged.provider_id = merged.provider_id.or(*logical_provider_id);
         merged.context_window = merged.context_window.or(*context_window);
         // Inherited wholesale only when the model sets none of its own.
         if merged.extra_headers.is_empty() {

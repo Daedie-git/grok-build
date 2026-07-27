@@ -218,6 +218,7 @@ impl ShellToolsetConfig {
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Xai),
             auth_scheme: Default::default(),
             extra_headers: indexmap::IndexMap::new(),
             query_params: indexmap::IndexMap::new(),

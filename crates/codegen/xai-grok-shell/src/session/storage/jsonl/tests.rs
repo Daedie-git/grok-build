@@ -2671,6 +2671,10 @@ fn fork_filter_preserves_complete_tool_turn() {
 #[test]
 fn fork_filter_preserves_responses_metadata_for_complete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
+    use xai_grok_sampling_types::{
+        InternalChatMessageMetadataPassthrough, ResponseOutputItemKind,
+        ResponseOutputItemMetadata, ResponseOutputItemOrder,
+    };
     let metadata = |response_id: &str, kind, call_id: &str| {
         ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
             response_id: response_id.into(),
@@ -4112,6 +4116,7 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

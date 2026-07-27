@@ -146,7 +146,8 @@ pub(crate) async fn apply(
     }
     let applied_effort = model_sampling.reasoning_effort;
 
-    let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+    let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+        model_sampling.provider_id,
         model_sampling.api_backend.clone(),
         &model_sampling.base_url,
         &model_sampling.model,

@@ -523,6 +523,7 @@ pub(crate) async fn spawn_session_actor(
         temperature: sampling_config.temperature,
         top_p: sampling_config.top_p,
         api_backend: sampling_config.api_backend.clone(),
+        provider_id: sampling_config.provider_id,
         extra_headers: sampling_config.extra_headers.clone(),
         query_params: sampling_config.query_params.clone(),
         env_http_headers: sampling_config.env_http_headers.clone(),

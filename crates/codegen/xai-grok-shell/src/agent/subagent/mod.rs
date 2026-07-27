@@ -727,6 +727,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
+                provider_id: cfg.provider_id,
                 auth_scheme,
                 extra_headers,
                 query_params: cfg.query_params.clone(),
@@ -1055,7 +1056,8 @@ fn native_history_replayability(
     items: &[ConversationItem],
     sampling_config: &xai_grok_sampler::SamplerConfig,
 ) -> Result<bool, String> {
-    let identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+    let identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+        sampling_config.provider_id,
         sampling_config.api_backend.clone(),
         &sampling_config.base_url,
         &sampling_config.model,

@@ -1040,6 +1040,10 @@ pub struct SamplingConfig {
     /// Which API backend to use for this model
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// Explicit logical provider identity. Absent values retain legacy URL
+    /// inference when loading older chat-state snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<crate::ProviderId>,
     /// Extra headers to send with requests (e.g., for BYOK scenarios).
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub extra_headers: indexmap::IndexMap<String, String>,

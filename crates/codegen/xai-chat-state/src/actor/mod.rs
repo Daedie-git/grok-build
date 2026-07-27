@@ -28,6 +28,29 @@ use crate::types::{
 use state::ChatState;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
+const SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+async fn await_history_replacement_ack(
+    receiver: tokio::sync::oneshot::Receiver<Result<ReplaceHistoryAck, ReplaceHistoryError>>,
+    timeout: std::time::Duration,
+) -> Result<ReplaceHistoryAck, ReplaceHistoryError> {
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "history replacement acknowledgement dropped",
+        ))),
+        Err(_) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "history replacement acknowledgement timed out after {} seconds",
+                timeout.as_secs()
+            ),
+        ))),
+    }
+}
+
 /// The actor that owns all chat state.
 /// Runs in a dedicated tokio task and processes commands sequentially.
 pub struct ChatStateActor {
@@ -43,6 +66,8 @@ pub struct ChatStateActor {
     event_tx: mpsc::UnboundedSender<ChatStateEvent>,
     /// Cancellation token for graceful shutdown.
     cancellation_token: tokio_util::sync::CancellationToken,
+    /// Actor-local bound for identity-transition persistence acknowledgements.
+    sampling_transition_ack_timeout: std::time::Duration,
 }
 
 impl ChatStateActor {
@@ -80,6 +105,46 @@ impl ChatStateActor {
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> ChatStateHandle {
+        Self::spawn_inner(
+            initial_conversation,
+            sampling_config,
+            pruning_config,
+            persistence,
+            event_tx,
+            cancellation_token,
+            SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_persistence_ack_timeout(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        sampling_transition_ack_timeout: std::time::Duration,
+    ) -> ChatStateHandle {
+        Self::spawn_inner(
+            initial_conversation,
+            sampling_config,
+            PruningConfig::default(),
+            persistence,
+            event_tx,
+            cancellation_token,
+            sampling_transition_ack_timeout,
+        )
+    }
+
+    fn spawn_inner(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        pruning_config: PruningConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        sampling_transition_ack_timeout: std::time::Duration,
+    ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let actor = ChatStateActor {
@@ -89,6 +154,7 @@ impl ChatStateActor {
             cmd_rx,
             event_tx,
             cancellation_token,
+            sampling_transition_ack_timeout,
         };
 
         tokio::spawn(actor.run());
@@ -210,11 +276,11 @@ impl ChatStateActor {
                 self.state.sampling_config = config;
             }
             ChatStateCommand::TransitionSamplingState {
-                config,
+                target,
                 credentials,
-                identity,
                 reply,
             } => {
+                let (config, identity) = target.into_parts();
                 let mut proposed_history = self.state.conversation.clone();
                 let history_changed =
                     match xai_grok_sampling_types::prepare_history_for_sampling_identity(
@@ -239,12 +305,9 @@ impl ChatStateActor {
                 }
 
                 let persist_rx = self.persistence.replace_history_and_ack(&proposed_history);
-                let persisted = persist_rx.await.unwrap_or_else(|_| {
-                    Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "history replacement acknowledgement dropped",
-                    )))
-                });
+                let persisted =
+                    await_history_replacement_ack(persist_rx, self.sampling_transition_ack_timeout)
+                        .await;
                 let persistence = match persisted {
                     Ok(ReplaceHistoryAck::Committed) => SamplingTransitionPersistence::Committed,
                     Ok(ReplaceHistoryAck::CommittedWithBookkeepingWarning(error)) => {

@@ -12,6 +12,9 @@ pub mod doom_loop;
 pub mod error;
 pub mod messages;
 pub mod provider_capabilities;
+pub mod provider_history;
+pub mod provider_history_policy;
+pub mod sampling_identity;
 pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
@@ -42,7 +45,24 @@ pub use self::error::{
     is_context_length_error, status_user_message, user_facing_api_error_message,
 };
 pub use self::provider_capabilities::{
-    HostedToolPolicy, ProviderCapabilities, capabilities_for_base_url,
+    AutoCompactSafety, HostedToolPolicy, NativeCompactionKind, ProtocolIdentity,
+    ProviderCapabilities, ProviderId, ResolvedProvider, ResponsesWireProtocol, TurnRoutingPolicy,
+    capabilities_for_protocol, resolve_provider,
+};
+pub use self::provider_history::{
+    InternalChatMessageMetadataPassthrough, NativeCompactionCompatibility,
+    NativeCompactionItemKind, NativeCompactionItemMetadata, ProviderItem, ResponseMetadataOrigin,
+    ResponseOutputItemKind, ResponseOutputItemMetadata, ResponseOutputItemOrder,
+    ResponsesInputItemMetadata, ResponsesInputItemOrder,
+};
+pub use self::provider_history_policy::{
+    SamplingIdentityHistoryError, native_compaction_compatibility,
+    prepare_history_for_sampling_identity, strip_incompatible_response_metadata,
+    strip_incompatible_response_metadata_for_identity, validate_history_for_sampling_identity,
+};
+pub use self::sampling_identity::{
+    ResolvedSamplingTarget, SamplingIdentity, SamplingTargetMismatch,
+    chatgpt_account_id_from_headers,
 };
 pub use self::tool_overrides::{
     ClearableField, SearchDateBound, SearchDateBoundError, ToolOverrides, ToolOverridesUpdate,

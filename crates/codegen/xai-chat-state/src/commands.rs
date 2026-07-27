@@ -124,9 +124,8 @@ pub enum ChatStateCommand {
     /// Authoritatively transition conversation history, complete sampling
     /// config, and credentials as one serialized actor operation.
     TransitionSamplingState {
-        config: SamplingConfig,
+        target: xai_grok_sampling_types::ResolvedSamplingTarget,
         credentials: Credentials,
-        identity: xai_grok_sampling_types::SamplingIdentity,
         reply: oneshot::Sender<SamplingTransitionResult>,
     },
 
@@ -445,6 +444,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

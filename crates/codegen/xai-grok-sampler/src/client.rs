@@ -28,7 +28,7 @@ use xai_grok_sampling_types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodexCompactRequest,
     CodexCompactResponse, ConversationRequest, ConversationResponse, CreateResponseWrapper,
     DOOM_LOOP_CHECK_HEADER, HostedToolPolicy, MessagesRequestWrapper, ResponseModelMetadata,
-    Result, SamplingError, build_messages_request, capabilities_for_base_url,
+    Result, SamplingError, TurnRoutingState, build_messages_request, capabilities_for_base_url,
     conversation_request_to_codex_compact_request_for_origin, is_check_event, messages, rs,
 };
 
@@ -431,7 +431,8 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`, skipping unset/blank/invalid entries and trimming values.
+/// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`,
+/// skipping unset/blank/invalid entries and trimming values.
 fn apply_env_http_headers(
     env_http_headers: &IndexMap<String, String>,
     getenv: impl Fn(&str) -> Option<String>,
@@ -460,6 +461,77 @@ fn apply_env_http_headers(
     }
 }
 
+fn apply_config_http_headers(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+    headers: &mut HeaderMap,
+) -> Result<()> {
+    for (key, value) in extra_headers {
+        let header_name = HeaderName::try_from(key.as_str())
+            .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
+        headers.insert(header_name, header_value);
+    }
+    apply_env_http_headers(env_http_headers, getenv, headers);
+    Ok(())
+}
+
+fn sampling_identity_from_effective_headers(
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    headers: &HeaderMap,
+) -> xai_grok_sampling_types::SamplingIdentity {
+    let chatgpt_account_id = headers
+        .get(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    xai_grok_sampling_types::SamplingIdentity::new(api_backend, base_url, model, chatgpt_account_id)
+}
+
+/// Resolve the runtime sampling identity exactly as the wire client does.
+///
+/// Static headers are installed first and environment-backed headers are then
+/// applied with [`apply_env_http_headers`] semantics. Environment values remain
+/// runtime-only and are represented in the result solely by the account-bound
+/// identity metadata required for safe native-history replay.
+pub fn resolve_runtime_sampling_identity(
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Result<xai_grok_sampling_types::SamplingIdentity> {
+    resolve_runtime_sampling_identity_with_getenv(
+        api_backend,
+        base_url,
+        model,
+        extra_headers,
+        env_http_headers,
+        |var| std::env::var(var).ok(),
+    )
+}
+
+fn resolve_runtime_sampling_identity_with_getenv(
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<xai_grok_sampling_types::SamplingIdentity> {
+    let mut headers = HeaderMap::new();
+    apply_config_http_headers(extra_headers, env_http_headers, getenv, &mut headers)?;
+    Ok(sampling_identity_from_effective_headers(
+        api_backend,
+        base_url,
+        model,
+        &headers,
+    ))
+}
+
 /// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
 /// `reqwest::Client` and the default headers/request-defaults computed from a
 /// [`SamplerConfig`] at construction time.
@@ -468,6 +540,7 @@ pub struct SamplingClient {
     http: reqwest::Client,
     default_headers: HeaderMap,
     base_url: String,
+    chatgpt_account_id: Option<String>,
     defaults: ClientDefaults,
     /// Optional 401-attribution hook. The shell wires this to emit a
     /// structured event at every UNAUTHORIZED arm so 401s can be
@@ -691,24 +764,22 @@ impl SamplingClient {
             }
         }
 
-        // Apply all extra headers verbatim. This is the single
-        // injection point for proxy-auth headers and any other URL- or
-        // environment-specific headers the session decides to set.
-        for (key, value) in &config.extra_headers {
-            let header_name = HeaderName::try_from(key.as_str())
-                .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
-            let header_value = HeaderValue::from_str(value)
-                .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
-            headers.insert(header_name, header_value);
-        }
-
-        // Resolve here, not into `extra_headers`, so an env-sourced secret stays
-        // out of persisted state.
-        apply_env_http_headers(
+        // Apply static headers first, then environment overrides. Resolve the
+        // account identity only after this finalized effective ordering so the
+        // history guard and origin stamps agree with the wire request.
+        apply_config_http_headers(
+            &config.extra_headers,
             &config.env_http_headers,
             |var| std::env::var(var).ok(),
             &mut headers,
-        );
+        )?;
+        let chatgpt_account_id = sampling_identity_from_effective_headers(
+            config.api_backend.clone(),
+            &config.base_url,
+            &config.model,
+            &headers,
+        )
+        .chatgpt_account_id;
 
         // Add x-grok-client-version header for version gating at the proxy.
         if let Some(client_version) = config.client_version.as_ref()
@@ -802,6 +873,7 @@ impl SamplingClient {
             http,
             default_headers: headers,
             base_url: config.base_url,
+            chatgpt_account_id,
             defaults,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
@@ -813,6 +885,23 @@ impl SamplingClient {
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    /// Return the immutable runtime identity snapshot used by this client for
+    /// history guards and provider-origin metadata for `model`.
+    ///
+    /// The account comes from the finalized effective header map captured at
+    /// client construction, including any valid environment-header override.
+    pub fn sampling_identity_for_model(
+        &self,
+        model: &str,
+    ) -> xai_grok_sampling_types::SamplingIdentity {
+        xai_grok_sampling_types::SamplingIdentity::new(
+            self.defaults.api_backend.clone(),
+            self.base_url.clone(),
+            model,
+            self.chatgpt_account_id.clone(),
+        )
     }
 
     /// POST with default headers. When a bearer_resolver is wired it is the
@@ -1309,11 +1398,22 @@ impl SamplingClient {
         }
     }
 
-    fn apply_codex_turn_state(
+    /// Resolve the one routing scope used for both request application and
+    /// response capture on this backend. This transport-level capability gate
+    /// is independent of request construction so manually built requests
+    /// cannot leak routing metadata to unsupported providers.
+    fn turn_routing_state_for_backend<'a>(
+        &self,
+        state: Option<&'a TurnRoutingState>,
+    ) -> Option<&'a TurnRoutingState> {
+        state.filter(|_| capabilities_for_base_url(&self.base_url).sticky_turn_state)
+    }
+
+    fn apply_turn_routing_state(
         builder: reqwest::RequestBuilder,
-        state: Option<&std::sync::OnceLock<String>>,
+        state: Option<&TurnRoutingState>,
     ) -> reqwest::RequestBuilder {
-        match state.and_then(std::sync::OnceLock::get) {
+        match state.and_then(TurnRoutingState::value) {
             Some(value) if HeaderValue::from_str(value).is_ok() => {
                 builder.header(X_CODEX_TURN_STATE_HEADER, value)
             }
@@ -1321,7 +1421,7 @@ impl SamplingClient {
         }
     }
 
-    fn capture_codex_turn_state(headers: &HeaderMap, state: Option<&std::sync::OnceLock<String>>) {
+    fn capture_turn_routing_state(headers: &HeaderMap, state: Option<&TurnRoutingState>) {
         let Some(state) = state else { return };
         let Some(value) = headers
             .get(X_CODEX_TURN_STATE_HEADER)
@@ -1330,7 +1430,7 @@ impl SamplingClient {
         else {
             return;
         };
-        let _ = state.set(value.to_owned());
+        state.capture_first(value.to_owned());
     }
 
     /// Compact a Codex Responses conversation using the native unary endpoint.
@@ -1375,9 +1475,10 @@ impl SamplingClient {
             SamplingError::Serialization(error)
         })?;
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        let turn_routing_state =
+            self.turn_routing_state_for_backend(request.turn_routing_state.as_ref());
         let compact_builder = tracking.apply(self.post(self.endpoint("responses/compact")));
-        let compact_builder =
-            Self::apply_codex_turn_state(compact_builder, request.codex_turn_state.as_deref());
+        let compact_builder = Self::apply_turn_routing_state(compact_builder, turn_routing_state);
         let built_request = compact_builder
             .json(&request_body)
             .build()
@@ -1388,7 +1489,7 @@ impl SamplingClient {
             error
         })?;
         let status = response.status();
-        Self::capture_codex_turn_state(response.headers(), request.codex_turn_state.as_deref());
+        Self::capture_turn_routing_state(response.headers(), turn_routing_state);
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
@@ -1493,10 +1594,11 @@ impl SamplingClient {
             &request.response_item_metadata_passthrough,
         )
         .map_err(SamplingError::serialization_message)?;
+        let turn_routing_state =
+            self.turn_routing_state_for_backend(request.turn_routing_state.as_ref());
         let http_request = grok_headers.apply(self.post(self.endpoint("responses")));
         let http_request =
-            Self::apply_codex_turn_state(http_request, request.codex_turn_state.as_deref())
-                .json(&request_body);
+            Self::apply_turn_routing_state(http_request, turn_routing_state).json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1504,7 +1606,7 @@ impl SamplingClient {
         })?;
 
         let status = response.status();
-        Self::capture_codex_turn_state(response.headers(), request.codex_turn_state.as_deref());
+        Self::capture_turn_routing_state(response.headers(), turn_routing_state);
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
         let should_retry = extract_should_retry(response.headers());
@@ -1648,10 +1750,11 @@ impl SamplingClient {
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
+        let turn_routing_state =
+            self.turn_routing_state_for_backend(request.turn_routing_state.as_ref());
         let http_request = grok_headers.apply(self.post(self.endpoint("responses")));
-        let mut http_request =
-            Self::apply_codex_turn_state(http_request, request.codex_turn_state.as_deref())
-                .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let mut http_request = Self::apply_turn_routing_state(http_request, turn_routing_state)
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if doom_loop.is_some() {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
@@ -1677,7 +1780,7 @@ impl SamplingClient {
         })?;
 
         let status = response.status();
-        Self::capture_codex_turn_state(response.headers(), request.codex_turn_state.as_deref());
+        Self::capture_turn_routing_state(response.headers(), turn_routing_state);
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
@@ -2125,12 +2228,12 @@ impl SamplingClient {
         &self,
         model: &str,
     ) -> Option<xai_grok_sampling_types::ResponseMetadataOrigin> {
-        let account = self
-            .default_headers
-            .get(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        xai_grok_sampling_types::ResponseMetadataOrigin::codex(&self.base_url, model, account)
+        let identity = self.sampling_identity_for_model(model);
+        xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            &identity.base_url,
+            &identity.model,
+            identity.chatgpt_account_id,
+        )
     }
 
     fn reject_incompatible_native_history(
@@ -2138,33 +2241,37 @@ impl SamplingClient {
         request: &ConversationRequest,
         api: &'static str,
     ) -> Result<()> {
-        let compatibility = xai_grok_sampling_types::native_compaction_compatibility(&request.items)
-            .map_err(|_| SamplingError::InvalidConfiguration(
-                "native Codex compaction history has missing or malformed durable identity metadata; history was not modified",
-            ))?;
-        let Some(expected) = compatibility else {
-            return Ok(());
+        let api_backend = match api {
+            "Responses" => xai_grok_sampling_types::ApiBackend::Responses,
+            "Messages" => xai_grok_sampling_types::ApiBackend::Messages,
+            _ => xai_grok_sampling_types::ApiBackend::ChatCompletions,
         };
-        let account = self
-            .default_headers
-            .get(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let compatible = api == "Responses"
-            && request.model.as_deref().is_some_and(|model| {
-                expected.matches_origin(
-                    &xai_grok_sampling_types::ApiBackend::Responses,
-                    &self.base_url,
-                    model,
-                    account.as_deref(),
-                )
-            });
-        if compatible {
-            Ok(())
+        let model = request.model.as_deref().unwrap_or_default();
+        let identity = if api_backend == self.defaults.api_backend {
+            self.sampling_identity_for_model(model)
         } else {
-            Err(SamplingError::InvalidConfiguration(
+            xai_grok_sampling_types::SamplingIdentity::new(
+                api_backend,
+                self.base_url.clone(),
+                model,
+                self.chatgpt_account_id.clone(),
+            )
+        };
+        match xai_grok_sampling_types::validate_history_for_sampling_identity(
+            &request.items,
+            &identity,
+        ) {
+            Ok(()) => Ok(()),
+            Err(xai_grok_sampling_types::SamplingIdentityHistoryError::MalformedNativeHistory(
+                _,
+            )) => Err(SamplingError::InvalidConfiguration(
+                "native Codex compaction history has missing or malformed durable identity metadata; history was not modified",
+            )),
+            Err(
+                xai_grok_sampling_types::SamplingIdentityHistoryError::IncompatibleNativeHistory,
+            ) => Err(SamplingError::InvalidConfiguration(
                 "this session contains identity-bound native Codex compaction history; backend, API, model, and ChatGPT account must exactly match the compaction origin (history was not modified)",
-            ))
+            )),
         }
     }
 
@@ -2271,7 +2378,7 @@ impl SamplingClient {
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
         wrapper.extra_tool_entries = extra_tools;
-        wrapper.codex_turn_state = request.codex_turn_state.clone();
+        wrapper.turn_routing_state = request.turn_routing_state.clone();
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2323,7 +2430,7 @@ impl SamplingClient {
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.codex_turn_state = request.codex_turn_state.clone();
+        wrapper.turn_routing_state = request.turn_routing_state.clone();
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2498,8 +2605,10 @@ mod tests {
         }];
         let request = ConversationRequest {
             items: vec![
-                xai_grok_sampling_types::ConversationItem::NativeCompactionMetadata(compatibility),
-                xai_grok_sampling_types::ConversationItem::Compaction(
+                xai_grok_sampling_types::ConversationItem::native_compaction_metadata(
+                    compatibility,
+                ),
+                xai_grok_sampling_types::ConversationItem::encrypted_compaction(
                     rs::CompactionSummaryItemParam {
                         id: Some("cmp_test".into()),
                         encrypted_content: "opaque".into(),
@@ -2559,30 +2668,31 @@ mod tests {
         assert!(
             matches!(
                 request.items[1],
-                xai_grok_sampling_types::ConversationItem::Compaction(_)
+                xai_grok_sampling_types::ConversationItem::Provider(ref provider)
+                    if provider.is_encrypted_compaction()
             ),
             "guard must not mutate history"
         );
     }
 
     #[test]
-    fn codex_turn_state_is_first_value_wins_and_replayed() {
-        let state = std::sync::OnceLock::new();
+    fn turn_routing_state_is_first_value_wins_and_replayed() {
+        let state = TurnRoutingState::fresh();
         let mut first = HeaderMap::new();
         first.insert(
             X_CODEX_TURN_STATE_HEADER,
             HeaderValue::from_static("turn-one"),
         );
-        SamplingClient::capture_codex_turn_state(&first, Some(&state));
+        SamplingClient::capture_turn_routing_state(&first, Some(&state));
         let mut later = HeaderMap::new();
         later.insert(
             X_CODEX_TURN_STATE_HEADER,
             HeaderValue::from_static("turn-two"),
         );
-        SamplingClient::capture_codex_turn_state(&later, Some(&state));
-        assert_eq!(state.get().map(String::as_str), Some("turn-one"));
+        SamplingClient::capture_turn_routing_state(&later, Some(&state));
+        assert_eq!(state.value(), Some("turn-one"));
 
-        let request = SamplingClient::apply_codex_turn_state(
+        let request = SamplingClient::apply_turn_routing_state(
             reqwest::Client::new().post("https://example.test/responses"),
             Some(&state),
         )
@@ -2595,7 +2705,55 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("turn-one")
         );
-        assert!(std::sync::OnceLock::<String>::new().get().is_none());
+        assert!(TurnRoutingState::default().value().is_none());
+    }
+
+    #[test]
+    fn backend_capability_gates_turn_routing_send_and_capture() {
+        let mut supported_config = minimal_config();
+        supported_config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string();
+        let supported = SamplingClient::new(supported_config).unwrap();
+        let unsupported = SamplingClient::new(minimal_config()).unwrap();
+
+        let populated = TurnRoutingState::fresh();
+        assert!(populated.capture_first("client-state".to_string()));
+        let supported_state = supported.turn_routing_state_for_backend(Some(&populated));
+        let unsupported_state = unsupported.turn_routing_state_for_backend(Some(&populated));
+        assert!(supported_state.is_some());
+        assert!(unsupported_state.is_none());
+
+        let supported_request = SamplingClient::apply_turn_routing_state(
+            reqwest::Client::new().post("https://example.test/responses"),
+            supported_state,
+        )
+        .build()
+        .unwrap();
+        let unsupported_request = SamplingClient::apply_turn_routing_state(
+            reqwest::Client::new().post("https://example.test/responses"),
+            unsupported_state,
+        )
+        .build()
+        .unwrap();
+        assert!(
+            supported_request
+                .headers()
+                .contains_key(X_CODEX_TURN_STATE_HEADER)
+        );
+        assert!(
+            !unsupported_request
+                .headers()
+                .contains_key(X_CODEX_TURN_STATE_HEADER)
+        );
+
+        let fresh = TurnRoutingState::fresh();
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            X_CODEX_TURN_STATE_HEADER,
+            HeaderValue::from_static("server-state"),
+        );
+        let unsupported_state = unsupported.turn_routing_state_for_backend(Some(&fresh));
+        SamplingClient::capture_turn_routing_state(&response_headers, unsupported_state);
+        assert!(fresh.value().is_none());
     }
 
     #[test]
@@ -2842,6 +3000,73 @@ mod tests {
         assert_eq!(headers.get("x-override").unwrap(), "from-env");
         // An invalid header name is skipped rather than panicking.
         assert!(headers.get("x invalid").is_none());
+    }
+
+    #[test]
+    fn runtime_account_identity_matches_effective_header_ordering() {
+        let account_header = xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string();
+        let resolve = |extra_headers: &IndexMap<String, String>,
+                       env_http_headers: &IndexMap<String, String>,
+                       value: Option<&str>| {
+            resolve_runtime_sampling_identity_with_getenv(
+                ApiBackend::Responses,
+                xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+                "gpt-account-test",
+                extra_headers,
+                env_http_headers,
+                |_| value.map(str::to_owned),
+            )
+            .unwrap()
+            .chatgpt_account_id
+        };
+
+        let mut static_headers = IndexMap::new();
+        static_headers.insert(account_header.clone(), "acct-static".into());
+        assert_eq!(
+            resolve(&static_headers, &IndexMap::new(), None).as_deref(),
+            Some("acct-static")
+        );
+
+        let mut env_headers = IndexMap::new();
+        env_headers.insert("chatgpt-account-id".into(), "ACCOUNT_ENV".into());
+        assert_eq!(
+            resolve(&IndexMap::new(), &env_headers, Some(" acct-env ")).as_deref(),
+            Some("acct-env")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("acct-override")).as_deref(),
+            Some("acct-override")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("   ")).as_deref(),
+            Some("acct-static")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("bad\nvalue")).as_deref(),
+            Some("acct-static")
+        );
+    }
+
+    #[test]
+    fn runtime_identity_helper_agrees_with_sampling_client() {
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+        config.model = "gpt-account-test".into();
+        config.extra_headers.insert(
+            xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+            "acct-static".into(),
+        );
+        let identity = resolve_runtime_sampling_identity(
+            config.api_backend.clone(),
+            &config.base_url,
+            &config.model,
+            &config.extra_headers,
+            &config.env_http_headers,
+        )
+        .unwrap();
+        let client = SamplingClient::new(config).unwrap();
+        assert_eq!(identity.chatgpt_account_id, client.chatgpt_account_id);
     }
 
     #[test]
@@ -3539,13 +3764,15 @@ mod tests {
         let durable = decoded.into_conversation_items().unwrap();
         assert!(matches!(
             &durable[0],
-            ConversationItem::ResponseOutputMetadata(metadata)
-                if metadata.items[0]
-                    .internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|value| value.turn_id.as_deref())
-                    == Some("turn-unary")
-                    && metadata.items[0].item_id.as_deref() == Some("msg_unary")
+            ConversationItem::Provider(provider)
+                if provider.as_response_output_metadata().is_some_and(|metadata| {
+                    metadata.items[0]
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|value| value.turn_id.as_deref())
+                        == Some("turn-unary")
+                        && metadata.items[0].item_id.as_deref() == Some("msg_unary")
+                })
         ));
         assert!(matches!(&durable[1], ConversationItem::Assistant(_)));
     }

@@ -19,8 +19,11 @@ use tracing::debug;
 use crate::commands::{ChatStateCommand, StrictAppendAck};
 use crate::events::ChatStateEvent;
 use crate::handle::ChatStateHandle;
-use crate::persistence::ChatPersistence;
-use crate::types::{PruningConfig, TurnCapture};
+use crate::persistence::{ChatPersistence, ReplaceHistoryAck, ReplaceHistoryError};
+use crate::types::{
+    PruningConfig, SamplingTransitionApplied, SamplingTransitionError,
+    SamplingTransitionPersistence, TurnCapture,
+};
 
 use state::ChatState;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
@@ -206,6 +209,71 @@ impl ChatStateActor {
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
             }
+            ChatStateCommand::TransitionSamplingState {
+                config,
+                credentials,
+                identity,
+                reply,
+            } => {
+                let mut proposed_history = self.state.conversation.clone();
+                let history_changed =
+                    match xai_grok_sampling_types::prepare_history_for_sampling_identity(
+                        &mut proposed_history,
+                        &identity,
+                    ) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            let _ = reply.send(Err(SamplingTransitionError::History(error)));
+                            return;
+                        }
+                    };
+
+                if !history_changed {
+                    self.state.sampling_config = config;
+                    self.state.credentials = credentials;
+                    let _ = reply.send(Ok(SamplingTransitionApplied {
+                        history_changed: false,
+                        persistence: SamplingTransitionPersistence::NotRequired,
+                    }));
+                    return;
+                }
+
+                let persist_rx = self.persistence.replace_history_and_ack(&proposed_history);
+                let persisted = persist_rx.await.unwrap_or_else(|_| {
+                    Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "history replacement acknowledgement dropped",
+                    )))
+                });
+                let persistence = match persisted {
+                    Ok(ReplaceHistoryAck::Committed) => SamplingTransitionPersistence::Committed,
+                    Ok(ReplaceHistoryAck::CommittedWithBookkeepingWarning(error)) => {
+                        SamplingTransitionPersistence::CommittedWithBookkeepingWarning(error)
+                    }
+                    Err(ReplaceHistoryError::NotCommitted(error)) => {
+                        let _ = reply.send(Err(
+                            SamplingTransitionError::HistoryReplacementNotCommitted(error),
+                        ));
+                        return;
+                    }
+                    Err(ReplaceHistoryError::Indeterminate(error)) => {
+                        let _ = reply.send(Err(
+                            SamplingTransitionError::HistoryReplacementIndeterminate(error),
+                        ));
+                        return;
+                    }
+                };
+
+                // Persistence is now authoritative. Reuse the existing install
+                // semantics so no duplicate replacement is emitted.
+                self.replace_conversation_without_persistence(proposed_history, false);
+                self.state.sampling_config = config;
+                self.state.credentials = credentials;
+                let _ = reply.send(Ok(SamplingTransitionApplied {
+                    history_changed: true,
+                    persistence,
+                }));
+            }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
             }
@@ -259,8 +327,8 @@ impl ChatStateActor {
             ChatStateCommand::RestoreSnapshot(snapshot) => {
                 self.restore_snapshot(*snapshot);
             }
-            ChatStateCommand::BeginCodexTurn => {
-                self.state.codex_turn_state = std::sync::Arc::new(std::sync::OnceLock::new());
+            ChatStateCommand::BeginTurnRoutingScope => {
+                self.state.turn_routing_state = xai_grok_sampling_types::TurnRoutingState::fresh();
             }
             ChatStateCommand::BeginTurnCapture => {
                 self.state.turn_capture = Some(state::TurnCaptureState {
@@ -323,8 +391,8 @@ impl ChatStateActor {
             ChatStateCommand::GetPromptIndex { reply } => {
                 let _ = reply.send(self.state.prompt_index);
             }
-            ChatStateCommand::GetCodexTurnState { reply } => {
-                let _ = reply.send(self.state.codex_turn_state.clone());
+            ChatStateCommand::GetTurnRoutingState { reply } => {
+                let _ = reply.send(self.state.turn_routing_state.clone());
             }
             ChatStateCommand::GetLastCompactionPromptIndex { reply } => {
                 let _ = reply.send(self.state.last_compaction_prompt_index);
@@ -347,6 +415,12 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetSamplingConfig { reply } => {
                 let _ = reply.send(self.state.sampling_config.clone());
+            }
+            ChatStateCommand::GetSamplingState { reply } => {
+                let _ = reply.send(crate::types::SamplingState {
+                    config: self.state.sampling_config.clone(),
+                    credentials: self.state.credentials.clone(),
+                });
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {
                 let _ = reply.send(self.state.agent_edited_paths.clone());

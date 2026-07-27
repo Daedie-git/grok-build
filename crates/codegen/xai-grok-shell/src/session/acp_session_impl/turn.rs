@@ -467,10 +467,10 @@ impl SessionActor {
         // A new prompt gets a fresh bounded-task compaction budget. A single
         // subagent turn may compact once, then it must synthesize without tools.
         self.reset_bounded_auto_compaction_for_turn();
-        // A prompt turn owns one fresh Codex sticky-routing token. Every
+        // A prompt turn owns one fresh provider-neutral routing scope. Every
         // ordinary request, retry, inline compaction, and continuation built
         // below shares this scope; the next prompt replaces it.
-        self.chat_state_handle.begin_codex_turn();
+        self.chat_state_handle.begin_turn_routing_scope();
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);

@@ -1380,10 +1380,10 @@ async fn bootstrap_refuses_native_fork_that_would_require_summarization() {
     let chat = spawn_test_parent_chat_state("gpt-native");
     chat.replace_conversation(vec![
         ConversationItem::system("parent system"),
-        ConversationItem::NativeCompactionMetadata(native_test_compatibility(Some(
+        ConversationItem::native_compaction_metadata(native_test_compatibility(Some(
             "cmp-native",
         ))),
-        ConversationItem::Compaction(
+        ConversationItem::encrypted_compaction(
             xai_grok_sampling_types::rs::CompactionSummaryItemParam {
                 id: Some("cmp-native".to_string()),
                 encrypted_content: "opaque".to_string(),
@@ -1445,8 +1445,8 @@ async fn disk_bootstrap_decides_native_verbatim_from_authoritative_snapshot() {
     storage.replace_chat_history(&parent, &stale).await.unwrap();
     let authoritative = vec![
         ConversationItem::system("native system"),
-        ConversationItem::NativeCompactionMetadata(native_test_compatibility(Some("cmp-auth"))),
-        ConversationItem::Compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+        ConversationItem::native_compaction_metadata(native_test_compatibility(Some("cmp-auth"))),
+        ConversationItem::encrypted_compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
             id: Some("cmp-auth".into()),
             encrypted_content: "authoritative cipher".into(),
         }),
@@ -1479,7 +1479,7 @@ async fn disk_bootstrap_decides_native_verbatim_from_authoritative_snapshot() {
         id: acp::SessionId::new("authoritative-native-child"),
         cwd: "/workspace".into(),
     };
-    let child_dir = crate::session::persistence::session_dir(&child);
+    let child_dir = storage.session_dir(&child);
     let result = bootstrap_initial_context(
         &request,
         None,
@@ -1493,7 +1493,11 @@ async fn disk_bootstrap_decides_native_verbatim_from_authoritative_snapshot() {
     let BootstrapInitialContext::Ready(initial) = result else {
         panic!("compatible authoritative native history must fork verbatim")
     };
-    assert!(initial.verbatim_fork);
+    assert!(
+        initial.verbatim_fork,
+        "expected verbatim native fork, got: {}",
+        serde_json::to_string_pretty(&initial.conversation).unwrap()
+    );
     assert_eq!(
         serde_json::to_value(&initial.conversation).unwrap(),
         serde_json::to_value(&authoritative).unwrap()
@@ -1544,7 +1548,7 @@ async fn disk_bootstrap_filters_authoritative_ordinary_snapshot_not_stale_cache(
             synthetic_reason: Some(xai_grok_sampling_types::SyntheticReason::SystemReminder),
             ..Default::default()
         }),
-        ConversationItem::ResponseOutputMetadata(
+        ConversationItem::response_output_metadata(
             xai_grok_sampling_types::ResponseOutputItemMetadata {
                 response_id: "resp-authoritative".into(),
                 output_items: 1,
@@ -1591,7 +1595,7 @@ async fn disk_bootstrap_filters_authoritative_ordinary_snapshot_not_stale_cache(
         id: acp::SessionId::new("authoritative-ordinary-child"),
         cwd: "/workspace".into(),
     };
-    let child_dir = crate::session::persistence::session_dir(&child);
+    let child_dir = storage.session_dir(&child);
     let result = bootstrap_initial_context(
         &request,
         None,
@@ -1625,22 +1629,24 @@ async fn disk_bootstrap_filters_authoritative_ordinary_snapshot_not_stale_cache(
     assert!(!copied_text.contains("SYNTHETIC_FILTER_ME"));
     assert!(copied.iter().any(|item| matches!(
         item,
-        ConversationItem::ResponseOutputMetadata(metadata)
-            if metadata.items[0].item_id.as_deref() == Some("msg-authoritative")
-                && metadata.items[0]
-                    .internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|value| value.turn_id.as_deref())
-                    == Some("turn-authoritative")
+        ConversationItem::Provider(provider)
+            if provider.as_response_output_metadata().is_some_and(|metadata| {
+                metadata.items[0].item_id.as_deref() == Some("msg-authoritative")
+                    && metadata.items[0]
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|value| value.turn_id.as_deref())
+                        == Some("turn-authoritative")
+            })
     )));
 }
 
 #[test]
 fn native_fork_identity_requires_exact_model_and_account() {
-    let items = vec![ConversationItem::NativeCompactionMetadata(
+    let items = vec![ConversationItem::native_compaction_metadata(
         native_test_compatibility(None),
     ),
-        ConversationItem::Compaction(
+        ConversationItem::encrypted_compaction(
             xai_grok_sampling_types::rs::CompactionSummaryItemParam {
                 id: None,
                 encrypted_content: "opaque".to_string(),

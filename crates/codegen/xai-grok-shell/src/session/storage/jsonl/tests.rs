@@ -845,7 +845,7 @@ async fn compaction_checkpoint_round_trips_native_replacement_history() {
         compacted_history: vec![
             ConversationItem::system("sys"),
             retained_user,
-            ConversationItem::Compaction(
+            ConversationItem::encrypted_compaction(
                 xai_grok_sampling_types::rs::CompactionSummaryItemParam {
                     id: Some("cmp_checkpoint".into()),
                     encrypted_content: "encrypted-checkpoint-context".into(),
@@ -873,13 +873,17 @@ async fn compaction_checkpoint_round_trips_native_replacement_history() {
         ConversationItem::User(user)
             if user.response_item_id.as_deref() == Some("msg_checkpoint_user")
     ));
-    match &restored.compacted_history[2] {
-        ConversationItem::Compaction(item) => {
-            assert_eq!(item.id.as_deref(), Some("cmp_checkpoint"));
-            assert_eq!(item.encrypted_content, "encrypted-checkpoint-context");
-        }
-        other => panic!("expected checkpointed native compaction, got {other:?}"),
-    }
+    let ConversationItem::Provider(provider) = &restored.compacted_history[2] else {
+        panic!(
+            "expected checkpointed native compaction, got {:?}",
+            restored.compacted_history[2]
+        )
+    };
+    let item = provider
+        .as_encrypted_compaction()
+        .expect("encrypted native compaction payload");
+    assert_eq!(item.id.as_deref(), Some("cmp_checkpoint"));
+    assert_eq!(item.encrypted_content, "encrypted-checkpoint-context");
 }
 #[tokio::test]
 async fn copy_session_data_uses_committed_rewind_over_stale_cache_in_both_modes() {
@@ -1047,8 +1051,8 @@ async fn verbatim_copy_after_native_compaction_then_rewind_uses_latest_marker() 
     }];
     let authoritative = vec![
         ConversationItem::system("system"),
-        ConversationItem::NativeCompactionMetadata(compatibility),
-        ConversationItem::Compaction(
+        ConversationItem::native_compaction_metadata(compatibility),
+        ConversationItem::encrypted_compaction(
             xai_grok_sampling_types::rs::CompactionSummaryItemParam {
                 id: Some("cmp-copy".into()),
                 encrypted_content: "cipher".into(),
@@ -2559,6 +2563,41 @@ fn fork_filter_truncates_at_complete_turn() {
     assert!(matches!(items[2], ConversationItem::Assistant(_)));
 }
 #[test]
+fn fork_filter_only_carries_ordinary_provider_metadata_through_turn_boundary() {
+    let ordinary = ConversationItem::response_output_metadata(
+        xai_grok_sampling_types::ResponseOutputItemMetadata {
+            response_id: "resp-test".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: None,
+        },
+    );
+    let mut ordinary_items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q1"),
+        ConversationItem::assistant("a1"),
+        ordinary,
+    ];
+    super::fork_filter_chat(&mut ordinary_items);
+    assert_eq!(ordinary_items.len(), 4);
+
+    let native = ConversationItem::encrypted_compaction(
+        xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+            id: Some("cmp-test".into()),
+            encrypted_content: "ciphertext".into(),
+        },
+    );
+    let mut native_items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q1"),
+        ConversationItem::assistant("a1"),
+        native,
+    ];
+    super::fork_filter_chat(&mut native_items);
+    assert_eq!(native_items.len(), 3);
+}
+
+#[test]
 fn fork_filter_handles_consecutive_user_messages() {
     let mut items = vec![
             ConversationItem::system("sys"),
@@ -2633,7 +2672,7 @@ fn fork_filter_preserves_complete_tool_turn() {
 fn fork_filter_preserves_responses_metadata_for_complete_tool_turn() {
     use xai_grok_sampling_types::conversation::*;
     let metadata = |response_id: &str, kind, call_id: &str| {
-        ConversationItem::ResponseOutputMetadata(ResponseOutputItemMetadata {
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
             response_id: response_id.into(),
             output_items: 1,
             items: vec![ResponseOutputItemOrder {
@@ -3578,10 +3617,8 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
-            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
-            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
-            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(
@@ -3642,10 +3679,8 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
-            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
-            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
-            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(
@@ -3720,10 +3755,8 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
-            ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
-            ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
-            ConversationItem::Compaction(_) => "compaction",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);
@@ -3744,13 +3777,14 @@ fn read_chat_history_preserves_native_compaction_item() {
         ConversationItem::User(user)
             if user.response_item_id.as_deref() == Some("msg_persisted")
     ));
-    match &items[2] {
-        ConversationItem::Compaction(item) => {
-            assert_eq!(item.id.as_deref(), Some("cmp_persisted"));
-            assert_eq!(item.encrypted_content, "opaque-native-context");
-        }
-        other => panic!("expected persisted compaction item, got {other:?}"),
-    }
+    let ConversationItem::Provider(provider) = &items[2] else {
+        panic!("expected persisted compaction item, got {:?}", items[2])
+    };
+    let item = provider
+        .as_encrypted_compaction()
+        .expect("encrypted native compaction payload");
+    assert_eq!(item.id.as_deref(), Some("cmp_persisted"));
+    assert_eq!(item.encrypted_content, "opaque-native-context");
 }
 
 /// Set up a session dir with a raw `chat_history.jsonl` and return

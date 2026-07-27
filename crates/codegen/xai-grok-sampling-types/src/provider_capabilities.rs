@@ -21,7 +21,7 @@ pub enum HostedToolPolicy {
 pub struct ProviderCapabilities {
     /// May call a native `/responses/compact` replacement endpoint.
     pub native_compact: bool,
-    /// Capture/replay sticky turn routing state (`x-codex-turn-state`).
+    /// Capture and replay provider routing state within one prompt turn.
     pub sticky_turn_state: bool,
     /// Preserve exact Responses output order via item ids + manifests.
     pub preserve_output_order: bool,
@@ -89,6 +89,7 @@ mod tests {
     fn codex_url_gets_codex_capabilities() {
         let caps = capabilities_for_base_url(CODEX_BACKEND_BASE_URL);
         assert!(caps.native_compact);
+        assert!(caps.sticky_turn_state);
         assert!(caps.preserve_output_order);
         assert_eq!(caps.provider_kind_meta, Some("codex"));
         assert_eq!(caps.hosted_tool_policy, HostedToolPolicy::RejectUnknown);
@@ -98,6 +99,7 @@ mod tests {
     fn grok_url_gets_default_capabilities() {
         let caps = capabilities_for_base_url("https://api.x.ai/v1");
         assert!(!caps.native_compact);
+        assert!(!caps.sticky_turn_state);
         assert!(!caps.chatgpt_auth);
         assert_eq!(caps.hosted_tool_policy, HostedToolPolicy::AllowExtra);
         assert!(caps.provider_kind_meta.is_none());

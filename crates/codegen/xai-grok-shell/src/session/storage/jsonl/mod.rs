@@ -107,7 +107,7 @@ impl JsonlStorageAdapter {
         Ok(items)
     }
 
-    fn session_dir(&self, info: &Info) -> PathBuf {
+    pub(crate) fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => root
                 .join("sessions")
@@ -561,7 +561,7 @@ impl JsonlStorageAdapter {
             if rebuilt.iter().any(|item| {
                 matches!(
                     item,
-                    ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_)
+                    ConversationItem::Provider(provider) if provider.is_native_compaction_item()
                 )
             }) {
                 xai_grok_sampling_types::native_compaction_compatibility(&rebuilt)
@@ -631,7 +631,7 @@ impl JsonlStorageAdapter {
         let contains_native_items = checkpoint.compacted_history.iter().any(|item| {
             matches!(
                 item,
-                ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_)
+                ConversationItem::Provider(provider) if provider.is_native_compaction_item()
             )
         });
         if contains_native_items {
@@ -694,7 +694,7 @@ impl JsonlStorageAdapter {
         if !items.iter().any(|item| {
             matches!(
                 item,
-                ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_)
+                ConversationItem::Provider(provider) if provider.is_native_compaction_item()
             )
         }) {
             return Ok(());
@@ -1234,9 +1234,12 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
                             }
                             j += 1;
                         }
-                        ConversationItem::ResponseOutputMetadata(_)
-                        | ConversationItem::Reasoning(_)
-                        | ConversationItem::BackendToolCall(_) => {
+                        ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_) => {
+                            j += 1;
+                        }
+                        ConversationItem::Provider(provider)
+                            if provider.is_response_output_metadata() =>
+                        {
                             j += 1;
                         }
                         _ => break,

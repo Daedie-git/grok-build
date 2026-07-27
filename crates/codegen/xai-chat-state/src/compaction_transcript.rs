@@ -67,11 +67,9 @@ fn role_label(item: &ConversationItem) -> &'static str {
         ConversationItem::User(_) => "Human",
         ConversationItem::Assistant(_) => "Assistant",
         ConversationItem::ToolResult(_) => "Function",
-        ConversationItem::BackendToolCall(_) => "Assistant",
-        ConversationItem::ResponseOutputMetadata(_)
-        | ConversationItem::Reasoning(_)
-        | ConversationItem::NativeCompactionMetadata(_)
-        | ConversationItem::Compaction(_) => "Assistant",
+        ConversationItem::BackendToolCall(_)
+        | ConversationItem::Provider(_)
+        | ConversationItem::Reasoning(_) => "Assistant",
     }
 }
 

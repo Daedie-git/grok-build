@@ -110,6 +110,16 @@ pub fn normalize_forked_context(items: Vec<ConversationItem>) -> (Vec<Conversati
 /// `xai-grok-shell/src/session/storage/jsonl.rs` (it truncates to the last
 /// complete turn before this counts them). Keep their notions of a "complete
 /// turn" in sync if the turn item model changes.
+fn is_turn_transparent_item(item: &ConversationItem) -> bool {
+    matches!(
+        item,
+        ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_)
+    ) || matches!(
+        item,
+        ConversationItem::Provider(provider) if provider.is_response_output_metadata()
+    )
+}
+
 fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
     let mut turn_ends = Vec::new();
     let mut i = 0;
@@ -125,14 +135,7 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
         }
         // Skip transport metadata / Reasoning / BackendToolCall siblings that
         // precede the Assistant.
-        while i < items.len()
-            && matches!(
-                items[i],
-                ConversationItem::ResponseOutputMetadata(_)
-                    | ConversationItem::Reasoning(_)
-                    | ConversationItem::BackendToolCall(_)
-            )
-        {
+        while i < items.len() && is_turn_transparent_item(items[i]) {
             i += 1;
         }
         // Expect Assistant.
@@ -144,13 +147,8 @@ fn count_complete_turns(items: &[&ConversationItem]) -> Vec<usize> {
         // transport metadata / Reasoning / BackendToolCall siblings, until the
         // next User/Assistant.
         while i < items.len()
-            && matches!(
-                items[i],
-                ConversationItem::ToolResult(_)
-                    | ConversationItem::ResponseOutputMetadata(_)
-                    | ConversationItem::Reasoning(_)
-                    | ConversationItem::BackendToolCall(_)
-            )
+            && (matches!(items[i], ConversationItem::ToolResult(_))
+                || is_turn_transparent_item(items[i]))
         {
             i += 1;
         }
@@ -338,10 +336,7 @@ fn render_item_to_background(out: &mut String, item: &ConversationItem) {
         // Reasoning siblings don't enter the fork-background rendering —
         // they're rendered (when needed) inline with the surrounding
         // assistant turn elsewhere.
-        ConversationItem::ResponseOutputMetadata(_)
-        | ConversationItem::Reasoning(_)
-        | ConversationItem::NativeCompactionMetadata(_)
-        | ConversationItem::Compaction(_) => {}
+        ConversationItem::Provider(_) | ConversationItem::Reasoning(_) => {}
     }
 }
 
@@ -776,6 +771,31 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0], 3); // after reasoning + A1
         assert_eq!(turns[1], 6); // after reasoning + A2
+    }
+
+    #[test]
+    fn count_complete_turns_treats_only_ordinary_provider_metadata_as_transparent() {
+        let ordinary = ConversationItem::response_output_metadata(
+            xai_grok_sampling_types::ResponseOutputItemMetadata {
+                response_id: "resp-test".into(),
+                output_items: 0,
+                items: Vec::new(),
+                origin: None,
+            },
+        );
+        let ordinary_items = [user_item("U1"), ordinary, assistant_item("A1")];
+        let ordinary_refs: Vec<&ConversationItem> = ordinary_items.iter().collect();
+        assert_eq!(count_complete_turns(&ordinary_refs), vec![3]);
+
+        let native = ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-test".into()),
+                encrypted_content: "ciphertext".into(),
+            },
+        );
+        let native_items = [user_item("U1"), native, assistant_item("A1")];
+        let native_refs: Vec<&ConversationItem> = native_items.iter().collect();
+        assert!(count_complete_turns(&native_refs).is_empty());
     }
 
     #[test]

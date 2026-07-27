@@ -39,11 +39,13 @@ fn compaction_fixture(info: &Info) -> (CompactionCheckpointFile, SessionUpdate) 
         prompt_index_at_compaction: 2,
         compacted_history: vec![
             ConversationItem::system("authoritative checkpoint"),
-            ConversationItem::NativeCompactionMetadata(compatibility),
-            ConversationItem::Compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
-                id: Some("cmp-recovery".into()),
-                encrypted_content: "cipher-recovery".into(),
-            }),
+            ConversationItem::native_compaction_metadata(compatibility),
+            ConversationItem::encrypted_compaction(
+                xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                    id: Some("cmp-recovery".into()),
+                    encrypted_content: "cipher-recovery".into(),
+                },
+            ),
         ],
         schema_version: 1,
         created_at: "2026-01-01T00:00:00Z".into(),
@@ -714,7 +716,7 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
         Some("acct-cold".into()),
     )
     .unwrap();
-    let ordinary_metadata = ConversationItem::ResponseOutputMetadata(
+    let ordinary_metadata = ConversationItem::response_output_metadata(
         xai_grok_sampling_types::ResponseOutputItemMetadata {
             response_id: "resp-after-compact".into(),
             output_items: 1,
@@ -751,13 +753,15 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
     let cold_with_ordinary = adapter.load_session_without_updates(&info).await.unwrap();
     assert!(matches!(
         &cold_with_ordinary.chat_history[replacement.len()],
-        ConversationItem::ResponseOutputMetadata(metadata)
-            if metadata.items[0].item_id.as_deref() == Some("msg_after_compact")
-                && metadata.items[0]
-                    .internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|value| value.turn_id.as_deref())
-                    == Some("turn-after-compact")
+        ConversationItem::Provider(provider)
+            if provider.as_response_output_metadata().is_some_and(|metadata| {
+                metadata.items[0].item_id.as_deref() == Some("msg_after_compact")
+                    && metadata.items[0]
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|value| value.turn_id.as_deref())
+                        == Some("turn-after-compact")
+            })
     ));
 
     let request = xai_grok_sampling_types::ConversationRequest {
@@ -860,11 +864,11 @@ async fn cold_load_rejects_missing_or_mutated_native_manifest() {
                 .as_array_mut()
                 .unwrap()
                 .iter_mut()
-                .find(|item| item["type"] == "native_compaction_metadata")
-                .unwrap()
-                .as_object_mut()
+                .find(|item| {
+                    item["type"] == "provider" && item["kind"] == "native_compaction_metadata"
+                })
                 .unwrap();
-            mutation(descriptor);
+            mutation(descriptor["payload"].as_object_mut().unwrap());
         };
 
     let mut missing = valid_value.clone();
@@ -915,7 +919,7 @@ async fn cold_load_rejects_missing_or_mutated_native_manifest() {
     missing_descriptor
         .as_array_mut()
         .unwrap()
-        .retain(|item| item["type"] != "native_compaction_metadata");
+        .retain(|item| item["type"] != "provider" || item["kind"] != "native_compaction_metadata");
     invalid.push(missing_descriptor);
 
     let mut legacy = valid_value;

@@ -751,7 +751,7 @@ pub(crate) struct SessionActor {
     /// Live gate shared with the notification bridge (see
     /// `NotificationBridgeConfig::queue_exit_reminder_on_approved_exit`).
     /// Seeded at spawn from the agent definition's harness; refreshed by
-    /// `handle_rebuild_agent_for_definition` so the bridge always agrees
+    /// `install_prepared_agent_rebuild` so the bridge always agrees
     /// with the live harness gate.
     pub(crate) queue_exit_reminder_on_approved_exit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// First skill the current prompt activated via its slash-skill path,
@@ -1017,7 +1017,7 @@ pub(crate) struct SessionActor {
     /// Cached recipe for constructing this session's [`xai_grok_agent::Agent`].
     ///
     /// Populated once at session spawn and then reused by
-    /// `handle_rebuild_agent_for_definition` to build a fresh `Agent`
+    /// `prepare_agent_rebuild` to build a fresh `Agent`
     /// (system prompt, [`xai_grok_tools::bridge::ToolBridge`], tool
     /// registry, tool name aliases, compaction policy, and reminder
     /// policy) when the user picks a model with a different

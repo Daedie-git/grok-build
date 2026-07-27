@@ -191,16 +191,19 @@ pub enum SessionCommand {
     },
     SetSessionModel {
         sampling_config: xai_grok_sampler::SamplerConfig,
+        /// Runtime identity resolved from finalized static + environment headers.
+        sampling_identity: xai_grok_sampling_types::SamplingIdentity,
+        /// Optional zero-turn harness candidate prepared before, and installed
+        /// only after, the authoritative sampling transition succeeds.
+        rebuild_definition: Option<Box<xai_grok_agent::AgentDefinition>>,
         use_concise: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).
         /// Set to `false` for forked sessions so mid-session model switches
         /// cannot contaminate the inherited prompt configuration.
         apply_prompt_override: bool,
         /// When `true`, suppress the system prompt rewrite even though
-        /// `apply_prompt_override` may be `true`. Set by the model-switch
-        /// orchestrator immediately after a successful
-        /// `RebuildAgentForDefinition` so the fresh harness's prompt
-        /// (already installed by the rebuild handler) is not clobbered by
+        /// `apply_prompt_override` may be `true`. A staged rebuild always sets
+        /// this so its freshly installed harness prompt is not clobbered by
         /// the concise/default swap below.
         skip_prompt_rewrite: bool,
         /// Re-resolved auto-compact threshold for the new model. Computed
@@ -211,19 +214,6 @@ pub enum SessionCommand {
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
-    },
-    /// Zero-turn harness rebuild: build a brand-new `Agent` from the
-    /// session's `AgentRebuildSpec` and the new `AgentDefinition`,
-    /// re-register MCP tools, swap the live `Agent`, rewrite the
-    /// system message in the conversation, persist the new prompt
-    /// artifacts, and update `active_agent_type`.
-    ///
-    /// Triggered by `MvpAgent::set_session_model` when the new model's
-    /// `agent_type` differs from the session's current one and no user
-    /// message has been sent yet (`turn_count == 0`).
-    RebuildAgentForDefinition {
-        definition: xai_grok_agent::AgentDefinition,
-        responds_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers
     /// into the session's sampling config.
@@ -248,6 +238,7 @@ pub enum SessionCommand {
         /// forked sessions inherit the source session's context window, causing
         /// auto-compact and context-usage signals to use the wrong threshold.
         context_window: Option<std::num::NonZeroU64>,
+        responds_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     GetCurrentModel {
         responds_to: oneshot::Sender<String>,

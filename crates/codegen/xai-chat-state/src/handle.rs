@@ -11,7 +11,7 @@ use xai_grok_sampling_types::{
 use crate::commands::{ChatStateCommand, RepairHistoryBlocked, StrictAppendAck, StrictAppendError};
 use crate::types::{
     AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    TurnCapture,
+    SamplingState, SamplingTransitionResult, TurnCapture,
 };
 
 /// Handle to communicate with ChatStateActor.
@@ -170,6 +170,26 @@ impl ChatStateHandle {
             .send(ChatStateCommand::UpdateSamplingConfig { config });
     }
 
+    /// Authoritatively transition conversation history, complete sampling
+    /// config, and credentials in one serialized actor operation, revalidating
+    /// history against the caller's effective runtime sampling identity.
+    pub async fn transition_sampling_state(
+        &self,
+        config: SamplingConfig,
+        credentials: Credentials,
+        identity: xai_grok_sampling_types::SamplingIdentity,
+    ) -> Option<SamplingTransitionResult> {
+        self.query("TransitionSamplingState", |reply| {
+            ChatStateCommand::TransitionSamplingState {
+                config,
+                credentials,
+                identity,
+                reply,
+            }
+        })
+        .await
+    }
+
     /// Track that the agent edited a file path.
     pub fn record_agent_edited_path(&self, path: String) {
         let _ = self
@@ -291,10 +311,10 @@ impl ChatStateHandle {
             .send(ChatStateCommand::RestoreSnapshot(Box::new(snapshot)));
     }
 
-    /// Start a fresh process-local Codex sticky-routing scope. Call exactly
-    /// once before the first model request of every prompt turn.
-    pub fn begin_codex_turn(&self) {
-        let _ = self.cmd_tx.send(ChatStateCommand::BeginCodexTurn);
+    /// Start a fresh process-local routing scope. Call exactly once before the
+    /// first model request of every prompt turn.
+    pub fn begin_turn_routing_scope(&self) {
+        let _ = self.cmd_tx.send(ChatStateCommand::BeginTurnRoutingScope);
     }
 
     /// Begin capturing turn messages. Call at the start of a real user turn
@@ -401,12 +421,12 @@ impl ChatStateHandle {
         .unwrap_or(0)
     }
 
-    /// Clone the current turn's process-local Codex sticky-routing state.
-    pub async fn get_codex_turn_state(
+    /// Clone the current prompt turn's process-local routing state.
+    pub async fn get_turn_routing_state(
         &self,
-    ) -> Option<std::sync::Arc<std::sync::OnceLock<String>>> {
-        self.query("GetCodexTurnState", |reply| {
-            ChatStateCommand::GetCodexTurnState { reply }
+    ) -> Option<xai_grok_sampling_types::TurnRoutingState> {
+        self.query("GetTurnRoutingState", |reply| {
+            ChatStateCommand::GetTurnRoutingState { reply }
         })
         .await
     }
@@ -485,6 +505,14 @@ impl ChatStateHandle {
     pub async fn get_sampling_config(&self) -> Option<SamplingConfig> {
         self.query("GetSamplingConfig", |reply| {
             ChatStateCommand::GetSamplingConfig { reply }
+        })
+        .await
+    }
+
+    /// Atomically get sampling config and credentials from one actor turn.
+    pub async fn get_sampling_state(&self) -> Option<SamplingState> {
+        self.query("GetSamplingState", |reply| {
+            ChatStateCommand::GetSamplingState { reply }
         })
         .await
     }

@@ -6,7 +6,9 @@
 use std::io;
 
 use tokio::sync::{mpsc, oneshot};
-use xai_chat_state::{ChatPersistence, StrictAppendAck, StrictAppendError};
+use xai_chat_state::{
+    ChatPersistence, ReplaceHistoryAck, ReplaceHistoryError, StrictAppendAck, StrictAppendError,
+};
 use xai_grok_sampling_types::ConversationItem;
 
 use super::persistence::PersistenceMsg;
@@ -63,6 +65,29 @@ impl ChatPersistence for ChannelChatPersistence {
             .send(PersistenceMsg::ReplaceChatHistory(items.to_vec()));
     }
 
+    fn replace_history_and_ack(
+        &mut self,
+        items: &[ConversationItem],
+    ) -> oneshot::Receiver<Result<ReplaceHistoryAck, ReplaceHistoryError>> {
+        let (reply, receiver) = oneshot::channel();
+        if self
+            .tx
+            .send(PersistenceMsg::ReplaceChatHistoryAndAck {
+                messages: items.to_vec(),
+                respond_to: reply,
+            })
+            .is_err()
+        {
+            let (reply, receiver) = oneshot::channel();
+            let _ = reply.send(Err(ReplaceHistoryError::NotCommitted(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "session persistence actor unavailable",
+            ))));
+            return receiver;
+        }
+        receiver
+    }
+
     fn flush(&mut self) {
         let _ = self.tx.send(PersistenceMsg::Flush);
     }
@@ -114,6 +139,26 @@ mod tests {
         persistence.replace_history(&[ConversationItem::system("compacted")]);
         let msg = rx.recv().await.unwrap();
         assert!(matches!(msg, PersistenceMsg::ReplaceChatHistory(_)));
+    }
+
+    #[tokio::test]
+    async fn channel_persistence_sends_acknowledged_replace_history() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut persistence = ChannelChatPersistence::new(tx);
+        let ack = persistence.replace_history_and_ack(&[ConversationItem::system("replacement")]);
+        let PersistenceMsg::ReplaceChatHistoryAndAck {
+            messages,
+            respond_to,
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected acknowledged history replacement");
+        };
+        assert_eq!(messages.len(), 1);
+        respond_to.send(Ok(ReplaceHistoryAck::Committed)).unwrap();
+        assert!(matches!(
+            ack.await.unwrap().unwrap(),
+            ReplaceHistoryAck::Committed
+        ));
     }
 
     #[tokio::test]

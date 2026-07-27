@@ -15,8 +15,8 @@ use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
     ApiBackend, ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage,
-    FinishReason, ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition,
-    TraceContext, Usage,
+    FinishReason, ImageUrl, MessageContent, Role, SamplingConfig, ToolCallRequest, ToolChoice,
+    ToolDefinition, TraceContext, Usage,
 };
 
 // ============================================================================
@@ -24,7 +24,7 @@ use crate::types::{
 // ============================================================================
 
 /// A single item in a conversation - the unified internal representation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConversationItem {
     /// System instructions/prompt
@@ -43,11 +43,9 @@ pub enum ConversationItem {
     /// 2. Sent back to the Responses API as input items for context continuity
     /// 3. Rendered by the pager (search queries, sources, etc.)
     BackendToolCall(BackendToolCallItem),
-    /// Complete provider-order manifest for the immediately following
-    /// ordinary Responses output group. Message/function-call output items may
-    /// collapse into one Assistant semantically; this persistence-only sidecar
-    /// restores their exact order only at the Codex wire boundary.
-    ResponseOutputMetadata(ResponseOutputItemMetadata),
+    /// Provider-owned durable history. The sealed envelope keeps neutral
+    /// consumers independent of provider-specific payload variants.
+    Provider(ProviderItem),
     /// A reasoning item from the Responses API, stored as a sibling of the
     /// assistant message so that:
     ///
@@ -61,13 +59,251 @@ pub enum ConversationItem {
     /// wrapping `rs::WebSearchToolCall` etc.) so no field is dropped on the
     /// way through.
     Reasoning(rs::ReasoningItem),
-    /// Durable identity scope for the immediately following native compaction
-    /// segment. This item is persistence-only and is never sent on the wire.
+}
+
+/// Sealed, strongly typed provider-owned durable history envelope.
+///
+/// Provider and payload enums are intentionally private. External crates use
+/// the typed constructors and accessors below rather than depending on a
+/// provider's internal variant taxonomy.
+#[derive(Debug, Clone)]
+pub struct ProviderItem {
+    inner: ProviderItemInner,
+}
+
+#[derive(Debug, Clone)]
+enum ProviderItemInner {
+    Codex(CodexProviderItem),
+}
+
+#[derive(Debug, Clone)]
+enum CodexProviderItem {
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
     NativeCompactionMetadata(NativeCompactionCompatibility),
-    /// Opaque replacement-history item returned by Codex `/responses/compact`.
-    /// The id and encrypted payload must round-trip unchanged into the next
-    /// Responses request and through persistence/checkpoint/rewind flows.
+    EncryptedCompaction(rs::CompactionSummaryItemParam),
+}
+
+impl ProviderItem {
+    pub fn response_output_metadata(metadata: ResponseOutputItemMetadata) -> Self {
+        Self {
+            inner: ProviderItemInner::Codex(CodexProviderItem::ResponseOutputMetadata(metadata)),
+        }
+    }
+
+    pub fn native_compaction_metadata(metadata: NativeCompactionCompatibility) -> Self {
+        Self {
+            inner: ProviderItemInner::Codex(CodexProviderItem::NativeCompactionMetadata(metadata)),
+        }
+    }
+
+    pub fn encrypted_compaction(item: rs::CompactionSummaryItemParam) -> Self {
+        Self {
+            inner: ProviderItemInner::Codex(CodexProviderItem::EncryptedCompaction(item)),
+        }
+    }
+
+    pub fn as_response_output_metadata(&self) -> Option<&ResponseOutputItemMetadata> {
+        match &self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::ResponseOutputMetadata(metadata)) => {
+                Some(metadata)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_response_output_metadata_mut(&mut self) -> Option<&mut ResponseOutputItemMetadata> {
+        match &mut self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::ResponseOutputMetadata(metadata)) => {
+                Some(metadata)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_native_compaction_metadata(&self) -> Option<&NativeCompactionCompatibility> {
+        match &self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::NativeCompactionMetadata(metadata)) => {
+                Some(metadata)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_native_compaction_metadata_mut(
+        &mut self,
+    ) -> Option<&mut NativeCompactionCompatibility> {
+        match &mut self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::NativeCompactionMetadata(metadata)) => {
+                Some(metadata)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_encrypted_compaction(&self) -> Option<&rs::CompactionSummaryItemParam> {
+        match &self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::EncryptedCompaction(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    pub fn as_encrypted_compaction_mut(&mut self) -> Option<&mut rs::CompactionSummaryItemParam> {
+        match &mut self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::EncryptedCompaction(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    pub fn is_response_output_metadata(&self) -> bool {
+        self.as_response_output_metadata().is_some()
+    }
+
+    pub fn is_native_compaction_metadata(&self) -> bool {
+        self.as_native_compaction_metadata().is_some()
+    }
+
+    pub fn is_encrypted_compaction(&self) -> bool {
+        self.as_encrypted_compaction().is_some()
+    }
+
+    /// True for either half of the native compact descriptor/payload pair.
+    pub fn is_native_compaction_item(&self) -> bool {
+        self.is_native_compaction_metadata() || self.is_encrypted_compaction()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderName {
+    Codex,
+}
+
+#[derive(Serialize)]
+struct ProviderItemSerialize<'a> {
+    provider: ProviderName,
+    #[serde(flatten)]
+    item: CodexProviderItemSerialize<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
+enum CodexProviderItemSerialize<'a> {
+    ResponseOutputMetadata(&'a ResponseOutputItemMetadata),
+    NativeCompactionMetadata(&'a NativeCompactionCompatibility),
+    #[serde(rename = "compaction")]
+    EncryptedCompaction(&'a rs::CompactionSummaryItemParam),
+}
+
+impl Serialize for ProviderItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let item = match &self.inner {
+            ProviderItemInner::Codex(CodexProviderItem::ResponseOutputMetadata(metadata)) => {
+                CodexProviderItemSerialize::ResponseOutputMetadata(metadata)
+            }
+            ProviderItemInner::Codex(CodexProviderItem::NativeCompactionMetadata(metadata)) => {
+                CodexProviderItemSerialize::NativeCompactionMetadata(metadata)
+            }
+            ProviderItemInner::Codex(CodexProviderItem::EncryptedCompaction(item)) => {
+                CodexProviderItemSerialize::EncryptedCompaction(item)
+            }
+        };
+        ProviderItemSerialize {
+            provider: ProviderName::Codex,
+            item,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderItemDeserialize {
+    provider: ProviderName,
+    #[serde(flatten)]
+    item: CodexProviderItemDeserialize,
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum CodexProviderItemDeserialize {
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
+    NativeCompactionMetadata(NativeCompactionCompatibility),
+    #[serde(rename = "compaction")]
+    EncryptedCompaction(rs::CompactionSummaryItemParam),
+}
+
+impl<'de> Deserialize<'de> for ProviderItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ProviderItemDeserialize { provider, item } =
+            ProviderItemDeserialize::deserialize(deserializer)?;
+        match (provider, item) {
+            (
+                ProviderName::Codex,
+                CodexProviderItemDeserialize::ResponseOutputMetadata(metadata),
+            ) => Ok(Self::response_output_metadata(metadata)),
+            (
+                ProviderName::Codex,
+                CodexProviderItemDeserialize::NativeCompactionMetadata(metadata),
+            ) => Ok(Self::native_compaction_metadata(metadata)),
+            (ProviderName::Codex, CodexProviderItemDeserialize::EncryptedCompaction(item)) => {
+                Ok(Self::encrypted_compaction(item))
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConversationItemDeserialize {
+    System(SystemItem),
+    User(UserItem),
+    Assistant(AssistantItem),
+    ToolResult(ToolResultItem),
+    BackendToolCall(BackendToolCallItem),
+    Provider(ProviderItem),
+    Reasoning(rs::ReasoningItem),
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
+    NativeCompactionMetadata(NativeCompactionCompatibility),
     Compaction(rs::CompactionSummaryItemParam),
+}
+
+impl<'de> Deserialize<'de> for ConversationItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match ConversationItemDeserialize::deserialize(deserializer)? {
+                ConversationItemDeserialize::System(item) => Self::System(item),
+                ConversationItemDeserialize::User(item) => Self::User(item),
+                ConversationItemDeserialize::Assistant(item) => Self::Assistant(item),
+                ConversationItemDeserialize::ToolResult(item) => Self::ToolResult(item),
+                ConversationItemDeserialize::BackendToolCall(item) => Self::BackendToolCall(item),
+                ConversationItemDeserialize::Provider(item) => Self::Provider(item),
+                ConversationItemDeserialize::Reasoning(item) => Self::Reasoning(item),
+                ConversationItemDeserialize::ResponseOutputMetadata(item) => {
+                    Self::Provider(ProviderItem::response_output_metadata(item))
+                }
+                ConversationItemDeserialize::NativeCompactionMetadata(item) => {
+                    Self::Provider(ProviderItem::native_compaction_metadata(item))
+                }
+                ConversationItemDeserialize::Compaction(item) => {
+                    Self::Provider(ProviderItem::encrypted_compaction(item))
+                }
+            },
+        )
+    }
 }
 
 /// Internal Responses transport metadata that Codex requires clients to replay
@@ -96,6 +332,77 @@ pub enum ResponseOutputItemKind {
     CustomToolCall,
     CodeInterpreterCall,
     Compaction,
+}
+
+/// Complete sampling identity used to decide whether provider-owned history can
+/// be replayed. Codex's supported public host spellings are canonicalized to a
+/// single backend URL; all other backends retain their exact configured base
+/// URL. Credentials and bearer tokens must never be stored here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SamplingIdentity {
+    pub api_backend: ApiBackend,
+    pub backend_family: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt_account_id: Option<String>,
+}
+
+impl SamplingIdentity {
+    pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
+    pub const OTHER_BACKEND_FAMILY: &'static str = "other";
+
+    pub fn new(
+        api_backend: ApiBackend,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        chatgpt_account_id: Option<String>,
+    ) -> Self {
+        let base_url = base_url.into();
+        let (backend_family, base_url) = if crate::is_codex_backend_url(&base_url) {
+            (
+                Self::CODEX_RESPONSES_FAMILY.to_string(),
+                crate::CODEX_BACKEND_BASE_URL.to_string(),
+            )
+        } else {
+            (Self::OTHER_BACKEND_FAMILY.to_string(), base_url)
+        };
+        Self {
+            api_backend,
+            backend_family,
+            base_url,
+            model: model.into(),
+            chatgpt_account_id,
+        }
+    }
+
+    pub fn from_sampling_config(config: &SamplingConfig) -> Self {
+        Self::new(
+            config.api_backend.clone(),
+            config.base_url.clone(),
+            config.model.clone(),
+            chatgpt_account_id_from_headers(&config.extra_headers).map(str::to_owned),
+        )
+    }
+
+    fn is_codex_responses(&self) -> bool {
+        self.api_backend == ApiBackend::Responses
+            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
+            && self.base_url == crate::CODEX_BACKEND_BASE_URL
+    }
+}
+
+/// Extract the effective ChatGPT account from ordered config headers.
+/// Header names are ASCII-case-insensitive and later entries win, matching
+/// their eventual HTTP-header installation semantics.
+pub fn chatgpt_account_id_from_headers(
+    headers: &indexmap::IndexMap<String, String>,
+) -> Option<&str> {
+    headers
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case(crate::CHATGPT_ACCOUNT_ID_HEADER))
+        .map(|(_, value)| value.as_str())
 }
 
 /// Exact provider identity under which ordinary Codex Responses transport
@@ -134,6 +441,15 @@ impl ResponseMetadataOrigin {
             })
     }
 
+    pub fn matches_identity(&self, identity: &SamplingIdentity) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
+            && self.base_url == crate::CODEX_BACKEND_BASE_URL
+            && identity.is_codex_responses()
+            && self.model == identity.model
+            && self.chatgpt_account_id == identity.chatgpt_account_id
+    }
+
     pub fn matches(
         &self,
         api_backend: &ApiBackend,
@@ -141,13 +457,12 @@ impl ResponseMetadataOrigin {
         model: &str,
         chatgpt_account_id: Option<&str>,
     ) -> bool {
-        self.schema_version == Self::SCHEMA_VERSION
-            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
-            && self.base_url == crate::CODEX_BACKEND_BASE_URL
-            && *api_backend == ApiBackend::Responses
-            && crate::capabilities_for_base_url(base_url).preserve_response_metadata
-            && self.model == model
-            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
+        self.matches_identity(&SamplingIdentity::new(
+            api_backend.clone(),
+            base_url,
+            model,
+            chatgpt_account_id.map(str::to_owned),
+        ))
     }
 }
 
@@ -193,6 +508,28 @@ pub struct ResponseOutputItemOrder {
 /// proposed sampler identity. Semantic messages/tool history remain portable;
 /// opaque native compaction descriptors are deliberately untouched and retain
 /// their separate fail-closed compatibility checks.
+pub fn strip_incompatible_response_metadata_for_identity(
+    items: &mut Vec<ConversationItem>,
+    identity: &SamplingIdentity,
+) -> bool {
+    let original_len = items.len();
+    items.retain(|item| {
+        !matches!(
+            item,
+            ConversationItem::Provider(provider)
+                if provider.as_response_output_metadata().is_some_and(|metadata| {
+                    !metadata
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| origin.matches_identity(identity))
+                })
+        )
+    });
+    items.len() != original_len
+}
+
+/// Backward-compatible field-wise wrapper. New state-transition code should
+/// construct one [`SamplingIdentity`] and use the identity-based policy.
 pub fn strip_incompatible_response_metadata(
     items: &mut Vec<ConversationItem>,
     api_backend: &ApiBackend,
@@ -200,22 +537,15 @@ pub fn strip_incompatible_response_metadata(
     model: &str,
     chatgpt_account_id: Option<&str>,
 ) -> bool {
-    let original_len = items.len();
-    items.retain(|item| {
-        !matches!(
-            item,
-            ConversationItem::ResponseOutputMetadata(metadata)
-                if !metadata.origin.as_ref().is_some_and(|origin| {
-                    origin.matches(
-                        api_backend,
-                        base_url,
-                        model,
-                        chatgpt_account_id,
-                    )
-                })
-        )
-    });
-    items.len() != original_len
+    strip_incompatible_response_metadata_for_identity(
+        items,
+        &SamplingIdentity::new(
+            api_backend.clone(),
+            base_url,
+            model,
+            chatgpt_account_id.map(str::to_owned),
+        ),
+    )
 }
 
 /// Request-side binding after durable conversation items have expanded back
@@ -312,6 +642,14 @@ impl NativeCompactionCompatibility {
 
     /// Whether a proposed sampler identity can safely replay this opaque
     /// history. Every known identity component is exact-match only.
+    pub fn matches_identity(&self, identity: &SamplingIdentity) -> bool {
+        self.schema_version == Self::SCHEMA_VERSION
+            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
+            && identity.is_codex_responses()
+            && self.model == identity.model
+            && self.chatgpt_account_id == identity.chatgpt_account_id
+    }
+
     pub fn matches_origin(
         &self,
         api_backend: &ApiBackend,
@@ -319,12 +657,12 @@ impl NativeCompactionCompatibility {
         model: &str,
         chatgpt_account_id: Option<&str>,
     ) -> bool {
-        self.schema_version == Self::SCHEMA_VERSION
-            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
-            && *api_backend == ApiBackend::Responses
-            && crate::is_codex_backend_url(base_url)
-            && self.model == model
-            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
+        self.matches_identity(&SamplingIdentity::new(
+            api_backend.clone(),
+            base_url,
+            model,
+            chatgpt_account_id.map(str::to_owned),
+        ))
     }
 }
 
@@ -337,20 +675,27 @@ pub fn native_compaction_compatibility(
     let mut metadata_pending = false;
     for item in items {
         match item {
-            ConversationItem::NativeCompactionMetadata(value) => {
-                if metadata_pending || descriptor.is_some() {
+            ConversationItem::Provider(provider) => {
+                if let Some(value) = provider.as_native_compaction_metadata() {
+                    if metadata_pending || descriptor.is_some() {
+                        return Err(
+                            "native compaction history contains conflicting identity metadata"
+                                .into(),
+                        );
+                    }
+                    descriptor = Some(value);
+                    metadata_pending = true;
+                } else if provider.is_encrypted_compaction() {
+                    if !metadata_pending {
+                        return Err("native compaction history is missing durable identity metadata; resume with the original client or start a new session".into());
+                    }
+                    metadata_pending = false;
+                } else if metadata_pending {
                     return Err(
-                        "native compaction history contains conflicting identity metadata".into(),
+                        "native compaction identity metadata is not adjacent to its opaque item"
+                            .into(),
                     );
                 }
-                descriptor = Some(value);
-                metadata_pending = true;
-            }
-            ConversationItem::Compaction(_) => {
-                if !metadata_pending {
-                    return Err("native compaction history is missing durable identity metadata; resume with the original client or start a new session".into());
-                }
-                metadata_pending = false;
             }
             _ if metadata_pending => {
                 return Err(
@@ -386,7 +731,7 @@ pub fn native_compaction_compatibility(
                 break;
             }
             match item {
-                ConversationItem::System(_) | ConversationItem::NativeCompactionMetadata(_) => {}
+                ConversationItem::System(_) => {}
                 ConversationItem::User(user) => replay_items.push((
                     NativeCompactionItemKind::Message,
                     user.response_item_id.as_deref(),
@@ -395,10 +740,20 @@ pub fn native_compaction_compatibility(
                     NativeCompactionItemKind::Reasoning,
                     Some(reasoning.id.as_str()),
                 )),
-                ConversationItem::Compaction(compaction) => replay_items.push((
-                    NativeCompactionItemKind::Compaction,
-                    compaction.id.as_deref(),
-                )),
+                ConversationItem::Provider(provider) => {
+                    if provider.is_native_compaction_metadata() {
+                        continue;
+                    }
+                    let Some(compaction) = provider.as_encrypted_compaction() else {
+                        return Err(
+                            "native compaction manifest crosses an unsupported replay item".into(),
+                        );
+                    };
+                    replay_items.push((
+                        NativeCompactionItemKind::Compaction,
+                        compaction.id.as_deref(),
+                    ));
+                }
                 _ => {
                     return Err(
                         "native compaction manifest crosses an unsupported replay item".into(),
@@ -437,6 +792,50 @@ pub fn native_compaction_compatibility(
         }
     }
     Ok(descriptor)
+}
+
+/// Why history cannot transition to a proposed sampling identity.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SamplingIdentityHistoryError {
+    #[error(
+        "native Codex compaction history has missing or malformed durable identity metadata: {0}; history was not modified"
+    )]
+    MalformedNativeHistory(String),
+    #[error(
+        "session contains identity-bound native Codex compaction history; backend, API, model, and ChatGPT account must exactly match its origin"
+    )]
+    IncompatibleNativeHistory,
+}
+
+/// Validate opaque native history against a proposed identity without mutating
+/// caller-owned history. Samplers use this as defense in depth at every API
+/// entry point.
+pub fn validate_history_for_sampling_identity(
+    items: &[ConversationItem],
+    identity: &SamplingIdentity,
+) -> Result<(), SamplingIdentityHistoryError> {
+    let compatibility = native_compaction_compatibility(items)
+        .map_err(SamplingIdentityHistoryError::MalformedNativeHistory)?;
+    if compatibility.is_some_and(|expected| !expected.matches_identity(identity)) {
+        return Err(SamplingIdentityHistoryError::IncompatibleNativeHistory);
+    }
+    Ok(())
+}
+
+/// Prepare history for an authoritative sampling-identity transition.
+///
+/// Native history is fully parsed and identity-validated before this function
+/// mutates anything. Only after that succeeds are incompatible ordinary
+/// response sidecars stripped. The returned boolean reports whether history
+/// changed.
+pub fn prepare_history_for_sampling_identity(
+    items: &mut Vec<ConversationItem>,
+    identity: &SamplingIdentity,
+) -> Result<bool, SamplingIdentityHistoryError> {
+    validate_history_for_sampling_identity(items, identity)?;
+    Ok(strip_incompatible_response_metadata_for_identity(
+        items, identity,
+    ))
 }
 
 /// System message content
@@ -935,6 +1334,54 @@ impl From<ToolDefinition> for ToolSpec {
 // Conversation Request
 // ============================================================================
 
+/// Shared process-local routing state for one prompt turn.
+///
+/// Clones share the same first-value-wins scope so retries, compaction, and
+/// continuations can replay routing metadata captured from the first response.
+/// The opaque state is deliberately not serializable; create a fresh scope for
+/// each prompt with [`Self::fresh`] or [`Default::default`].
+pub struct TurnRoutingState(Arc<std::sync::OnceLock<String>>);
+
+impl TurnRoutingState {
+    /// Create a fresh, empty routing scope for one prompt turn.
+    pub fn fresh() -> Self {
+        Self(Arc::new(std::sync::OnceLock::new()))
+    }
+
+    /// Capture a routing value if this scope is still empty.
+    ///
+    /// Returns `true` only for the first value captured in the scope.
+    pub fn capture_first(&self, value: String) -> bool {
+        self.0.set(value).is_ok()
+    }
+
+    /// Inspect the captured routing value for transport application or tests.
+    pub fn value(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
+
+impl Clone for TurnRoutingState {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Default for TurnRoutingState {
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
+impl std::fmt::Debug for TurnRoutingState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRoutingState")
+            .field("captured", &self.value().is_some())
+            .finish()
+    }
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -972,9 +1419,8 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
-    /// Process-local, first-value-wins Codex sticky-routing token for one user
-    /// turn. Callers must create a fresh lock per turn; it is never persisted.
-    pub codex_turn_state: Option<Arc<std::sync::OnceLock<String>>>,
+    /// Process-local routing scope for one prompt turn. Never persisted.
+    pub turn_routing_state: Option<TurnRoutingState>,
 }
 
 impl ConversationRequest {
@@ -1272,6 +1718,21 @@ impl ConversationResponse {
 // ============================================================================
 
 impl ConversationItem {
+    /// Create ordinary provider response metadata.
+    pub fn response_output_metadata(metadata: ResponseOutputItemMetadata) -> Self {
+        Self::Provider(ProviderItem::response_output_metadata(metadata))
+    }
+
+    /// Create native compaction compatibility metadata.
+    pub fn native_compaction_metadata(metadata: NativeCompactionCompatibility) -> Self {
+        Self::Provider(ProviderItem::native_compaction_metadata(metadata))
+    }
+
+    /// Create an encrypted native compaction replay payload.
+    pub fn encrypted_compaction(item: rs::CompactionSummaryItemParam) -> Self {
+        Self::Provider(ProviderItem::encrypted_compaction(item))
+    }
+
     /// Create a system message
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
@@ -1622,11 +2083,8 @@ impl ConversationItem {
             Self::Assistant(_) => Role::Assistant,
             Self::ToolResult(_) => Role::Tool,
             Self::BackendToolCall(_) => Role::Assistant,
-            // Metadata, reasoning, and native compaction are semantically part of the assistant's turn.
-            Self::ResponseOutputMetadata(_)
-            | Self::Reasoning(_)
-            | Self::NativeCompactionMetadata(_)
-            | Self::Compaction(_) => Role::Assistant,
+            // Provider metadata, reasoning, and native compaction are semantically part of the assistant's turn.
+            Self::Provider(_) | Self::Reasoning(_) => Role::Assistant,
         }
     }
 
@@ -1657,9 +2115,7 @@ impl ConversationItem {
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
             // Transport/native metadata and payload are intentionally opaque locally.
-            Self::ResponseOutputMetadata(_)
-            | Self::NativeCompactionMetadata(_)
-            | Self::Compaction(_) => String::new(),
+            Self::Provider(_) => String::new(),
         }
     }
 }
@@ -2318,10 +2774,10 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             "conversation_to_chat_messages folds Reasoning siblings; \
                  conversation_item_to_chat_message is never called with one"
         ),
-        ConversationItem::ResponseOutputMetadata(_) => {
-            unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
-        }
-        ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
+        ConversationItem::Provider(provider) => {
+            if provider.is_response_output_metadata() {
+                unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
+            }
             panic!("opaque native Codex compaction history cannot be projected to Chat Completions")
         }
     }
@@ -2348,7 +2804,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
 
     for item in items {
         match item {
-            ConversationItem::ResponseOutputMetadata(_) => {}
+            ConversationItem::Provider(provider) if provider.is_response_output_metadata() => {}
             ConversationItem::Reasoning(r) => {
                 let text = reasoning_item_text(&r);
                 if !text.is_empty() {
@@ -2843,11 +3299,10 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }
             }]
         }
-        ConversationItem::ResponseOutputMetadata(_)
-        | ConversationItem::NativeCompactionMetadata(_) => Vec::new(),
-        ConversationItem::Compaction(item) => {
-            vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))]
-        }
+        ConversationItem::Provider(provider) => provider
+            .as_encrypted_compaction()
+            .map(|item| vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))])
+            .unwrap_or_default(),
     }
 }
 
@@ -3258,9 +3713,7 @@ pub fn transform_conversation_cwd(
                 }
             }
             // Provider/native metadata and encrypted content are immutable.
-            ConversationItem::ResponseOutputMetadata(_)
-            | ConversationItem::NativeCompactionMetadata(_)
-            | ConversationItem::Compaction(_) => {}
+            ConversationItem::Provider(_) => {}
         }
     }
 }
@@ -3716,9 +4169,10 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     });
                 }
             }
-            ConversationItem::ResponseOutputMetadata(_) => {}
-            ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
-                panic!("opaque native Codex compaction history cannot be projected to Messages")
+            ConversationItem::Provider(provider) => {
+                if !provider.is_response_output_metadata() {
+                    panic!("opaque native Codex compaction history cannot be projected to Messages")
+                }
             }
         }
     }
@@ -3991,6 +4445,274 @@ mod tests {
     use super::*;
     use crate::tool_overrides::*;
     use assert_matches::assert_matches;
+
+    fn ordinary_identity_sidecar() -> ConversationItem {
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-identity".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: ResponseMetadataOrigin::codex(
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+        })
+    }
+
+    fn valid_native_identity_history() -> Vec<ConversationItem> {
+        let mut compatibility =
+            NativeCompactionCompatibility::codex("gpt-identity", Some("acct-identity".into()));
+        compatibility.replacement_segment_items = 1;
+        compatibility.item_metadata = vec![NativeCompactionItemMetadata {
+            input_index: 0,
+            kind: NativeCompactionItemKind::Compaction,
+            item_id: Some("cmp-identity".into()),
+            internal_chat_message_metadata_passthrough: None,
+        }];
+        vec![
+            ConversationItem::native_compaction_metadata(compatibility),
+            ConversationItem::encrypted_compaction(rs::CompactionSummaryItemParam {
+                id: Some("cmp-identity".into()),
+                encrypted_content: "opaque".into(),
+            }),
+        ]
+    }
+
+    fn codex_identity() -> SamplingIdentity {
+        SamplingIdentity::new(
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+            "gpt-identity",
+            Some("acct-identity".into()),
+        )
+    }
+
+    #[test]
+    fn sampling_identity_policy_preserves_same_identity_and_canonical_codex_alias() {
+        for base_url in [
+            crate::CODEX_BACKEND_BASE_URL,
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            let mut history = vec![ordinary_identity_sidecar(), ConversationItem::user("hello")];
+            let identity = SamplingIdentity::new(
+                ApiBackend::Responses,
+                base_url,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            );
+            assert!(!prepare_history_for_sampling_identity(&mut history, &identity).unwrap());
+            assert_eq!(history.len(), 2);
+        }
+    }
+
+    #[test]
+    fn sampling_identity_policy_strips_sidecars_on_backend_api_model_or_account_change() {
+        let changed = [
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                "https://api.x.ai/v1",
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::ChatCompletions,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-other",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-other".into()),
+            ),
+        ];
+        for identity in changed {
+            let mut history = vec![ordinary_identity_sidecar(), ConversationItem::user("hello")];
+            assert!(prepare_history_for_sampling_identity(&mut history, &identity).unwrap());
+            assert_eq!(history.len(), 1);
+            assert!(matches!(history[0], ConversationItem::User(_)));
+        }
+    }
+
+    #[test]
+    fn sampling_identity_policy_rejects_mismatched_native_without_mutation() {
+        let mut history = valid_native_identity_history();
+        history.push(ordinary_identity_sidecar());
+        let before = serde_json::to_vec(&history).unwrap();
+        let wrong = SamplingIdentity::new(
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+            "gpt-other",
+            Some("acct-identity".into()),
+        );
+        assert_eq!(
+            prepare_history_for_sampling_identity(&mut history, &wrong),
+            Err(SamplingIdentityHistoryError::IncompatibleNativeHistory)
+        );
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
+    #[test]
+    fn sampling_identity_policy_rejects_malformed_native_before_any_mutation() {
+        let mut history = vec![
+            ordinary_identity_sidecar(),
+            valid_native_identity_history().remove(0),
+        ];
+        let before = serde_json::to_vec(&history).unwrap();
+        assert!(matches!(
+            prepare_history_for_sampling_identity(&mut history, &codex_identity()),
+            Err(SamplingIdentityHistoryError::MalformedNativeHistory(_))
+        ));
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
+    #[test]
+    fn chatgpt_account_header_is_case_insensitive_and_last_wins() {
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("ChatGPT-Account-ID".into(), "first".into());
+        headers.insert("x-other".into(), "ignored".into());
+        headers.insert("chatgpt-account-id".into(), "last".into());
+        assert_eq!(chatgpt_account_id_from_headers(&headers), Some("last"));
+    }
+
+    #[test]
+    fn turn_routing_state_clones_share_scope_and_fresh_scopes_are_independent() {
+        let state = TurnRoutingState::fresh();
+        let shared = state.clone();
+        assert!(shared.capture_first("first".to_string()));
+        assert!(!state.capture_first("second".to_string()));
+        assert_eq!(state.value(), Some("first"));
+        assert_eq!(shared.value(), Some("first"));
+        assert!(TurnRoutingState::default().value().is_none());
+    }
+
+    fn native_manifest_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": NativeCompactionCompatibility::SCHEMA_VERSION,
+            "backend_family": NativeCompactionCompatibility::CODEX_RESPONSES_FAMILY,
+            "model": "gpt-test",
+            "replacement_segment_start": 0,
+            "replacement_segment_items": 1,
+            "item_metadata": [{
+                "input_index": 0,
+                "kind": "compaction",
+                "item_id": "cmp-test",
+                "internal_chat_message_metadata_passthrough": null
+            }]
+        })
+    }
+
+    #[test]
+    fn provider_item_loads_all_legacy_conversation_tags() {
+        let ordinary: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "response_output_metadata",
+            "response_id": "resp-test",
+            "output_items": 0,
+            "items": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            ordinary,
+            ConversationItem::Provider(ref provider) if provider.is_response_output_metadata()
+        ));
+
+        let mut native = native_manifest_json();
+        native["type"] = serde_json::json!("native_compaction_metadata");
+        let native: ConversationItem = serde_json::from_value(native).unwrap();
+        assert!(matches!(
+            native,
+            ConversationItem::Provider(ref provider) if provider.is_native_compaction_metadata()
+        ));
+
+        let encrypted: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "compaction",
+            "id": "cmp-test",
+            "encrypted_content": "ciphertext"
+        }))
+        .unwrap();
+        assert!(matches!(
+            encrypted,
+            ConversationItem::Provider(ref provider) if provider.is_encrypted_compaction()
+        ));
+    }
+
+    #[test]
+    fn provider_item_canonical_envelopes_round_trip() {
+        let ordinary = ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-test".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: None,
+        });
+        let native: NativeCompactionCompatibility =
+            serde_json::from_value(native_manifest_json()).unwrap();
+        let items = [
+            (ordinary, "response_output_metadata"),
+            (
+                ConversationItem::native_compaction_metadata(native),
+                "native_compaction_metadata",
+            ),
+            (
+                ConversationItem::encrypted_compaction(rs::CompactionSummaryItemParam {
+                    id: Some("cmp-test".into()),
+                    encrypted_content: "ciphertext".into(),
+                }),
+                "compaction",
+            ),
+        ];
+
+        for (item, expected_kind) in items {
+            let value = serde_json::to_value(&item).unwrap();
+            assert_eq!(value["type"], "provider");
+            assert_eq!(value["provider"], "codex");
+            assert_eq!(value["kind"], expected_kind);
+            assert!(value.get("payload").is_some());
+            let round_trip: ConversationItem = serde_json::from_value(value).unwrap();
+            assert!(matches!(round_trip, ConversationItem::Provider(_)));
+        }
+    }
+
+    #[test]
+    fn provider_item_unknown_provider_and_kind_fail_closed() {
+        for value in [
+            serde_json::json!({
+                "type": "provider",
+                "provider": "future_provider",
+                "kind": "compaction",
+                "payload": {"id": "cmp", "encrypted_content": "cipher"}
+            }),
+            serde_json::json!({
+                "type": "provider",
+                "provider": "codex",
+                "kind": "future_kind",
+                "payload": {}
+            }),
+            serde_json::json!({
+                "type": "provider",
+                "provider": "codex",
+                "kind": "compaction",
+                "payload": {"id": "cmp", "encrypted_content": "cipher"},
+                "future_envelope_field": true
+            }),
+        ] {
+            assert!(serde_json::from_value::<ConversationItem>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_native_manifest_fails_closed() {
+        let mut value = native_manifest_json();
+        value["type"] = serde_json::json!("native_compaction_metadata");
+        value.as_object_mut().unwrap().remove("item_metadata");
+        assert!(serde_json::from_value::<ConversationItem>(value).is_err());
+    }
 
     #[test]
     fn prior_turn_interrupt_serde_round_trip_and_unknown_fallback() {

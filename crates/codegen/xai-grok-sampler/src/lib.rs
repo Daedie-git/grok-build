@@ -36,7 +36,9 @@ pub use actor::SamplerActor;
 pub use attribution::{
     Auth401AttributionCallback, SENT_BEARER_PREFIX_LEN, SamplingConsumer, SharedAttributionCallback,
 };
-pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
+pub use client::{
+    ApiBackend, SamplingClient, resolve_runtime_sampling_identity, user_agent_string_for,
+};
 pub use config::{
     AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
     SharedBearerResolver, SharedHeaderInjector,

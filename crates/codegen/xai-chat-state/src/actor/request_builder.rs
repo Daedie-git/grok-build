@@ -2,6 +2,7 @@
 
 use xai_grok_sampling_types::{
     ContentPart, ConversationItem, ConversationRequest, ToolSpec, TraceContext,
+    capabilities_for_base_url,
 };
 
 use super::ChatStateActor;
@@ -145,7 +146,9 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
-            codex_turn_state: Some(self.state.codex_turn_state.clone()),
+            turn_routing_state: capabilities_for_base_url(&self.state.sampling_config.base_url)
+                .sticky_turn_state
+                .then(|| self.state.turn_routing_state.clone()),
         }
     }
 }

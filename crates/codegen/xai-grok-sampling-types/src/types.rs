@@ -1103,8 +1103,8 @@ pub struct CreateResponseWrapper {
     /// Exact provider identity to stamp on metadata captured from this response.
     pub response_metadata_origin: Option<crate::ResponseMetadataOrigin>,
 
-    /// Process-local turn-scoped Codex sticky-routing token.
-    pub codex_turn_state: Option<std::sync::Arc<std::sync::OnceLock<String>>>,
+    /// Process-local routing scope for one prompt turn. Never serialized.
+    pub turn_routing_state: Option<crate::TurnRoutingState>,
 }
 
 impl CreateResponseWrapper {
@@ -1124,7 +1124,7 @@ impl CreateResponseWrapper {
             response_message_item_ids: vec![],
             response_item_metadata_passthrough: vec![],
             response_metadata_origin: None,
-            codex_turn_state: None,
+            turn_routing_state: None,
         }
     }
 

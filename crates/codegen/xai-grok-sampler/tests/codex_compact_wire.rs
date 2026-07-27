@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use xai_grok_sampler::SamplingClient;
 use xai_grok_sampling_types::{
     CHATGPT_ACCOUNT_ID_HEADER, CodexCompactResponse, ConversationItem, ConversationRequest,
-    NativeCompactionCompatibility, ReasoningEffort, SamplingError, ToolSpec,
+    NativeCompactionCompatibility, ReasoningEffort, SamplingError, ToolSpec, TurnRoutingState,
     codex_compact_output_to_conversation,
 };
 
@@ -21,6 +21,13 @@ struct CapturedRequest {
     uri: Uri,
     headers: HeaderMap,
     body: Value,
+}
+
+fn codex_test_config(base_url: &str, api_key: &str) -> xai_grok_sampler::SamplerConfig {
+    let mut config = support::test_config(base_url, api_key);
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+    config
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -75,7 +82,7 @@ async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let mut cfg = support::test_config(&format!("http://{addr}/v1"), "test-codex-token");
+    let mut cfg = codex_test_config(&format!("http://{addr}/v1"), "test-codex-token");
     cfg.extra_headers
         .insert(CHATGPT_ACCOUNT_ID_HEADER.into(), "acct_test_native".into());
     let client = SamplingClient::new(cfg).expect("client builds");
@@ -175,7 +182,7 @@ async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_turn_state_is_shared_by_ordinary_compact_and_continuation_only() {
+async fn unsupported_provider_neither_sends_nor_captures_turn_routing_state() {
     let ordinary_headers = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let compact_headers = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let ordinary_sink = Arc::clone(&ordinary_headers);
@@ -196,7 +203,7 @@ async fn codex_turn_state_is_shared_by_ordinary_compact_and_continuation_only() 
                     axum::response::Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "text/event-stream")
-                        .header("x-codex-turn-state", "turn-one")
+                        .header("x-codex-turn-state", "server-ordinary")
                         .body(axum::body::Body::from("data: [DONE]\n\n"))
                         .unwrap()
                 }
@@ -225,7 +232,7 @@ async fn codex_turn_state_is_shared_by_ordinary_compact_and_continuation_only() 
                         .insert("content-type", "application/json".parse().unwrap());
                     response
                         .headers_mut()
-                        .insert("x-codex-turn-state", "turn-two".parse().unwrap());
+                        .insert("x-codex-turn-state", "server-compact".parse().unwrap());
                     response
                 }
             }),
@@ -236,52 +243,49 @@ async fn codex_turn_state_is_shared_by_ordinary_compact_and_continuation_only() 
         let _ = axum::serve(listener, app).await;
     });
 
-    let client = SamplingClient::new(support::test_config(
-        &format!("http://{addr}/v1"),
-        "test-token",
-    ))
-    .unwrap();
-    let first_turn = Arc::new(std::sync::OnceLock::new());
+    // Explicit non-Codex identity must win even though these test routes emit
+    // Codex-specific headers.
+    let mut config = support::test_config(&format!("http://{addr}/v1"), "test-token");
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.provider_id = Some(xai_grok_sampling_types::ProviderId::Custom);
+    let client = SamplingClient::new(config).unwrap();
+    let populated = TurnRoutingState::fresh();
+    assert!(populated.capture_first("client-state".to_string()));
     let request = ConversationRequest {
         items: vec![ConversationItem::user("hello")],
-        codex_turn_state: Some(Arc::clone(&first_turn)),
+        turn_routing_state: Some(populated.clone()),
         ..Default::default()
     };
     let (stream, _, _) = client
         .conversation_stream_responses(request.clone())
         .await
-        .expect("ordinary turn-start request succeeds");
+        .expect("ordinary request succeeds");
     drop(stream);
-    client
-        .conversation_compact_responses(request.clone())
-        .await
-        .expect("mid-turn compact succeeds");
-    let (stream, _, _) = client
-        .conversation_stream_responses(request)
-        .await
-        .expect("mid-turn continuation succeeds");
-    drop(stream);
+    assert!(matches!(
+        client.conversation_compact_responses(request).await,
+        Err(SamplingError::InvalidConfiguration(_))
+    ));
+    assert_eq!(populated.value(), Some("client-state"));
 
-    let second_turn = Arc::new(std::sync::OnceLock::new());
+    let fresh = TurnRoutingState::fresh();
     let (stream, _, _) = client
         .conversation_stream_responses(ConversationRequest {
             items: vec![ConversationItem::user("next")],
-            codex_turn_state: Some(Arc::clone(&second_turn)),
+            turn_routing_state: Some(fresh.clone()),
             ..Default::default()
         })
         .await
-        .expect("next turn succeeds");
+        .expect("second ordinary request succeeds");
     drop(stream);
 
-    assert_eq!(first_turn.get().map(String::as_str), Some("turn-one"));
-    assert_eq!(second_turn.get().map(String::as_str), Some("turn-one"));
-    assert_eq!(
-        *ordinary_headers.lock().unwrap(),
-        vec![None, Some("turn-one".to_string()), None]
+    assert!(
+        fresh.value().is_none(),
+        "unsupported response must not capture"
     );
-    assert_eq!(
-        *compact_headers.lock().unwrap(),
-        vec![Some("turn-one".to_string())]
+    assert_eq!(*ordinary_headers.lock().unwrap(), vec![None, None]);
+    assert!(
+        compact_headers.lock().unwrap().is_empty(),
+        "unsupported provider must reject native compact before HTTP"
     );
 }
 
@@ -312,7 +316,7 @@ async fn invalid_native_manifest_is_rejected_by_both_endpoints_before_http() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))
@@ -347,7 +351,9 @@ async fn invalid_native_manifest_is_rejected_by_both_endpoints_before_http() {
         items
             .iter_mut()
             .find_map(|item| match item {
-                ConversationItem::NativeCompactionMetadata(manifest) => Some(manifest),
+                ConversationItem::Provider(provider) => {
+                    provider.as_native_compaction_metadata_mut()
+                }
                 _ => None,
             })
             .unwrap()
@@ -388,8 +394,9 @@ async fn invalid_native_manifest_is_rejected_by_both_endpoints_before_http() {
     invalid_histories.push(wrong_segment_length);
 
     let mut missing_descriptor = valid.clone();
-    missing_descriptor
-        .retain(|item| !matches!(item, ConversationItem::NativeCompactionMetadata(_)));
+    missing_descriptor.retain(|item| {
+        !matches!(item, ConversationItem::Provider(provider) if provider.is_native_compaction_metadata())
+    });
     invalid_histories.push(missing_descriptor);
 
     let mut legacy = valid;
@@ -437,7 +444,7 @@ async fn native_compact_preserves_actionable_detail_error() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))
@@ -480,7 +487,7 @@ async fn native_compact_classifies_unauthorized_as_auth() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let client = SamplingClient::new(support::test_config(
+    let client = SamplingClient::new(codex_test_config(
         &format!("http://{addr}/v1"),
         "test-token",
     ))

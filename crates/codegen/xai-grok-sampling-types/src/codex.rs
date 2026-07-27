@@ -313,7 +313,9 @@ pub fn response_item_metadata_passthrough_for_origin(
     let mut seen_response_ids = std::collections::BTreeSet::new();
 
     for item in &req.items {
-        if let ConversationItem::ResponseOutputMetadata(metadata) = item {
+        if let ConversationItem::Provider(provider) = item
+            && let Some(metadata) = provider.as_response_output_metadata()
+        {
             if active.is_some() {
                 return Err("ordinary Responses output groups overlap".into());
             }
@@ -356,7 +358,7 @@ pub fn response_item_metadata_passthrough_for_origin(
 
         let mut owners: Vec<(Kind, Option<&str>, Option<&str>)> = Vec::new();
         match item {
-            ConversationItem::System(_) | ConversationItem::NativeCompactionMetadata(_) => {}
+            ConversationItem::System(_) => {}
             ConversationItem::User(user) => {
                 owners.push((Kind::Message, user.response_item_id.as_deref(), None));
             }
@@ -394,24 +396,26 @@ pub fn response_item_metadata_passthrough_for_origin(
                     owners.push((Kind::CodeInterpreterCall, Some(value.id.as_str()), None));
                 }
             },
-            ConversationItem::Compaction(_) => {
-                if active.is_some() {
-                    return Err("ordinary Responses output group crosses native compaction".into());
+            ConversationItem::Provider(provider) => {
+                if provider.is_encrypted_compaction() {
+                    if active.is_some() {
+                        return Err(
+                            "ordinary Responses output group crosses native compaction".into()
+                        );
+                    }
+                    input_index += 1;
+                    continue;
                 }
-                input_index += 1;
-                continue;
+                debug_assert!(provider.is_native_compaction_metadata());
             }
-            ConversationItem::ResponseOutputMetadata(_) => unreachable!(),
         }
 
         if let Some((group, bound)) = &mut active {
             if matches!(
                 item,
-                ConversationItem::User(_)
-                    | ConversationItem::NativeCompactionMetadata(_)
-                    | ConversationItem::Compaction(_)
-                    | ConversationItem::System(_)
-            ) {
+                ConversationItem::User(_) | ConversationItem::System(_)
+            ) || matches!(item, ConversationItem::Provider(provider) if provider.is_native_compaction_item())
+            {
                 return Err("ordinary Responses output group crosses a response boundary".into());
             }
             for (owner_offset, (kind, item_id, call_id)) in owners.iter().enumerate() {
@@ -460,7 +464,9 @@ pub fn response_item_metadata_passthrough_for_origin(
             active = None;
         }
 
-        if let ConversationItem::NativeCompactionMetadata(compatibility) = item {
+        if let ConversationItem::Provider(provider) = item
+            && let Some(compatibility) = provider.as_native_compaction_metadata()
+        {
             result.extend(compatibility.item_metadata.iter().filter_map(|entry| {
                 let metadata = entry.internal_chat_message_metadata_passthrough.clone()?;
                 let kind = match entry.kind {
@@ -800,10 +806,12 @@ pub fn codex_compact_output_to_conversation(
                 encrypted_content,
                 internal_chat_message_metadata_passthrough,
             } => (
-                ConversationItem::Compaction(rs::CompactionSummaryItemParam {
-                    id: id.clone(),
-                    encrypted_content,
-                }),
+                ConversationItem::Provider(crate::ProviderItem::encrypted_compaction(
+                    rs::CompactionSummaryItemParam {
+                        id: id.clone(),
+                        encrypted_content,
+                    },
+                )),
                 NativeCompactionItemKind::Compaction,
                 id,
                 internal_chat_message_metadata_passthrough,
@@ -820,7 +828,8 @@ pub fn codex_compact_output_to_conversation(
     compatibility.replacement_segment_items = items.len();
     compatibility.item_metadata = item_metadata;
     let mut compaction_indices = items.iter().enumerate().filter_map(|(index, item)| {
-        matches!(item, ConversationItem::Compaction(_)).then_some(index)
+        matches!(item, ConversationItem::Provider(provider) if provider.is_encrypted_compaction())
+            .then_some(index)
     });
     let compaction_index = compaction_indices
         .next()
@@ -830,7 +839,9 @@ pub fn codex_compact_output_to_conversation(
     }
     items.insert(
         compaction_index,
-        ConversationItem::NativeCompactionMetadata(compatibility),
+        ConversationItem::Provider(crate::ProviderItem::native_compaction_metadata(
+            compatibility,
+        )),
     );
     Ok(items)
 }
@@ -1234,24 +1245,21 @@ pub fn captured_response_to_conversation_items(
     let mut items = Vec::with_capacity(output.len() + 2);
     let mut content = String::new();
     let mut response_item_id = None;
+    let mut exact_message_indices = Vec::new();
+    let mut exact_message_ids = std::collections::BTreeSet::new();
     let mut tool_calls = Vec::new();
 
     for captured in output {
         match captured.value {
             CapturedResponseOutputItemValue::Typed(rs::OutputItem::Message(message)) => {
-                if response_item_id.is_some() && require_exact {
-                    return Err(
-                        "multiple Codex Responses messages cannot collapse losslessly".into(),
-                    );
-                }
-                response_item_id = Some(message.id);
+                let mut message_content = String::new();
                 for part in message.content {
                     match part {
                         rs::OutputMessageContent::OutputText(text) => {
-                            if !content.is_empty() {
-                                content.push('\n');
+                            if !message_content.is_empty() {
+                                message_content.push('\n');
                             }
-                            content.push_str(&text.text);
+                            message_content.push_str(&text.text);
                         }
                         _ if require_exact => {
                             return Err(
@@ -1261,8 +1269,34 @@ pub fn captured_response_to_conversation_items(
                         _ => {}
                     }
                 }
-                if content.is_empty() && require_exact {
-                    return Err("empty Codex Responses message cannot be replayed exactly".into());
+
+                if require_exact {
+                    if message_content.is_empty() {
+                        return Err(
+                            "empty Codex Responses message cannot be replayed exactly".into()
+                        );
+                    }
+                    if message.id.is_empty() {
+                        return Err("Codex Responses message id is empty".into());
+                    }
+                    if !exact_message_ids.insert(message.id.clone()) {
+                        return Err("Codex Responses message id is duplicated".into());
+                    }
+                    exact_message_indices.push(items.len());
+                    items.push(ConversationItem::Assistant(AssistantItem {
+                        content: std::sync::Arc::<str>::from(message_content),
+                        response_item_id: Some(message.id),
+                        tool_calls: Vec::new(),
+                        model_id: None,
+                        model_fingerprint: None,
+                        reasoning_effort: None,
+                    }));
+                } else {
+                    response_item_id = Some(message.id);
+                    if !content.is_empty() && !message_content.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str(&message_content);
                 }
             }
             CapturedResponseOutputItemValue::Typed(rs::OutputItem::FunctionCall(call)) => {
@@ -1307,16 +1341,40 @@ pub fn captured_response_to_conversation_items(
         }
     }
 
-    items.push(ConversationItem::Assistant(AssistantItem {
-        content: std::sync::Arc::<str>::from(content),
-        response_item_id,
-        tool_calls,
-        model_id: Some(model_id),
-        model_fingerprint,
-        reasoning_effort,
-    }));
+    if require_exact {
+        if let Some(last_message_index) = exact_message_indices.last().copied() {
+            let ConversationItem::Assistant(assistant) = &mut items[last_message_index] else {
+                unreachable!("exact message index must identify an assistant item");
+            };
+            assistant.tool_calls = tool_calls;
+            assistant.model_id = Some(model_id);
+            assistant.model_fingerprint = model_fingerprint;
+            assistant.reasoning_effort = reasoning_effort;
+        } else {
+            items.push(ConversationItem::Assistant(AssistantItem {
+                content: std::sync::Arc::<str>::from(content),
+                response_item_id,
+                tool_calls,
+                model_id: Some(model_id),
+                model_fingerprint,
+                reasoning_effort,
+            }));
+        }
+    } else {
+        items.push(ConversationItem::Assistant(AssistantItem {
+            content: std::sync::Arc::<str>::from(content),
+            response_item_id,
+            tool_calls,
+            model_id: Some(model_id),
+            model_fingerprint,
+            reasoning_effort,
+        }));
+    }
     if let Some(manifest) = response_manifest {
-        items.insert(0, ConversationItem::ResponseOutputMetadata(manifest));
+        items.insert(
+            0,
+            ConversationItem::Provider(crate::ProviderItem::response_output_metadata(manifest)),
+        );
     }
     Ok(items)
 }
@@ -1747,15 +1805,16 @@ mod tests {
         assert!(matches!(replacement[2], ConversationItem::User(_)));
         assert!(matches!(
             replacement[3],
-            ConversationItem::NativeCompactionMetadata(_)
+            ConversationItem::Provider(ref provider) if provider.is_native_compaction_metadata()
         ));
-        match &replacement[4] {
-            ConversationItem::Compaction(item) => {
-                assert_eq!(item.id.as_deref(), Some("cmp_123"));
-                assert_eq!(item.encrypted_content, "encrypted-native-compaction");
-            }
-            other => panic!("expected native compaction item, got {other:?}"),
-        }
+        let ConversationItem::Provider(provider) = &replacement[4] else {
+            panic!("expected native compaction item, got {:?}", replacement[4])
+        };
+        let item = provider
+            .as_encrypted_compaction()
+            .expect("encrypted native compaction payload");
+        assert_eq!(item.id.as_deref(), Some("cmp_123"));
+        assert_eq!(item.encrypted_content, "encrypted-native-compaction");
 
         let persisted = serde_json::to_vec(&replacement).expect("persist replacement history");
         let replacement: Vec<ConversationItem> =
@@ -1918,7 +1977,9 @@ mod tests {
             items
                 .iter_mut()
                 .find_map(|item| match item {
-                    ConversationItem::NativeCompactionMetadata(manifest) => Some(manifest),
+                    ConversationItem::Provider(provider) => {
+                        provider.as_native_compaction_metadata_mut()
+                    }
                     _ => None,
                 })
                 .unwrap()
@@ -1987,8 +2048,8 @@ mod tests {
         let replacement = vec![
             ConversationItem::system("canonical system"),
             retained,
-            ConversationItem::NativeCompactionMetadata(compatibility),
-            ConversationItem::Compaction(crate::rs::CompactionSummaryItemParam {
+            ConversationItem::native_compaction_metadata(compatibility),
+            ConversationItem::encrypted_compaction(crate::rs::CompactionSummaryItemParam {
                 id: Some("cmp-retained".into()),
                 encrypted_content: "cipher".into(),
             }),
@@ -2122,9 +2183,12 @@ mod tests {
         assert_eq!(replacement.len(), 2);
         assert!(matches!(
             replacement[0],
-            ConversationItem::NativeCompactionMetadata(_)
+            ConversationItem::Provider(ref provider) if provider.is_native_compaction_metadata()
         ));
-        assert!(matches!(replacement[1], ConversationItem::Compaction(_)));
+        assert!(matches!(
+            replacement[1],
+            ConversationItem::Provider(ref provider) if provider.is_encrypted_compaction()
+        ));
     }
 
     #[test]
@@ -2223,18 +2287,20 @@ mod tests {
         .unwrap();
         assert!(matches!(
             &durable[0],
-            ConversationItem::ResponseOutputMetadata(metadata)
-                if metadata.items[0]
-                    .internal_chat_message_metadata_passthrough
-                    .as_ref()
-                    .and_then(|value| value.turn_id.as_deref())
-                    == Some("turn-added")
+            ConversationItem::Provider(provider)
+                if provider.as_response_output_metadata().is_some_and(|metadata| {
+                    metadata.items[0]
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|value| value.turn_id.as_deref())
+                        == Some("turn-added")
+                })
         ));
         let persisted = serde_json::to_string(&durable).unwrap();
         let cold: Vec<ConversationItem> = serde_json::from_str(&persisted).unwrap();
         assert!(matches!(
             cold[0],
-            ConversationItem::ResponseOutputMetadata(_)
+            ConversationItem::Provider(ref provider) if provider.is_response_output_metadata()
         ));
     }
 
@@ -2390,6 +2456,204 @@ mod tests {
     }
 
     #[test]
+    fn multiple_exact_messages_round_trip_as_distinct_assistants() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs_multi_0", "summary": [],
+                    "encrypted_content": "cipher-0", "status": "completed",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-0"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "message", "id": "msg_multi_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "progress", "annotations": []}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                2,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc_multi_2", "call_id": "call_multi_2",
+                    "name": "read_file", "arguments": "{}",
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-2"}
+                }),
+                &origin,
+            ),
+            captured_item(
+                3,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs_multi_3", "summary": [],
+                    "encrypted_content": "cipher-3", "status": "completed"
+                }),
+                &origin,
+            ),
+            captured_item(
+                4,
+                serde_json::json!({
+                    "type": "message", "id": "msg_multi_4", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "final", "annotations": []}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-4"}
+                }),
+                &origin,
+            ),
+        ];
+        let mut response = completed_response();
+        response.id = "resp-multi-message".into();
+        let durable = captured_response_to_conversation_items(response, output).unwrap();
+        let assistants = durable
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0].content.as_ref(), "progress");
+        assert_eq!(
+            assistants[0].response_item_id.as_deref(),
+            Some("msg_multi_1")
+        );
+        assert!(assistants[0].tool_calls.is_empty());
+        assert!(assistants[0].model_id.is_none());
+        assert_eq!(assistants[1].content.as_ref(), "final");
+        assert_eq!(
+            assistants[1].response_item_id.as_deref(),
+            Some("msg_multi_4")
+        );
+        assert_eq!(assistants[1].tool_calls.len(), 1);
+        assert_eq!(assistants[1].tool_calls[0].id.as_ref(), "call_multi_2");
+        assert_eq!(assistants[1].model_id.as_deref(), Some("gpt-codex"));
+
+        let cold: Vec<ConversationItem> =
+            serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+        let request = ConversationRequest {
+            items: cold,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = [
+            ("reasoning", Some("rs_multi_0"), None),
+            ("message", Some("msg_multi_1"), None),
+            ("function_call", Some("fc_multi_2"), Some("call_multi_2")),
+            ("reasoning", Some("rs_multi_3"), None),
+            ("message", Some("msg_multi_4"), None),
+        ];
+        for wire in [&ordinary, &compact] {
+            let input = wire["input"].as_array().unwrap();
+            assert_eq!(
+                input.iter().map(input_identity).collect::<Vec<_>>(),
+                expected
+            );
+            for (index, turn_id) in [(0, "turn-0"), (1, "turn-1"), (2, "turn-2"), (4, "turn-4")] {
+                assert_eq!(
+                    input[index]["internal_chat_message_metadata_passthrough"]["turn_id"],
+                    turn_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generic_multi_message_conversion_keeps_legacy_collapsing_behavior() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let mut output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "message", "id": "msg-generic-0", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "first", "annotations": []}]
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "message", "id": "msg-generic-1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "second", "annotations": []}]
+                }),
+                &origin,
+            ),
+        ];
+        for item in &mut output {
+            item.metadata_origin = None;
+        }
+        let durable =
+            captured_response_to_conversation_items(completed_response(), output).unwrap();
+        assert_eq!(durable.len(), 1);
+        let ConversationItem::Assistant(assistant) = &durable[0] else {
+            panic!("generic response must retain one collapsed assistant");
+        };
+        assert_eq!(assistant.content.as_ref(), "first\nsecond");
+        assert_eq!(assistant.response_item_id.as_deref(), Some("msg-generic-1"));
+    }
+
+    #[test]
+    fn duplicate_exact_message_ids_fail_closed() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                captured_item(
+                    index as u32,
+                    serde_json::json!({
+                        "type": "message", "id": "msg-duplicate", "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": text, "annotations": []}]
+                    }),
+                    &origin,
+                )
+            })
+            .collect();
+        let error = captured_response_to_conversation_items(completed_response(), output)
+            .expect_err("duplicate provider message ids cannot bind uniquely");
+        assert!(error.contains("duplicated"), "{error}");
+    }
+
+    #[test]
+    fn empty_exact_message_id_fails_closed() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![captured_item(
+            0,
+            serde_json::json!({
+                "type": "message", "id": "", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+            }),
+            &origin,
+        )];
+
+        let error = captured_response_to_conversation_items(completed_response(), output)
+            .expect_err("empty provider message ids cannot bind uniquely");
+        assert!(error.contains("id is empty"), "{error}");
+    }
+
+    #[test]
     fn response_group_resets_do_not_cross_tool_result_boundaries() {
         let origin =
             crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
@@ -2466,9 +2730,12 @@ mod tests {
         )
         .unwrap();
         let mut duplicate = items.clone();
-        let ConversationItem::ResponseOutputMetadata(manifest) = &mut duplicate[0] else {
+        let ConversationItem::Provider(provider) = &mut duplicate[0] else {
             panic!("manifest")
         };
+        let manifest = provider
+            .as_response_output_metadata_mut()
+            .expect("ordinary response manifest");
         manifest.items[1].output_index = 0;
         let duplicate_request = ConversationRequest {
             items: duplicate,
@@ -2480,10 +2747,14 @@ mod tests {
                 .expect_err("duplicate order entry must fail before HTTP");
         assert!(error.contains("duplicate indices"), "{error}");
 
-        let ConversationItem::ResponseOutputMetadata(manifest) = &mut items[0] else {
+        let ConversationItem::Provider(provider) = &mut items[0] else {
             panic!("manifest")
         };
-        manifest.items.remove(0);
+        provider
+            .as_response_output_metadata_mut()
+            .expect("ordinary response manifest")
+            .items
+            .remove(0);
         let request = ConversationRequest {
             items,
             model: Some("gpt-codex".into()),
@@ -2529,12 +2800,12 @@ mod tests {
         let request = ConversationRequest {
             items: vec![
                 ConversationItem::system("system"),
-                ConversationItem::NativeCompactionMetadata(compatibility),
-                ConversationItem::Compaction(rs::CompactionSummaryItemParam {
+                ConversationItem::native_compaction_metadata(compatibility),
+                ConversationItem::encrypted_compaction(rs::CompactionSummaryItemParam {
                     id: Some("cmp_1".into()),
                     encrypted_content: "cipher".into(),
                 }),
-                ConversationItem::ResponseOutputMetadata(ordinary),
+                ConversationItem::response_output_metadata(ordinary),
                 ConversationItem::Assistant(AssistantItem {
                     content: "later answer".into(),
                     response_item_id: Some("msg_later".into()),
@@ -2763,7 +3034,7 @@ mod tests {
         };
         let request = ConversationRequest {
             items: vec![
-                ConversationItem::ResponseOutputMetadata(metadata),
+                ConversationItem::response_output_metadata(metadata),
                 ConversationItem::Assistant(AssistantItem {
                     content: "portable answer".into(),
                     response_item_id: Some("msg-provider".into()),
@@ -2875,7 +3146,9 @@ mod tests {
         assert!(
             migrated
                 .iter()
-                .all(|item| !matches!(item, ConversationItem::ResponseOutputMetadata(_)))
+                .all(|item| {
+                    !matches!(item, ConversationItem::Provider(provider) if provider.is_response_output_metadata())
+                })
         );
         assert!(matches!(
             migrated.as_slice(),

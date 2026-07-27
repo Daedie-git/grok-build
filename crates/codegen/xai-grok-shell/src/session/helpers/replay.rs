@@ -1160,8 +1160,8 @@ mod tests {
             prompt_index_at_compaction: 3,
             compacted_history: vec![
                 ConversationItem::system("system"),
-                ConversationItem::NativeCompactionMetadata(compatibility),
-                ConversationItem::Compaction(
+                ConversationItem::native_compaction_metadata(compatibility),
+                ConversationItem::encrypted_compaction(
                     xai_grok_sampling_types::rs::CompactionSummaryItemParam {
                         id: Some("cmp-verify".into()),
                         encrypted_content: "cipher".into(),

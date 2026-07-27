@@ -53,7 +53,7 @@ impl SessionActor {
     /// or when nothing is pending.
     ///
     /// Called from `initialize` (fresh start, conversation is just `[system]`)
-    /// and the zero-turn harness rebuild (`handle_rebuild_agent_for_definition`,
+    /// and the zero-turn harness rebuild (`install_prepared_agent_rebuild`,
     /// conversation is the inherited zero-turn shape). Both drain the current
     /// bridge's pending baseline.
     ///

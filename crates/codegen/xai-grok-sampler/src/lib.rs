@@ -25,6 +25,7 @@ pub mod doom_loop;
 pub mod events;
 pub mod handle;
 pub mod metrics;
+mod responses_wire;
 pub mod retry;
 pub mod sampling_log;
 mod shared_http;
@@ -36,7 +37,10 @@ pub use actor::SamplerActor;
 pub use attribution::{
     Auth401AttributionCallback, SENT_BEARER_PREFIX_LEN, SamplingConsumer, SharedAttributionCallback,
 };
-pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
+pub use client::{
+    ApiBackend, SamplingClient, resolve_runtime_sampling_identity,
+    resolve_runtime_sampling_identity_for_provider, user_agent_string_for,
+};
 pub use config::{
     AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
     SharedBearerResolver, SharedHeaderInjector,

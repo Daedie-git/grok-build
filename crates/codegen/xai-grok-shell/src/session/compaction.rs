@@ -5,7 +5,7 @@
 //! error-recovery compaction, preflight overflow detection, and checkpoint
 //! persistence. These methods form a second `impl SessionActor` block that
 //! lives alongside the primary one in `acp_session.rs`.
-#[path = "compaction_native.rs"]
+#[path = "compaction/native/mod.rs"]
 mod native;
 use native::*;
 
@@ -38,6 +38,50 @@ use xai_chat_state::compaction_utils::{
     validate_compacted_history,
 };
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+
+/// The validated replacement produced by exactly one compaction implementation.
+/// Keeping native and local products discriminated prevents native history from
+/// accidentally entering local summary reconstruction or sanitization.
+enum CompactionProduct {
+    NativeCodex {
+        replacement_history: Vec<ConversationItem>,
+        output: CompactOutput,
+    },
+    LocalSummary {
+        summary: String,
+        output: CompactOutput,
+    },
+}
+
+enum CompactionReplacement {
+    NativeCodex(Vec<ConversationItem>),
+    LocalSummary(String),
+}
+
+impl CompactionProduct {
+    fn local_summary(&self) -> Option<&str> {
+        match self {
+            Self::NativeCodex { .. } => None,
+            Self::LocalSummary { summary, .. } => Some(summary),
+        }
+    }
+
+    fn into_parts(self) -> (CompactionReplacement, CompactOutput) {
+        match self {
+            Self::NativeCodex {
+                replacement_history,
+                output,
+            } => (
+                CompactionReplacement::NativeCodex(replacement_history),
+                output,
+            ),
+            Self::LocalSummary { summary, output } => {
+                (CompactionReplacement::LocalSummary(summary), output)
+            }
+        }
+    }
+}
+
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
@@ -63,21 +107,29 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
             ConversationItem::ToolResult(_) => 3,
             ConversationItem::BackendToolCall(_) => 4,
             ConversationItem::Reasoning(_) => 5,
-            ConversationItem::ResponseOutputMetadata(_) => 8,
-            ConversationItem::NativeCompactionMetadata(_) => 6,
-            ConversationItem::Compaction(_) => 7,
+            ConversationItem::Provider(provider) => {
+                if provider.is_native_compaction_metadata() {
+                    6
+                } else if provider.is_encrypted_compaction() {
+                    7
+                } else {
+                    8
+                }
+            }
         };
         tag.hash(&mut h);
-        if let ConversationItem::NativeCompactionMetadata(metadata) = it {
-            metadata.schema_version.hash(&mut h);
-            metadata.backend_family.hash(&mut h);
-            metadata.model.hash(&mut h);
-            metadata.chatgpt_account_id.hash(&mut h);
-        }
-        if let ConversationItem::ResponseOutputMetadata(metadata) = it {
-            serde_json::to_string(metadata)
-                .unwrap_or_default()
-                .hash(&mut h);
+        if let ConversationItem::Provider(provider) = it {
+            if let Some(metadata) = provider.as_native_compaction_metadata() {
+                metadata.schema_version.hash(&mut h);
+                metadata.backend_family.hash(&mut h);
+                metadata.model.hash(&mut h);
+                metadata.chatgpt_account_id.hash(&mut h);
+            }
+            if let Some(metadata) = provider.as_response_output_metadata() {
+                serde_json::to_string(metadata)
+                    .unwrap_or_default()
+                    .hash(&mut h);
+            }
         }
         it.text_content().hash(&mut h);
     }
@@ -534,7 +586,7 @@ fn codex_auto_compaction_needs_prefit(
 fn initial_compaction_input_stage(
     verbatim_input_enabled: bool,
     auto_trigger: bool,
-    base_url: &str,
+    capabilities: xai_grok_sampling_types::ProviderCapabilities,
     prepared_history_tokens: u64,
     context_window: u64,
     tool_tokens: u64,
@@ -544,7 +596,7 @@ fn initial_compaction_input_stage(
         return CompactionInputStage::Lossy;
     }
     if auto_trigger
-        && xai_grok_sampling_types::capabilities_for_base_url(base_url).provider_auto_compact_safety
+        && capabilities.enforces_auto_compact_safety()
         && codex_auto_compaction_needs_prefit(
             prepared_history_tokens,
             context_window,
@@ -598,11 +650,17 @@ mod codex_prefit_tests {
         let prompt_tokens = 2_000;
         let over_budget =
             fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens) + 1;
-        let stage = |verbatim, auto, base_url| {
+        let stage = |verbatim, auto, provider_id| {
+            let capabilities = xai_grok_sampling_types::resolve_provider(
+                Some(provider_id),
+                xai_grok_sampling_types::ApiBackend::Responses,
+                "http://127.0.0.1:3210/v1",
+            )
+            .capabilities();
             initial_compaction_input_stage(
                 verbatim,
                 auto,
-                base_url,
+                capabilities,
                 over_budget,
                 context_window,
                 tool_tokens,
@@ -611,22 +669,26 @@ mod codex_prefit_tests {
         };
 
         assert_eq!(
-            stage(true, true, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(true, true, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::VerbatimFitted,
             "automatic over-budget Codex must prefit"
         );
         assert_eq!(
-            stage(true, false, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(true, false, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::Verbatim,
             "manual Codex keeps the normal ladder entry"
         );
         assert_eq!(
-            stage(true, true, "https://api.openai.com/v1"),
+            stage(
+                true,
+                true,
+                xai_grok_sampling_types::ProviderId::OpenAiCompatible,
+            ),
             CompactionInputStage::Verbatim,
             "automatic non-Codex keeps the normal ladder entry"
         );
         assert_eq!(
-            stage(false, true, xai_grok_sampling_types::CODEX_BACKEND_BASE_URL),
+            stage(false, true, xai_grok_sampling_types::ProviderId::Codex),
             CompactionInputStage::Lossy,
             "disabled verbatim input starts lossy"
         );
@@ -646,10 +708,16 @@ mod codex_prefit_tests {
         let tool_tokens = 2_000;
         let prompt_tokens = 1_000;
         let budget = fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens);
+        let capabilities = xai_grok_sampling_types::resolve_provider(
+            Some(xai_grok_sampling_types::ProviderId::Codex),
+            xai_grok_sampling_types::ApiBackend::Responses,
+            "http://127.0.0.1:3210/v1",
+        )
+        .capabilities();
         let stage = initial_compaction_input_stage(
             true,
             true,
-            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            capabilities,
             history_tokens,
             context_window,
             tool_tokens,
@@ -942,8 +1010,8 @@ impl SessionActor {
     ) -> Result<(), acp::Error> {
         self.record_compaction_variant();
         // Manual compaction runs between prompt turns and therefore receives
-        // its own routing scope instead of replaying the previous turn's token.
-        self.chat_state_handle.begin_codex_turn();
+        // its own routing scope instead of replaying the previous turn's state.
+        self.chat_state_handle.begin_turn_routing_scope();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
@@ -1300,7 +1368,7 @@ impl SessionActor {
         // Native receives this exact source history (system is normalized into
         // `instructions` at the sampling boundary). Local summary variants use
         // their existing verbatim/lossy preparation below.
-        let mut native_source_conversation = full_conversation.clone();
+        let native_source_conversation = full_conversation.clone();
         let simplified_messages = if verbatim_input_enabled {
             xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                 full_conversation,
@@ -1355,6 +1423,11 @@ impl SessionActor {
                 .data("Compaction failed: no system message in simplified conversation"));
         }
         let sampling_config = self.reconstruct_full_config().await;
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_config.provider_id,
+            sampling_config.api_backend.clone(),
+            &sampling_config.base_url,
+        );
         let sampling_client = self.prepare_chat_completion(false).await?;
         let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
@@ -1381,159 +1454,100 @@ impl SessionActor {
         let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
         let strategy_override = std::env::var("GROK_CODEX_COMPACTION_STRATEGY").ok();
         let mut strategy = select_compaction_strategy(
-            &sampling_config.base_url,
+            provider.capabilities(),
             strategy_override.as_deref(),
             user_context.is_some(),
         );
         if user_context.is_some() && strategy == CompactionStrategy::LocalSummary {
             tracing::info!("using local summary because manual compaction supplied user context");
         }
+        let mut product: Option<CompactionProduct> = None;
+        let mut native_counters = NativeCompactionCounters::default();
+        let mut native_remote_fallback = false;
         if strategy == CompactionStrategy::NativeCodex {
-            let preflight = trim_native_tool_outputs_to_fit_context_window(
-                &mut native_source_conversation,
-                context_window,
-                compaction_tool_tokens,
-            );
-            tracing::info!(
-                rewritten_outputs = preflight.rewritten_outputs,
-                initial_tokens = %preflight.initial_tokens,
-                final_tokens = %preflight.final_tokens,
-                context_window,
-                "Prepared native Codex compaction input"
-            );
-            if preflight.final_tokens > i128::from(context_window) {
-                strategy = CompactionStrategy::LocalSummary;
-                tracing::warn!(
-                    final_tokens = %preflight.final_tokens,
+            let turn_routing_state = self.chat_state_handle.get_turn_routing_state().await;
+            let sampling_identity =
+                sampling_client.sampling_identity_for_model(&sampling_config.model);
+            let native_outcome = run_native_compaction(
+                CodexCompactionInput {
+                    source_conversation: native_source_conversation,
+                    canonical_system_message: system_message.clone(),
+                    tools: compaction_tools.clone(),
+                    hosted_tools: compaction_hosted_tools.clone(),
+                    sampling_identity,
+                    reasoning_effort: sampling_config.reasoning_effort,
+                    session_id: self.session_info.id.to_string(),
+                    turn_routing_state,
                     context_window,
-                    "Native compaction structural minimum still exceeds context; using fitted local-summary ladder without sending an oversized native request"
-                );
-            }
-        }
-        tracing::Span::current().record("compaction_strategy", strategy.as_str());
-        let native_compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
-            sampling_config.model.clone(),
-            sampling_config
-                .extra_headers
-                .iter()
-                .rev()
-                .find(|(name, _)| {
-                    name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
-                })
-                .map(|(_, value)| value.clone()),
-        );
-        let mut native_replacement_history: Option<Vec<ConversationItem>> = None;
-        let mut native_compact_output: Option<CompactOutput> = None;
-        let mut native_attempts = 0u32;
-        let mut native_transient_rejections = 0u32;
-        if strategy == CompactionStrategy::NativeCodex {
-            let codex_turn_state = self.chat_state_handle.get_codex_turn_state().await;
-            let native_request = xai_grok_sampling_types::ConversationRequest {
-                items: native_source_conversation,
-                tools: compaction_tools.clone(),
-                hosted_tools: compaction_hosted_tools.clone(),
-                tool_choice: (!compaction_tools.is_empty())
-                    .then_some(xai_grok_sampling_types::ConversationToolChoice::Auto),
-                model: Some(sampling_config.model.clone()),
-                reasoning_effort: sampling_config.reasoning_effort,
-                x_grok_conv_id: Some(self.session_info.id.to_string()),
-                x_grok_req_id: Some(format!("xai-native-compact-{}", uuid::Uuid::new_v4())),
-                x_grok_session_id: Some(self.session_info.id.to_string()),
-                x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
-                prompt_cache_key: Some(self.session_info.id.to_string()),
-                codex_turn_state,
-                ..Default::default()
-            };
-            let native_started = std::time::Instant::now();
-            loop {
-                native_attempts += 1;
-                match sampling_client
-                    .conversation_compact_responses(native_request.clone())
-                    .await
-                {
-                    Ok(response) => {
-                        let mut replacement =
-                            xai_grok_sampling_types::codex_compact_output_to_conversation(
-                                response.output,
-                                native_compatibility.clone(),
-                            )
-                            .map_err(|message| {
-                                acp::Error::internal_error()
-                                    .data(format!("native compact response invalid: {message}"))
-                            })?;
-                        if replacement.is_empty()
-                            || !replacement
-                                .iter()
-                                .any(|item| matches!(item, ConversationItem::Compaction(_)))
-                        {
-                            return Err(acp::Error::internal_error().data(
-                                "native compact response invalid: replacement history must contain an encrypted compaction item",
-                            ));
-                        }
-                        // Codex receives the leading System item via
-                        // `instructions` and does not echo it in replacement
-                        // output. Restore the same canonical item locally so
-                        // next-turn normalization recreates identical
-                        // instructions without fabricating a summary.
-                        replacement.insert(0, system_message.clone());
-                        native_replacement_history = Some(replacement);
-                        native_compact_output = Some(CompactOutput {
+                    tool_tokens: compaction_tool_tokens,
+                },
+                &sampling_client,
+            )
+            .await;
+            match native_outcome {
+                NativeCompactionOutcome::Success {
+                    replacement_history,
+                    output,
+                    counters,
+                } => {
+                    native_counters = counters;
+                    product = Some(CompactionProduct::NativeCodex {
+                        replacement_history,
+                        output: CompactOutput {
                             content: String::new(),
-                            stop_reason: Some("native_replacement".to_string()),
-                            truncated: false,
-                            // Unary compaction has no first-token event. Record
-                            // its full request latency, not a fabricated TTFT.
-                            ttft_ms: None,
-                            stream_ms: Some(native_started.elapsed().as_millis() as u64),
-                            delta_count: 0,
-                            itl_max_ms: None,
-                        });
-                        break;
+                            stop_reason: Some(output.stop_reason),
+                            truncated: output.truncated,
+                            ttft_ms: output.ttft_ms,
+                            stream_ms: output.stream_ms,
+                            delta_count: output.delta_count,
+                            itl_max_ms: output.itl_max_ms,
+                        },
+                    });
+                }
+                NativeCompactionOutcome::LocalFallback { reason, counters } => {
+                    native_counters = counters;
+                    strategy = CompactionStrategy::LocalSummary;
+                    native_remote_fallback =
+                        reason != NativeCompactionFallbackReason::StructuralMinimumTooLarge;
+                }
+                NativeCompactionOutcome::HardFailure {
+                    source,
+                    counters,
+                    estimated_input_tokens,
+                } => {
+                    let suppress_auto = source.suppresses_auto_compaction();
+                    let message = source.message();
+                    let span = tracing::Span::current();
+                    span.record(
+                        "compaction_strategy",
+                        CompactionStrategy::NativeCodex.as_str(),
+                    );
+                    span.record("compaction_attempts", counters.attempts as i64);
+                    span.record(
+                        "compaction_transient_rejections",
+                        counters.transient_rejections as i64,
+                    );
+                    span.record("compaction_outcome", CompactionOutcome::Failed.as_str());
+                    if auto_trigger && suppress_auto {
+                        self.suppress_auto_compaction(
+                            Self::classify_suppress_reason(&message),
+                            estimated_input_tokens,
+                            context_window,
+                        )
+                        .await;
                     }
-                    Err(error)
-                        if native_endpoint_unavailable(&error)
-                            || native_context_overflow(&error) =>
-                    {
-                        strategy = CompactionStrategy::LocalSummary;
-                        tracing::Span::current()
-                            .record("compaction_strategy", "local_summary_fallback");
-                        if native_context_overflow(&error) {
-                            tracing::warn!(
-                                %error,
-                                "Codex compact endpoint rejected the safely rewritten input as oversized; using fitted local-summary ladder without retrying identical native input"
-                            );
-                        } else {
-                            tracing::warn!(
-                                %error,
-                                "Codex compact endpoint unavailable; using explicit local-summary fallback"
-                            );
-                        }
-                        break;
-                    }
-                    Err(error) if error.is_retryable() && native_attempts < max_retries => {
-                        native_transient_rejections += 1;
-                        tracing::warn!(
-                            attempt = native_attempts,
-                            %error,
-                            "transient native Codex compaction failure; retrying native endpoint"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(retry_delay_secs)).await;
-                    }
-                    Err(error) => {
-                        let message = format!("native compact failed: {error}");
-                        if auto_trigger {
-                            self.suppress_auto_compaction(
-                                Self::classify_suppress_reason(&message),
-                                xai_chat_state::estimate_conversation_tokens(&native_request.items),
-                                context_window,
-                            )
-                            .await;
-                        }
-                        return Err(acp::Error::internal_error().data(message));
-                    }
+                    return Err(acp::Error::internal_error().data(message));
                 }
             }
         }
+        tracing::Span::current().record(
+            "compaction_strategy",
+            if native_remote_fallback {
+                "local_summary_fallback"
+            } else {
+                strategy.as_str()
+            },
+        );
         let mut last_error: Option<acp::Error> = None;
         let mut last_failure_outcome = CompactionOutcome::Failed;
         let use_short_prompt = false;
@@ -1553,7 +1567,7 @@ impl SessionActor {
             initial_compaction_input_stage(
                 verbatim_input_enabled,
                 auto_trigger,
-                &sampling_config.base_url,
+                provider.capabilities(),
                 estimated_input_tokens,
                 context_window,
                 compaction_tool_tokens,
@@ -1649,138 +1663,154 @@ impl SessionActor {
             }
             None
         };
-        let mut compact_summary: Option<String> = native_compact_output
-            .as_ref()
-            .map(|_| String::new())
-            .or_else(|| two_pass_output.as_ref().map(|o| o.content.clone()));
-        while compact_summary.is_none() {
-            match xai_grok_compaction::sample_full_replace_summary(
-                &sampler,
-                &request_turns,
-                user_context.as_deref(),
-                &fr_config,
-                &observer,
-            )
-            .await
-            {
-                Ok(summary) => {
-                    compact_summary = Some(summary.summary);
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
-                    last_error = Some(
-                        acp::Error::internal_error().data("compact failed: nothing to compact"),
-                    );
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::EmptyResponse) => {
-                    last_failure_outcome = if observer.degenerate_seen() {
-                        CompactionOutcome::Degenerate
-                    } else {
-                        CompactionOutcome::Transient
-                    };
-                    last_error = Some(acp::Error::internal_error().data(
-                        observer.last_error_message().unwrap_or_else(|| {
-                            "compact failed: model returned empty response".to_string()
-                        }),
-                    ));
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::Sampler {
-                    message,
-                    deterministic,
-                    context_overflow,
-                }) => {
-                    if context_overflow {
-                        let next_stage = input_stage.after_context_overflow();
-                        if let Some(stage) = next_stage {
-                            input_overflow_rejections += 1;
-                            xai_grok_telemetry::session_ctx::log_event(
-                                xai_grok_telemetry::events::CompactionRetryDegraded {
-                                    trigger,
-                                    reason: "input_overflow",
-                                    from_stage: Some(input_stage.as_str()),
-                                    to_stage: Some(stage.as_str()),
-                                    summary_chars: None,
-                                    attempt: observer.attempt_count(),
-                                    context_window,
-                                    compaction_id: compaction.compaction_id.clone(),
-                                },
+        let mut used_two_pass = false;
+        if product.is_none() {
+            if let Some(output) = two_pass_output {
+                used_two_pass = true;
+                product = Some(CompactionProduct::LocalSummary {
+                    summary: output.content.clone(),
+                    output,
+                });
+            } else {
+                while product.is_none() {
+                    match xai_grok_compaction::sample_full_replace_summary(
+                        &sampler,
+                        &request_turns,
+                        user_context.as_deref(),
+                        &fr_config,
+                        &observer,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            let output = sampler.take_last_success().expect(
+                                "a successful local full-replace sample stashes its CompactOutput",
                             );
-                            tracing::warn!(
-                                session_id = %self.session_info.id.0,
-                                ?stage,
-                                error = %message,
-                                "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
+                            product = Some(CompactionProduct::LocalSummary {
+                                summary: summary.summary,
+                                output,
+                            });
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
+                            last_error = Some(
+                                acp::Error::internal_error()
+                                    .data("compact failed: nothing to compact"),
                             );
-                            let conv = self.chat_state_handle.get_conversation().await;
-                            request_turns = match stage {
-                                CompactionInputStage::VerbatimFitted => {
-                                    let verbatim = xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::EmptyResponse) => {
+                            last_failure_outcome = if observer.degenerate_seen() {
+                                CompactionOutcome::Degenerate
+                            } else {
+                                CompactionOutcome::Transient
+                            };
+                            last_error = Some(acp::Error::internal_error().data(
+                                observer.last_error_message().unwrap_or_else(|| {
+                                    "compact failed: model returned empty response".to_string()
+                                }),
+                            ));
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::Sampler {
+                            message,
+                            deterministic,
+                            context_overflow,
+                        }) => {
+                            if context_overflow {
+                                let next_stage = input_stage.after_context_overflow();
+                                if let Some(stage) = next_stage {
+                                    input_overflow_rejections += 1;
+                                    xai_grok_telemetry::session_ctx::log_event(
+                                        xai_grok_telemetry::events::CompactionRetryDegraded {
+                                            trigger,
+                                            reason: "input_overflow",
+                                            from_stage: Some(input_stage.as_str()),
+                                            to_stage: Some(stage.as_str()),
+                                            summary_chars: None,
+                                            attempt: observer.attempt_count(),
+                                            context_window,
+                                            compaction_id: compaction.compaction_id.clone(),
+                                        },
+                                    );
+                                    tracing::warn!(
+                                        session_id = %self.session_info.id.0,
+                                        ?stage,
+                                        error = %message,
+                                        "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
+                                    );
+                                    let conv = self.chat_state_handle.get_conversation().await;
+                                    request_turns = match stage {
+                                        CompactionInputStage::VerbatimFitted => {
+                                            let verbatim = xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                                         conv,
                                         summary_strips_reasoning,
                                     );
-                                    xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                                            xai_chat_state::compaction_utils::fit_conversation_to_budget(
                                         verbatim,
                                         fitted_history_budget,
                                     )
-                                }
-                                CompactionInputStage::Lossy => {
-                                    let lossy_budget = (context_window.saturating_mul(7) / 10)
-                                        .saturating_sub(compaction_tool_tokens);
-                                    xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                                        }
+                                        CompactionInputStage::Lossy => {
+                                            let lossy_budget = (context_window.saturating_mul(7)
+                                                / 10)
+                                                .saturating_sub(compaction_tool_tokens);
+                                            xai_chat_state::compaction_utils::fit_conversation_to_budget(
                                         xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
                                             conv,
                                         ),
                                         lossy_budget,
                                     )
+                                        }
+                                        CompactionInputStage::Verbatim => {
+                                            unreachable!("ladder only steps forward")
+                                        }
+                                    };
+                                    input_stage = stage;
+                                    continue;
                                 }
-                                CompactionInputStage::Verbatim => {
-                                    unreachable!("ladder only steps forward")
+                                last_failure_outcome = CompactionOutcome::Deterministic;
+                                if auto_trigger {
+                                    self.suppress_auto_compaction(
+                                        SuppressReason::Size,
+                                        estimated_input_tokens,
+                                        context_window,
+                                    )
+                                    .await;
                                 }
-                            };
-                            input_stage = stage;
-                            continue;
+                                last_error = Some(acp::Error::internal_error().data(message));
+                                break;
+                            }
+                            if deterministic {
+                                last_failure_outcome = CompactionOutcome::Deterministic;
+                                if auto_trigger {
+                                    let reason = Self::classify_suppress_reason(&message);
+                                    self.suppress_auto_compaction(
+                                        reason,
+                                        estimated_input_tokens,
+                                        context_window,
+                                    )
+                                    .await;
+                                }
+                                last_error = Some(acp::Error::internal_error().data(message));
+                                break;
+                            }
+                            last_failure_outcome = CompactionOutcome::Transient;
+                            last_error = Some(acp::Error::internal_error().data(message));
+                            break;
                         }
-                        last_failure_outcome = CompactionOutcome::Deterministic;
-                        if auto_trigger {
-                            self.suppress_auto_compaction(
-                                SuppressReason::Size,
-                                estimated_input_tokens,
-                                context_window,
-                            )
-                            .await;
-                        }
-                        last_error = Some(acp::Error::internal_error().data(message));
-                        break;
                     }
-                    if deterministic {
-                        last_failure_outcome = CompactionOutcome::Deterministic;
-                        if auto_trigger {
-                            let reason = Self::classify_suppress_reason(&message);
-                            self.suppress_auto_compaction(
-                                reason,
-                                estimated_input_tokens,
-                                context_window,
-                            )
-                            .await;
-                        }
-                        last_error = Some(acp::Error::internal_error().data(message));
-                        break;
-                    }
-                    last_failure_outcome = CompactionOutcome::Transient;
-                    last_error = Some(acp::Error::internal_error().data(message));
-                    break;
                 }
             }
         }
         let telemetry = observer.into_telemetry();
         // Native retries and an endpoint-unavailable probe followed by local
         // fallback are part of the same compaction lifecycle.
-        let total_attempts = native_attempts.saturating_add(telemetry.attempts);
-        let total_transient_rejections =
-            native_transient_rejections.saturating_add(telemetry.transient_rejections);
-        if strategy.uses_local_summary_pipeline() && two_pass_output.is_none() {
+        let total_attempts = native_counters.attempts.saturating_add(telemetry.attempts);
+        let total_transient_rejections = native_counters
+            .transient_rejections
+            .saturating_add(telemetry.transient_rejections);
+        if strategy.uses_local_summary_pipeline() && !used_two_pass {
             let request_chat_history = build_compaction_chat_history(
                 request_turns,
                 user_context.as_deref(),
@@ -1793,8 +1823,9 @@ impl SessionActor {
                 use_short_prompt,
                 &sampling_config.model,
                 trigger,
-                compact_summary
-                    .as_deref()
+                product
+                    .as_ref()
+                    .and_then(CompactionProduct::local_summary)
                     .or(telemetry.last_rejected_summary.as_deref()),
                 last_error.as_ref(),
                 telemetry.attempts,
@@ -1802,14 +1833,8 @@ impl SessionActor {
                 started_at,
             );
         }
-        let compact_output = match compact_summary {
-            Some(_) => match (native_compact_output, two_pass_output) {
-                (Some(native), _) => native,
-                (None, Some(tp)) => tp,
-                (None, None) => sampler
-                    .take_last_success()
-                    .expect("a successful local full-replace sample stashes its CompactOutput"),
-            },
+        let product = match product {
+            Some(product) => product,
             None => {
                 let span = tracing::Span::current();
                 span.record("compaction_attempts", total_attempts as i64);
@@ -1835,7 +1860,7 @@ impl SessionActor {
                 }));
             }
         };
-        let generate_session_compact = compact_output.content.clone();
+        let (replacement, compact_output) = product.into_parts();
         let user_message_prefix = self.build_user_message_prefix().await;
         let conversation = self.chat_state_handle.get_conversation().await;
         let (discovered_agents_md, all_skills_for_compaction, _agent_edited_paths, state_context) =
@@ -2132,65 +2157,68 @@ impl SessionActor {
         let agents_md_reminder = self.agent.borrow().agents_md_user_reminder();
         let compaction_context = state_context.for_compaction();
         let compaction_state_context: &CompactionStateContext = &compaction_context;
-        if strategy.uses_local_summary_pipeline() {
-            self.persist_compaction_segment(&segment_messages, &generate_session_compact);
+        if let CompactionReplacement::LocalSummary(summary) = &replacement {
+            self.persist_compaction_segment(&segment_messages, summary);
         }
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
             .count
             .load(std::sync::atomic::Ordering::Relaxed);
-        let compacted_history = if let Some(replacement) = native_replacement_history.take() {
-            // Install provider-authored structured history verbatim (apart from
-            // the canonical System item restored immediately after the call).
-            // Do not route it through the local summary assembler/sanitizer.
-            replacement
-        } else {
-            let raw_compacted = build_compacted_history(CompactedHistoryInput {
-                system_message: system_message.clone(),
-                user_message_prefix: user_message_prefix.clone(),
-                agents_md_reminder: agents_md_reminder.clone(),
-                state_context: compaction_state_context,
-                compaction_summary: generate_session_compact.clone(),
-                system_reminder: system_reminder.clone(),
-                summary_before_recent: use_short_prompt,
-                transcript_hint: transcript_hint.clone(),
-                summary_count,
-            });
-            let sanitize_result = sanitize_compacted_history(raw_compacted);
-            let compacted_history = if sanitize_result.stripped_tool_call_ids.is_empty() {
-                sanitize_result.items
-            } else {
-                tracing::warn!(
-                    session_id = %self.session_info.id,
-                    stripped_count = sanitize_result.stripped_tool_call_ids.len(),
-                    stripped_ids = ?sanitize_result.stripped_tool_call_ids,
-                    "compaction: stripped orphaned ToolResults from compacted history"
-                );
-                sanitize_result.items
-            };
-            let remaining_violations = validate_compacted_history(&compacted_history);
-            if remaining_violations.is_empty() {
-                compacted_history
-            } else {
-                tracing::error!(
-                    session_id = %self.session_info.id,
-                    violation_count = remaining_violations.len(),
-                    violation_ids = ?remaining_violations,
-                    "compaction: sanitized history still has invalid ToolResults -- \
-                     falling back to minimal compacted history (no recent_messages)"
-                );
-                build_compacted_history(CompactedHistoryInput {
-                    system_message,
-                    user_message_prefix,
-                    agents_md_reminder,
-                    state_context: &state_context.for_compaction(),
-                    compaction_summary: generate_session_compact,
-                    system_reminder,
+        let compacted_history = match replacement {
+            CompactionReplacement::NativeCodex(replacement) => {
+                // Install provider-authored structured history verbatim (apart
+                // from the canonical System item restored by the adapter). Do
+                // not route it through local reconstruction or sanitization.
+                replacement
+            }
+            CompactionReplacement::LocalSummary(generate_session_compact) => {
+                let raw_compacted = build_compacted_history(CompactedHistoryInput {
+                    system_message: system_message.clone(),
+                    user_message_prefix: user_message_prefix.clone(),
+                    agents_md_reminder: agents_md_reminder.clone(),
+                    state_context: compaction_state_context,
+                    compaction_summary: generate_session_compact.clone(),
+                    system_reminder: system_reminder.clone(),
                     summary_before_recent: use_short_prompt,
-                    transcript_hint,
+                    transcript_hint: transcript_hint.clone(),
                     summary_count,
-                })
+                });
+                let sanitize_result = sanitize_compacted_history(raw_compacted);
+                let compacted_history = if sanitize_result.stripped_tool_call_ids.is_empty() {
+                    sanitize_result.items
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_info.id,
+                        stripped_count = sanitize_result.stripped_tool_call_ids.len(),
+                        stripped_ids = ?sanitize_result.stripped_tool_call_ids,
+                        "compaction: stripped orphaned ToolResults from compacted history"
+                    );
+                    sanitize_result.items
+                };
+                let remaining_violations = validate_compacted_history(&compacted_history);
+                if remaining_violations.is_empty() {
+                    compacted_history
+                } else {
+                    tracing::error!(
+                        session_id = %self.session_info.id,
+                        violation_count = remaining_violations.len(),
+                        violation_ids = ?remaining_violations,
+                        "compaction: sanitized history still has invalid ToolResults -- \
+                         falling back to minimal compacted history (no recent_messages)"
+                    );
+                    build_compacted_history(CompactedHistoryInput {
+                        system_message,
+                        user_message_prefix,
+                        agents_md_reminder,
+                        state_context: &state_context.for_compaction(),
+                        compaction_summary: generate_session_compact,
+                        system_reminder,
+                        summary_before_recent: use_short_prompt,
+                        transcript_hint,
+                        summary_count,
+                    })
+                }
             }
         };
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
@@ -2398,8 +2426,15 @@ impl SessionActor {
             .compaction_at_tokens
             .get()
             .and_then(|limit| limit.resolve(cfg.context_window.get(), 90));
-        crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+        let safety = xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
             &cfg.base_url,
+        )
+        .capabilities()
+        .auto_compact_safety();
+        crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+            safety,
             cfg.context_window,
             configured_limit,
         )
@@ -2481,9 +2516,12 @@ impl SessionActor {
         // Keep this hard provider gate live during FINALIZING so post-compact
         // refill hits claim_bounded and fail-closes before another model call.
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await?;
-        if !xai_grok_sampling_types::capabilities_for_base_url(&sampling_cfg.base_url)
-            .provider_auto_compact_safety
-        {
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_cfg.provider_id,
+            sampling_cfg.api_backend.clone(),
+            &sampling_cfg.base_url,
+        );
+        if !provider.capabilities().enforces_auto_compact_safety() {
             return None;
         }
         let context_window = sampling_cfg.context_window;
@@ -2492,7 +2530,7 @@ impl SessionActor {
             .get()
             .and_then(|limit| limit.resolve(context_window.get(), 90));
         let limit = crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
-            &sampling_cfg.base_url,
+            provider.capabilities().auto_compact_safety(),
             context_window,
             configured_limit,
         )?
@@ -3070,6 +3108,7 @@ mod inline_auto_compact_flow_tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

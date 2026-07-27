@@ -1040,6 +1040,10 @@ pub struct SamplingConfig {
     /// Which API backend to use for this model
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// Explicit logical provider identity. Absent values retain legacy URL
+    /// inference when loading older chat-state snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<crate::ProviderId>,
     /// Extra headers to send with requests (e.g., for BYOK scenarios).
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub extra_headers: indexmap::IndexMap<String, String>,
@@ -1103,8 +1107,8 @@ pub struct CreateResponseWrapper {
     /// Exact provider identity to stamp on metadata captured from this response.
     pub response_metadata_origin: Option<crate::ResponseMetadataOrigin>,
 
-    /// Process-local turn-scoped Codex sticky-routing token.
-    pub codex_turn_state: Option<std::sync::Arc<std::sync::OnceLock<String>>>,
+    /// Process-local routing scope for one prompt turn. Never serialized.
+    pub turn_routing_state: Option<crate::TurnRoutingState>,
 }
 
 impl CreateResponseWrapper {
@@ -1124,7 +1128,7 @@ impl CreateResponseWrapper {
             response_message_item_ids: vec![],
             response_item_metadata_passthrough: vec![],
             response_metadata_origin: None,
-            codex_turn_state: None,
+            turn_routing_state: None,
         }
     }
 

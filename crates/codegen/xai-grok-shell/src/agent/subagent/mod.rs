@@ -707,8 +707,9 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some(cfg) = chat_state.get_sampling_config().await {
-            let creds = chat_state.get_credentials().await;
+        if let Some(state) = chat_state.get_sampling_state().await {
+            let cfg = state.config;
+            let creds = state.credentials;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
@@ -726,6 +727,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
+                provider_id: cfg.provider_id,
                 auth_scheme,
                 extra_headers,
                 query_params: cfg.query_params.clone(),
@@ -1054,31 +1056,20 @@ fn native_history_replayability(
     items: &[ConversationItem],
     sampling_config: &xai_grok_sampler::SamplerConfig,
 ) -> Result<bool, String> {
-    let compatibility = xai_grok_sampling_types::native_compaction_compatibility(items)?;
-    let Some(expected) = compatibility else {
-        return Ok(false);
-    };
-    let account = sampling_config
-        .extra_headers
-        .iter()
-        .rev()
-        .find(|(name, _)| {
-            name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
-        })
-        .map(|(_, value)| value.as_str());
-    if expected.matches_origin(
-        &sampling_config.api_backend,
+    let identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+        sampling_config.provider_id,
+        sampling_config.api_backend.clone(),
         &sampling_config.base_url,
         &sampling_config.model,
-        account,
-    ) {
-        Ok(true)
-    } else {
-        Err(
-            "identity-bound native Codex history requires the exact original backend, model, and ChatGPT account"
-                .to_string(),
-        )
-    }
+        &sampling_config.extra_headers,
+        &sampling_config.env_http_headers,
+    )
+    .map_err(|error| error.to_string())?;
+    xai_grok_sampling_types::validate_history_for_sampling_identity(items, &identity)
+        .map_err(|error| error.to_string())?;
+    Ok(items.iter().any(|item| {
+        matches!(item, ConversationItem::Provider(provider) if provider.is_native_compaction_item())
+    }))
 }
 
 /// Shared inherit budget for resume/fork of large transcripts (percent of
@@ -1128,6 +1119,32 @@ enum BootstrapInitialContext {
     /// Explicit resume or requested fork cannot safely inherit context.
     ResumeAbort(String),
 }
+
+/// Native provider history has already passed exact identity and size checks.
+/// Keep it byte-for-byte instead of sending it through ordinary fork
+/// normalization, which may discard synthetic/provider items or summarize it.
+fn verbatim_native_fork(items: Vec<ConversationItem>) -> InitialContext {
+    let prefix_len = items.len();
+    InitialContext {
+        source: InitialContextSource::Forked,
+        copy_error: None,
+        prefix_len: Some(prefix_len),
+        conversation: items,
+        verbatim_fork: true,
+    }
+}
+
+/// Resolve the live session storage root. `grok_home()` is process-cached, but
+/// test harnesses and embedded callers can intentionally provide a later
+/// `GROK_HOME`; disk bootstrap must inspect and copy from the same root rather
+/// than mixing a live override with a stale cached path.
+fn bootstrap_storage_root() -> std::path::PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::util::grok_home::grok_home)
+}
+
 /// Phase 3: resume (fail-closed on copy error) > fork (live then disk, fail-open) > New.
 /// Unresolved non-empty resume is aborted by the caller before this runs.
 async fn bootstrap_initial_context(
@@ -1154,7 +1171,7 @@ async fn bootstrap_initial_context(
             cwd: source.child_cwd.clone(),
         };
         let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
+            bootstrap_storage_root(),
         );
         let copy_options = crate::session::storage::CopySessionOptions {
             parent_session_id: Some(source.child_session_id.clone()),
@@ -1244,16 +1261,24 @@ async fn bootstrap_initial_context(
         None => None,
     };
     if let Some(items) = live_items {
-        if let Err(error) = evaluate_native_history_fork_policy(
+        let native_policy = match evaluate_native_history_fork_policy(
             &items,
             effective_sampling_config,
             child_context_window,
         ) {
-            return BootstrapInitialContext::ResumeAbort(format!(
-                "Cannot fork parent context: {error}"
-            ));
-        }
-        let ctx_out = verbatim_or_normalize_fork(items, child_context_window);
+            Ok(policy) => policy,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: {error}"
+                ));
+            }
+        };
+        let ctx_out = match native_policy {
+            NativeHistoryForkPolicy::VerbatimOnly => verbatim_native_fork(items),
+            NativeHistoryForkPolicy::Ordinary => {
+                verbatim_or_normalize_fork(items, child_context_window)
+            }
+        };
         tracing::info!(
             subagent_id = %request.id,
             subagent_type = %request.subagent_type,
@@ -1281,7 +1306,7 @@ async fn bootstrap_initial_context(
     }
     if let Some(ref parent_info) = ctx.parent_session_info {
         let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
+            bootstrap_storage_root(),
         );
         let source_items = match storage.load_authoritative_chat_history_for_copy(parent_info) {
             Ok(items) => items,
@@ -1347,9 +1372,9 @@ async fn bootstrap_initial_context(
                     Err(error) => BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot fork parent context: {error}"
                     )),
-                    Ok(NativeHistoryForkPolicy::VerbatimOnly) => BootstrapInitialContext::Ready(
-                        verbatim_or_normalize_fork(items, child_context_window),
-                    ),
+                    Ok(NativeHistoryForkPolicy::VerbatimOnly) => {
+                        BootstrapInitialContext::Ready(verbatim_native_fork(items))
+                    }
                     Ok(NativeHistoryForkPolicy::Ordinary) => {
                         BootstrapInitialContext::Ready(forked_initial_context(items))
                     }

@@ -420,25 +420,30 @@ impl SessionActor {
                 self.0.current_wire_valid().map(|a| a.key)
             }
         }
-        let cfg = self
+        let sampling_state = self
             .chat_state_handle
-            .get_sampling_config()
+            .get_sampling_state()
             .await
-            .unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
-                base_url: String::new(),
-                model: String::new(),
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                api_backend: Default::default(),
-                extra_headers: Default::default(),
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: std::num::NonZeroU64::new(256_000).unwrap(),
-                reasoning_effort: None,
-                stream_tool_calls: None,
+            .unwrap_or_else(|| xai_chat_state::SamplingState {
+                config: xai_grok_sampling_types::SamplingConfig {
+                    base_url: String::new(),
+                    model: String::new(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    provider_id: None,
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+                credentials: xai_chat_state::Credentials::default(),
             });
-        let creds = self.chat_state_handle.get_credentials().await;
+        let cfg = sampling_state.config;
+        let creds = sampling_state.credentials;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         let auth_method = self.auth_method_id.load();
         let gate =
@@ -464,8 +469,13 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if !xai_grok_sampling_types::capabilities_for_base_url(&cfg.base_url)
-            .skip_grok_compaction_headers
+        if !xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
+            &cfg.base_url,
+        )
+        .capabilities()
+        .skips_grok_compaction_headers()
             && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
         {
             let has_compaction_summary = self
@@ -497,6 +507,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            provider_id: cfg.provider_id,
             auth_scheme,
             extra_headers,
             query_params: cfg.query_params.clone(),
@@ -1203,12 +1214,9 @@ impl SessionActor {
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
         if let Some(ref am) = self.auth_manager {
-            let creds = self.chat_state_handle.get_credentials().await;
-            let (model_id, base_url) = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .map(|c| (c.model, c.base_url))
+            let sampling_state = self.chat_state_handle.get_sampling_state().await;
+            let (creds, model_id, base_url) = sampling_state
+                .map(|state| (state.credentials, state.config.model, state.config.base_url))
                 .unwrap_or_default();
             if self.auth_gate(&model_id, &base_url).active() {
                 match am.get_valid_token().await {
@@ -1256,13 +1264,9 @@ impl SessionActor {
         }
         use crate::auth::{is_jwt_expired_or_near, parse_jwt_expiration};
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
-        let creds = self.chat_state_handle.get_credentials().await;
-        let current_key = creds.api_key;
-        let current_model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
+        let sampling_state = self.chat_state_handle.get_sampling_state().await;
+        let (current_key, current_model_id) = sampling_state
+            .map(|state| (state.credentials.api_key, state.config.model))
             .unwrap_or_default();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(

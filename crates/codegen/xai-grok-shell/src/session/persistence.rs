@@ -298,6 +298,15 @@ pub enum PersistenceMsg {
     /// Replace the entire chat history (used for legacy best-effort compaction
     /// installs and tests). Production compaction uses [`Self::InstallCompactionAndAck`].
     ReplaceChatHistory(Vec<ConversationItem>),
+    /// Commit-aware history replacement used by authoritative sampling-state
+    /// transitions. Unlike an actor read barrier, this acknowledges the durable
+    /// cache commit and preserves post-commit bookkeeping warnings.
+    ReplaceChatHistoryAndAck {
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<xai_chat_state::ReplaceHistoryAck, xai_chat_state::ReplaceHistoryError>,
+        >,
+    },
     /// Commit-aware compaction install (local summary and native Codex). The
     /// durable marker is the commit point; cache/bookkeeping failures after it
     /// are reported as committed.
@@ -2063,6 +2072,29 @@ impl SessionPersistence {
                     {
                         tracing::warn!(?e, "failed to replace chat history");
                     }
+                }
+                PersistenceMsg::ReplaceChatHistoryAndAck {
+                    messages,
+                    respond_to,
+                } => {
+                    tracing::info!(
+                        num_messages = messages.len(),
+                        "Replacing chat history with commit acknowledgement"
+                    );
+                    let result = self
+                        .storage
+                        .replace_chat_history_commit_aware(&self.info, &messages)
+                        .await
+                        .map(|()| xai_chat_state::ReplaceHistoryAck::Committed)
+                        .or_else(|error| match error {
+                            crate::session::storage::ReplaceChatHistoryError::NotCommitted(error) => {
+                                Err(xai_chat_state::ReplaceHistoryError::NotCommitted(error))
+                            }
+                            crate::session::storage::ReplaceChatHistoryError::Committed(error) => {
+                                Ok(xai_chat_state::ReplaceHistoryAck::CommittedWithBookkeepingWarning(error))
+                            }
+                        });
+                    let _ = respond_to.send(result);
                 }
                 PersistenceMsg::InstallCompactionAndAck {
                     checkpoint,

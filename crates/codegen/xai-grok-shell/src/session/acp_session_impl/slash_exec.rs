@@ -970,14 +970,15 @@ impl SessionActor {
             return ok_end_turn(0, None);
         }
 
-        let (sampling_config, model_metadata, credentials) = tokio::join!(
-            self.chat_state_handle.get_sampling_config(),
+        let (sampling_state, model_metadata) = tokio::join!(
+            self.chat_state_handle.get_sampling_state(),
             self.chat_state_handle.get_last_model_metadata(),
-            self.chat_state_handle.get_credentials(),
         );
-        let model_id = sampling_config.map(|c| c.model);
+        let model_id = sampling_state
+            .as_ref()
+            .map(|state| state.config.model.clone());
         let resolved_model_id = model_metadata.resolved_model_id;
-        let client_version = credentials.client_version;
+        let client_version = sampling_state.and_then(|state| state.credentials.client_version);
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
         let outcome = self

@@ -531,8 +531,13 @@ impl ModelsManager {
             .get(model_id)
             .and_then(|entry| {
                 let info = entry.info();
-                if xai_grok_sampling_types::capabilities_for_base_url(&info.base_url)
-                    .provider_auto_compact_safety
+                if xai_grok_sampling_types::resolve_provider(
+                    info.provider_id,
+                    info.api_backend.clone(),
+                    &info.base_url,
+                )
+                .capabilities()
+                .enforces_auto_compact_safety()
                 {
                     info.auto_compact_token_limit
                         .map(|limit| {

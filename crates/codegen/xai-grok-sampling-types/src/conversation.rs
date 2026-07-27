@@ -11,12 +11,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider_history::{
+    LegacyProviderItemRef, NativeCompactionCompatibility, ProviderItem, ResponseOutputItemMetadata,
+};
 use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
-    ApiBackend, ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage,
-    FinishReason, ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition,
-    TraceContext, Usage,
+    ChatCompletionRequest, ChatContentBlock, ChatRequestMessage, ChatResponseMessage, FinishReason,
+    ImageUrl, MessageContent, Role, ToolCallRequest, ToolChoice, ToolDefinition, TraceContext,
+    Usage,
 };
 
 // ============================================================================
@@ -24,8 +27,7 @@ use crate::types::{
 // ============================================================================
 
 /// A single item in a conversation - the unified internal representation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum ConversationItem {
     /// System instructions/prompt
     System(SystemItem),
@@ -43,11 +45,9 @@ pub enum ConversationItem {
     /// 2. Sent back to the Responses API as input items for context continuity
     /// 3. Rendered by the pager (search queries, sources, etc.)
     BackendToolCall(BackendToolCallItem),
-    /// Complete provider-order manifest for the immediately following
-    /// ordinary Responses output group. Message/function-call output items may
-    /// collapse into one Assistant semantically; this persistence-only sidecar
-    /// restores their exact order only at the Codex wire boundary.
-    ResponseOutputMetadata(ResponseOutputItemMetadata),
+    /// Provider-owned durable history. The sealed envelope keeps neutral
+    /// consumers independent of provider-specific payload variants.
+    Provider(ProviderItem),
     /// A reasoning item from the Responses API, stored as a sibling of the
     /// assistant message so that:
     ///
@@ -61,382 +61,98 @@ pub enum ConversationItem {
     /// wrapping `rs::WebSearchToolCall` etc.) so no field is dropped on the
     /// way through.
     Reasoning(rs::ReasoningItem),
-    /// Durable identity scope for the immediately following native compaction
-    /// segment. This item is persistence-only and is never sent on the wire.
+}
+
+/// Stable persisted representation of a conversation item.
+///
+/// Provider-owned items remain sealed in memory, but Codex items keep their
+/// legacy top-level JSON tags for downgrade compatibility. The deserializer
+/// accepts both this encoding and the newer `type = "provider"` envelope, so a
+/// future versioned rollout can change the durable format deliberately rather
+/// than as a side effect of the internal refactor.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConversationItemSerialize<'a> {
+    System(&'a SystemItem),
+    User(&'a UserItem),
+    Assistant(&'a AssistantItem),
+    ToolResult(&'a ToolResultItem),
+    BackendToolCall(&'a BackendToolCallItem),
+    Reasoning(&'a rs::ReasoningItem),
+    ResponseOutputMetadata(&'a ResponseOutputItemMetadata),
+    NativeCompactionMetadata(&'a NativeCompactionCompatibility),
+    Compaction(&'a rs::CompactionSummaryItemParam),
+}
+
+impl Serialize for ConversationItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let persisted = match self {
+            Self::System(item) => ConversationItemSerialize::System(item),
+            Self::User(item) => ConversationItemSerialize::User(item),
+            Self::Assistant(item) => ConversationItemSerialize::Assistant(item),
+            Self::ToolResult(item) => ConversationItemSerialize::ToolResult(item),
+            Self::BackendToolCall(item) => ConversationItemSerialize::BackendToolCall(item),
+            Self::Reasoning(item) => ConversationItemSerialize::Reasoning(item),
+            Self::Provider(provider) => match provider.legacy_persistence_projection() {
+                LegacyProviderItemRef::ResponseOutputMetadata(item) => {
+                    ConversationItemSerialize::ResponseOutputMetadata(item)
+                }
+                LegacyProviderItemRef::NativeCompactionMetadata(item) => {
+                    ConversationItemSerialize::NativeCompactionMetadata(item)
+                }
+                LegacyProviderItemRef::EncryptedCompaction(item) => {
+                    ConversationItemSerialize::Compaction(item)
+                }
+            },
+        };
+        persisted.serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConversationItemDeserialize {
+    System(SystemItem),
+    User(UserItem),
+    Assistant(AssistantItem),
+    ToolResult(ToolResultItem),
+    BackendToolCall(BackendToolCallItem),
+    Provider(ProviderItem),
+    Reasoning(rs::ReasoningItem),
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
     NativeCompactionMetadata(NativeCompactionCompatibility),
-    /// Opaque replacement-history item returned by Codex `/responses/compact`.
-    /// The id and encrypted payload must round-trip unchanged into the next
-    /// Responses request and through persistence/checkpoint/rewind flows.
     Compaction(rs::CompactionSummaryItemParam),
 }
 
-/// Internal Responses transport metadata that Codex requires clients to replay
-/// unchanged with provider-authored compact output items.
-///
-/// Keep this strongly typed and fail closed when the provider expands the
-/// payload: unlike arbitrary response fields, this is the one explicitly
-/// approved opaque metadata envelope we persist.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct InternalChatMessageMetadataPassthrough {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
-}
-
-/// Ordinary Responses item shape used to bind provider metadata to the
-/// durable owner and to the exact subsequent input item.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResponseOutputItemKind {
-    Message,
-    Reasoning,
-    FunctionCall,
-    FunctionCallOutput,
-    WebSearchCall,
-    CustomToolCall,
-    CodeInterpreterCall,
-    Compaction,
-}
-
-/// Exact provider identity under which ordinary Codex Responses transport
-/// metadata may be replayed. The canonical URL is a public backend identifier;
-/// credentials and bearer tokens must never be stored here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponseMetadataOrigin {
-    pub schema_version: u8,
-    pub backend_family: String,
-    pub base_url: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chatgpt_account_id: Option<String>,
-}
-
-impl ResponseMetadataOrigin {
-    pub const SCHEMA_VERSION: u8 = 1;
-    pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
-
-    pub fn codex(
-        base_url: &str,
-        model: impl Into<String>,
-        chatgpt_account_id: Option<String>,
-    ) -> Option<Self> {
-        crate::capabilities_for_base_url(base_url)
-            .preserve_response_metadata
-            .then(|| Self {
-                schema_version: Self::SCHEMA_VERSION,
-                backend_family: Self::CODEX_RESPONSES_FAMILY.into(),
-                // Both supported public host spellings identify the same backend.
-                // Persisting the fixed canonical URL also prevents accidental
-                // persistence of path-carried credentials from custom URLs.
-                base_url: crate::CODEX_BACKEND_BASE_URL.into(),
-                model: model.into(),
-                chatgpt_account_id,
-            })
-    }
-
-    pub fn matches(
-        &self,
-        api_backend: &ApiBackend,
-        base_url: &str,
-        model: &str,
-        chatgpt_account_id: Option<&str>,
-    ) -> bool {
-        self.schema_version == Self::SCHEMA_VERSION
-            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
-            && self.base_url == crate::CODEX_BACKEND_BASE_URL
-            && *api_backend == ApiBackend::Responses
-            && crate::capabilities_for_base_url(base_url).preserve_response_metadata
-            && self.model == model
-            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
-    }
-}
-
-/// Complete ordered manifest for one ordinary Codex Responses output group.
-///
-/// The semantic conversation model intentionally keeps function calls grouped
-/// on an [`AssistantItem`]. This persistence-only sidecar records the original
-/// provider order so Codex wire serialization can restore it without changing
-/// tool execution or UI grouping. `output_items` is stored independently from
-/// the entries so deleted entries fail closed after a cold resume.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponseOutputItemMetadata {
-    /// Defaults retain readability of the short-lived legacy per-item sidecar;
-    /// a matching Codex request rejects empty/incomplete group fields.
-    #[serde(default)]
-    pub response_id: String,
-    #[serde(default)]
-    pub output_items: u32,
-    #[serde(default)]
-    pub items: Vec<ResponseOutputItemOrder>,
-    /// `None` represents history written before origin scoping. Such metadata
-    /// remains readable for migration but is never replayed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<ResponseMetadataOrigin>,
-}
-
-/// One position and owner binding in an ordinary Responses output manifest.
-/// The passthrough field is a required nullable field: every supported output
-/// item has an entry even when the provider supplied no metadata envelope.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponseOutputItemOrder {
-    pub output_index: u32,
-    pub kind: ResponseOutputItemKind,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub item_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub call_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
-}
-
-/// Remove ordinary provider transport sidecars that do not belong to the
-/// proposed sampler identity. Semantic messages/tool history remain portable;
-/// opaque native compaction descriptors are deliberately untouched and retain
-/// their separate fail-closed compatibility checks.
-pub fn strip_incompatible_response_metadata(
-    items: &mut Vec<ConversationItem>,
-    api_backend: &ApiBackend,
-    base_url: &str,
-    model: &str,
-    chatgpt_account_id: Option<&str>,
-) -> bool {
-    let original_len = items.len();
-    items.retain(|item| {
-        !matches!(
-            item,
-            ConversationItem::ResponseOutputMetadata(metadata)
-                if !metadata.origin.as_ref().is_some_and(|origin| {
-                    origin.matches(
-                        api_backend,
-                        base_url,
-                        model,
-                        chatgpt_account_id,
-                    )
-                })
+impl<'de> Deserialize<'de> for ConversationItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match ConversationItemDeserialize::deserialize(deserializer)? {
+                ConversationItemDeserialize::System(item) => Self::System(item),
+                ConversationItemDeserialize::User(item) => Self::User(item),
+                ConversationItemDeserialize::Assistant(item) => Self::Assistant(item),
+                ConversationItemDeserialize::ToolResult(item) => Self::ToolResult(item),
+                ConversationItemDeserialize::BackendToolCall(item) => Self::BackendToolCall(item),
+                ConversationItemDeserialize::Provider(item) => Self::Provider(item),
+                ConversationItemDeserialize::Reasoning(item) => Self::Reasoning(item),
+                ConversationItemDeserialize::ResponseOutputMetadata(item) => {
+                    Self::Provider(ProviderItem::response_output_metadata(item))
+                }
+                ConversationItemDeserialize::NativeCompactionMetadata(item) => {
+                    Self::Provider(ProviderItem::native_compaction_metadata(item))
+                }
+                ConversationItemDeserialize::Compaction(item) => {
+                    Self::Provider(ProviderItem::encrypted_compaction(item))
+                }
+            },
         )
-    });
-    items.len() != original_len
-}
-
-/// Request-side binding after durable conversation items have expanded back
-/// into the Responses input array.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResponsesInputItemMetadata {
-    pub input_index: usize,
-    pub kind: ResponseOutputItemKind,
-    pub item_id: Option<String>,
-    pub call_id: Option<String>,
-    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
-    /// Present only for ordinary output items. Native compact replacement
-    /// bindings use their separate immutable segment manifest.
-    pub response_order: Option<ResponsesInputItemOrder>,
-}
-
-/// Original position of an ordinary output item within one provider response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResponsesInputItemOrder {
-    pub response_id: String,
-    pub output_index: u32,
-    pub output_items: u32,
-}
-
-/// Compact-output item kind used to bind passthrough metadata to its exact
-/// replay position without weakening the pinned Responses request types.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeCompactionItemKind {
-    Message,
-    Reasoning,
-    Compaction,
-}
-
-/// Complete manifest entry for one provider-authored compact output item.
-/// `input_index` is the item's zero-based position in the subsequent Responses
-/// `input` array (canonical system instructions are excluded). Entries with no
-/// provider metadata are retained so deletion and reordering remain detectable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NativeCompactionItemMetadata {
-    pub input_index: usize,
-    pub kind: NativeCompactionItemKind,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub item_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
-}
-
-fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
-}
-
-/// Exact identity under which opaque native Codex history may be replayed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NativeCompactionCompatibility {
-    pub schema_version: u8,
-    pub backend_family: String,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chatgpt_account_id: Option<String>,
-    /// First Responses input position owned by the compact replacement. This is
-    /// zero today, but persisting it makes the segment boundary explicit.
-    pub replacement_segment_start: usize,
-    /// Number of provider-authored replay items in the replacement segment.
-    pub replacement_segment_items: usize,
-    /// Complete ordered manifest for the replacement segment, including items
-    /// whose passthrough metadata is `None`. This field is intentionally not
-    /// serde-defaulted: schema-v2 history without it is invalid.
-    pub item_metadata: Vec<NativeCompactionItemMetadata>,
-}
-
-impl NativeCompactionCompatibility {
-    /// Version 2 adds the mandatory durable passthrough-metadata side table.
-    /// Older clients reject it rather than replaying native history lossily.
-    pub const SCHEMA_VERSION: u8 = 2;
-    pub const LEGACY_SCHEMA_VERSION: u8 = 1;
-    pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
-
-    pub fn codex(model: impl Into<String>, chatgpt_account_id: Option<String>) -> Self {
-        Self {
-            schema_version: Self::SCHEMA_VERSION,
-            backend_family: Self::CODEX_RESPONSES_FAMILY.into(),
-            model: model.into(),
-            chatgpt_account_id,
-            replacement_segment_start: 0,
-            replacement_segment_items: 0,
-            item_metadata: Vec::new(),
-        }
     }
-
-    /// Whether a proposed sampler identity can safely replay this opaque
-    /// history. Every known identity component is exact-match only.
-    pub fn matches_origin(
-        &self,
-        api_backend: &ApiBackend,
-        base_url: &str,
-        model: &str,
-        chatgpt_account_id: Option<&str>,
-    ) -> bool {
-        self.schema_version == Self::SCHEMA_VERSION
-            && self.backend_family == Self::CODEX_RESPONSES_FAMILY
-            && *api_backend == ApiBackend::Responses
-            && crate::is_codex_backend_url(base_url)
-            && self.model == model
-            && self.chatgpt_account_id.as_deref() == chatgpt_account_id
-    }
-}
-
-/// Return the single durable native identity, rejecting malformed/legacy
-/// opaque history rather than guessing whether it is portable.
-pub fn native_compaction_compatibility(
-    items: &[ConversationItem],
-) -> Result<Option<&NativeCompactionCompatibility>, String> {
-    let mut descriptor = None;
-    let mut metadata_pending = false;
-    for item in items {
-        match item {
-            ConversationItem::NativeCompactionMetadata(value) => {
-                if metadata_pending || descriptor.is_some() {
-                    return Err(
-                        "native compaction history contains conflicting identity metadata".into(),
-                    );
-                }
-                descriptor = Some(value);
-                metadata_pending = true;
-            }
-            ConversationItem::Compaction(_) => {
-                if !metadata_pending {
-                    return Err("native compaction history is missing durable identity metadata; resume with the original client or start a new session".into());
-                }
-                metadata_pending = false;
-            }
-            _ if metadata_pending => {
-                return Err(
-                    "native compaction identity metadata is not adjacent to its opaque item".into(),
-                );
-            }
-            _ => {}
-        }
-    }
-    if metadata_pending {
-        return Err("native compaction identity metadata has no opaque item".into());
-    }
-    if let Some(descriptor) = descriptor {
-        if descriptor.schema_version != NativeCompactionCompatibility::SCHEMA_VERSION {
-            return Err("legacy native compaction history cannot be replayed safely".into());
-        }
-        if descriptor.replacement_segment_start != 0 {
-            return Err("native compaction manifest has an invalid segment start".into());
-        }
-        if descriptor.replacement_segment_items == 0 {
-            return Err("native compaction manifest has an empty replacement segment".into());
-        }
-        if descriptor.item_metadata.len() != descriptor.replacement_segment_items {
-            return Err("native compaction manifest length does not match its segment".into());
-        }
-
-        let mut replay_items = Vec::with_capacity(descriptor.replacement_segment_items);
-        for item in items {
-            // The manifest binds only the immutable provider-authored
-            // replacement prefix. Turns appended after compaction are outside
-            // that segment and must never shift or extend this binding.
-            if replay_items.len() == descriptor.replacement_segment_items {
-                break;
-            }
-            match item {
-                ConversationItem::System(_) | ConversationItem::NativeCompactionMetadata(_) => {}
-                ConversationItem::User(user) => replay_items.push((
-                    NativeCompactionItemKind::Message,
-                    user.response_item_id.as_deref(),
-                )),
-                ConversationItem::Reasoning(reasoning) => replay_items.push((
-                    NativeCompactionItemKind::Reasoning,
-                    Some(reasoning.id.as_str()),
-                )),
-                ConversationItem::Compaction(compaction) => replay_items.push((
-                    NativeCompactionItemKind::Compaction,
-                    compaction.id.as_deref(),
-                )),
-                _ => {
-                    return Err(
-                        "native compaction manifest crosses an unsupported replay item".into(),
-                    );
-                }
-            }
-        }
-        if replay_items.len() != descriptor.replacement_segment_items {
-            return Err("native compaction replacement segment is truncated".into());
-        }
-        if replay_items
-            .iter()
-            .filter(|(kind, _)| *kind == NativeCompactionItemKind::Compaction)
-            .count()
-            != 1
-        {
-            return Err("native compaction segment must contain exactly one opaque item".into());
-        }
-
-        let mut seen_indices = std::collections::BTreeSet::new();
-        for (expected_index, metadata) in descriptor.item_metadata.iter().enumerate() {
-            if !seen_indices.insert(metadata.input_index) {
-                return Err("native compaction manifest contains duplicate input indices".into());
-            }
-            if metadata.input_index != descriptor.replacement_segment_start + expected_index {
-                return Err(
-                    "native compaction manifest has missing, extra, or unordered indices".into(),
-                );
-            }
-            let Some((kind, item_id)) = replay_items.get(expected_index) else {
-                return Err("native compaction manifest input index is out of range".into());
-            };
-            if *kind != metadata.kind || *item_id != metadata.item_id.as_deref() {
-                return Err("native compaction manifest does not match its replay item".into());
-            }
-        }
-    }
-    Ok(descriptor)
 }
 
 /// System message content
@@ -935,6 +651,54 @@ impl From<ToolDefinition> for ToolSpec {
 // Conversation Request
 // ============================================================================
 
+/// Shared process-local routing state for one prompt turn.
+///
+/// Clones share the same first-value-wins scope so retries, compaction, and
+/// continuations can replay routing metadata captured from the first response.
+/// The opaque state is deliberately not serializable; create a fresh scope for
+/// each prompt with [`Self::fresh`] or [`Default::default`].
+pub struct TurnRoutingState(Arc<std::sync::OnceLock<String>>);
+
+impl TurnRoutingState {
+    /// Create a fresh, empty routing scope for one prompt turn.
+    pub fn fresh() -> Self {
+        Self(Arc::new(std::sync::OnceLock::new()))
+    }
+
+    /// Capture a routing value if this scope is still empty.
+    ///
+    /// Returns `true` only for the first value captured in the scope.
+    pub fn capture_first(&self, value: String) -> bool {
+        self.0.set(value).is_ok()
+    }
+
+    /// Inspect the captured routing value for transport application or tests.
+    pub fn value(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
+
+impl Clone for TurnRoutingState {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Default for TurnRoutingState {
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
+impl std::fmt::Debug for TurnRoutingState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRoutingState")
+            .field("captured", &self.value().is_some())
+            .finish()
+    }
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -972,9 +736,8 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
-    /// Process-local, first-value-wins Codex sticky-routing token for one user
-    /// turn. Callers must create a fresh lock per turn; it is never persisted.
-    pub codex_turn_state: Option<Arc<std::sync::OnceLock<String>>>,
+    /// Process-local routing scope for one prompt turn. Never persisted.
+    pub turn_routing_state: Option<TurnRoutingState>,
 }
 
 impl ConversationRequest {
@@ -1272,6 +1035,21 @@ impl ConversationResponse {
 // ============================================================================
 
 impl ConversationItem {
+    /// Create ordinary provider response metadata.
+    pub fn response_output_metadata(metadata: ResponseOutputItemMetadata) -> Self {
+        Self::Provider(ProviderItem::response_output_metadata(metadata))
+    }
+
+    /// Create native compaction compatibility metadata.
+    pub fn native_compaction_metadata(metadata: NativeCompactionCompatibility) -> Self {
+        Self::Provider(ProviderItem::native_compaction_metadata(metadata))
+    }
+
+    /// Create an encrypted native compaction replay payload.
+    pub fn encrypted_compaction(item: rs::CompactionSummaryItemParam) -> Self {
+        Self::Provider(ProviderItem::encrypted_compaction(item))
+    }
+
     /// Create a system message
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
@@ -1622,11 +1400,8 @@ impl ConversationItem {
             Self::Assistant(_) => Role::Assistant,
             Self::ToolResult(_) => Role::Tool,
             Self::BackendToolCall(_) => Role::Assistant,
-            // Metadata, reasoning, and native compaction are semantically part of the assistant's turn.
-            Self::ResponseOutputMetadata(_)
-            | Self::Reasoning(_)
-            | Self::NativeCompactionMetadata(_)
-            | Self::Compaction(_) => Role::Assistant,
+            // Provider metadata, reasoning, and native compaction are semantically part of the assistant's turn.
+            Self::Provider(_) | Self::Reasoning(_) => Role::Assistant,
         }
     }
 
@@ -1657,9 +1432,7 @@ impl ConversationItem {
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
             // Transport/native metadata and payload are intentionally opaque locally.
-            Self::ResponseOutputMetadata(_)
-            | Self::NativeCompactionMetadata(_)
-            | Self::Compaction(_) => String::new(),
+            Self::Provider(_) => String::new(),
         }
     }
 }
@@ -2318,10 +2091,10 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             "conversation_to_chat_messages folds Reasoning siblings; \
                  conversation_item_to_chat_message is never called with one"
         ),
-        ConversationItem::ResponseOutputMetadata(_) => {
-            unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
-        }
-        ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
+        ConversationItem::Provider(provider) => {
+            if provider.is_response_output_metadata() {
+                unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
+            }
             panic!("opaque native Codex compaction history cannot be projected to Chat Completions")
         }
     }
@@ -2348,7 +2121,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
 
     for item in items {
         match item {
-            ConversationItem::ResponseOutputMetadata(_) => {}
+            ConversationItem::Provider(provider) if provider.is_response_output_metadata() => {}
             ConversationItem::Reasoning(r) => {
                 let text = reasoning_item_text(&r);
                 if !text.is_empty() {
@@ -2843,11 +2616,10 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }
             }]
         }
-        ConversationItem::ResponseOutputMetadata(_)
-        | ConversationItem::NativeCompactionMetadata(_) => Vec::new(),
-        ConversationItem::Compaction(item) => {
-            vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))]
-        }
+        ConversationItem::Provider(provider) => provider
+            .as_encrypted_compaction()
+            .map(|item| vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))])
+            .unwrap_or_default(),
     }
 }
 
@@ -3258,9 +3030,7 @@ pub fn transform_conversation_cwd(
                 }
             }
             // Provider/native metadata and encrypted content are immutable.
-            ConversationItem::ResponseOutputMetadata(_)
-            | ConversationItem::NativeCompactionMetadata(_)
-            | ConversationItem::Compaction(_) => {}
+            ConversationItem::Provider(_) => {}
         }
     }
 }
@@ -3716,9 +3486,10 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     });
                 }
             }
-            ConversationItem::ResponseOutputMetadata(_) => {}
-            ConversationItem::NativeCompactionMetadata(_) | ConversationItem::Compaction(_) => {
-                panic!("opaque native Codex compaction history cannot be projected to Messages")
+            ConversationItem::Provider(provider) => {
+                if !provider.is_response_output_metadata() {
+                    panic!("opaque native Codex compaction history cannot be projected to Messages")
+                }
             }
         }
     }
@@ -3989,8 +3760,311 @@ mod compaction_item_bridge_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_history::{
+        NativeCompactionItemKind, NativeCompactionItemMetadata, ResponseMetadataOrigin,
+    };
+    use crate::provider_history_policy::{
+        SamplingIdentityHistoryError, prepare_history_for_sampling_identity,
+    };
+    use crate::sampling_identity::SamplingIdentity;
     use crate::tool_overrides::*;
+    use crate::types::ApiBackend;
     use assert_matches::assert_matches;
+
+    fn ordinary_identity_sidecar() -> ConversationItem {
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-identity".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: ResponseMetadataOrigin::codex(
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+        })
+    }
+
+    fn valid_native_identity_history() -> Vec<ConversationItem> {
+        let mut compatibility =
+            NativeCompactionCompatibility::codex("gpt-identity", Some("acct-identity".into()));
+        compatibility.replacement_segment_items = 1;
+        compatibility.item_metadata = vec![NativeCompactionItemMetadata {
+            input_index: 0,
+            kind: NativeCompactionItemKind::Compaction,
+            item_id: Some("cmp-identity".into()),
+            internal_chat_message_metadata_passthrough: None,
+        }];
+        vec![
+            ConversationItem::native_compaction_metadata(compatibility),
+            ConversationItem::encrypted_compaction(rs::CompactionSummaryItemParam {
+                id: Some("cmp-identity".into()),
+                encrypted_content: "opaque".into(),
+            }),
+        ]
+    }
+
+    fn codex_identity() -> SamplingIdentity {
+        SamplingIdentity::new(
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+            "gpt-identity",
+            Some("acct-identity".into()),
+        )
+    }
+
+    #[test]
+    fn sampling_identity_policy_preserves_same_identity_and_canonical_codex_alias() {
+        for base_url in [
+            crate::CODEX_BACKEND_BASE_URL,
+            "https://chatgpt.com/backend-api/codex",
+        ] {
+            let mut history = vec![ordinary_identity_sidecar(), ConversationItem::user("hello")];
+            let identity = SamplingIdentity::new(
+                ApiBackend::Responses,
+                base_url,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            );
+            assert!(!prepare_history_for_sampling_identity(&mut history, &identity).unwrap());
+            assert_eq!(history.len(), 2);
+        }
+    }
+
+    #[test]
+    fn sampling_identity_policy_strips_sidecars_on_backend_api_model_or_account_change() {
+        let changed = [
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                "https://api.x.ai/v1",
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::ChatCompletions,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-other",
+                Some("acct-identity".into()),
+            ),
+            SamplingIdentity::new(
+                ApiBackend::Responses,
+                crate::CODEX_BACKEND_BASE_URL,
+                "gpt-identity",
+                Some("acct-other".into()),
+            ),
+        ];
+        for identity in changed {
+            let mut history = vec![ordinary_identity_sidecar(), ConversationItem::user("hello")];
+            assert!(prepare_history_for_sampling_identity(&mut history, &identity).unwrap());
+            assert_eq!(history.len(), 1);
+            assert!(matches!(history[0], ConversationItem::User(_)));
+        }
+    }
+
+    #[test]
+    fn sampling_identity_policy_rejects_mismatched_native_without_mutation() {
+        let mut history = valid_native_identity_history();
+        history.push(ordinary_identity_sidecar());
+        let before = serde_json::to_vec(&history).unwrap();
+        let wrong = SamplingIdentity::new(
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+            "gpt-other",
+            Some("acct-identity".into()),
+        );
+        assert_eq!(
+            prepare_history_for_sampling_identity(&mut history, &wrong),
+            Err(SamplingIdentityHistoryError::IncompatibleNativeHistory)
+        );
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
+    #[test]
+    fn explicit_third_provider_on_codex_transport_cannot_replay_codex_native_history() {
+        let mut history = valid_native_identity_history();
+        history.push(ordinary_identity_sidecar());
+        let before = serde_json::to_vec(&history).unwrap();
+        let protocol = crate::ProtocolIdentity::resolve(
+            Some(crate::ProviderId::Custom),
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+        );
+        let identity = SamplingIdentity::new_for_protocol(
+            &protocol,
+            crate::CODEX_BACKEND_BASE_URL,
+            "gpt-identity",
+            Some("acct-identity".into()),
+        );
+
+        assert_eq!(
+            prepare_history_for_sampling_identity(&mut history, &identity),
+            Err(SamplingIdentityHistoryError::IncompatibleNativeHistory)
+        );
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
+    #[test]
+    fn sampling_identity_policy_rejects_malformed_native_before_any_mutation() {
+        let mut history = vec![
+            ordinary_identity_sidecar(),
+            valid_native_identity_history().remove(0),
+        ];
+        let before = serde_json::to_vec(&history).unwrap();
+        assert!(matches!(
+            prepare_history_for_sampling_identity(&mut history, &codex_identity()),
+            Err(SamplingIdentityHistoryError::MalformedNativeHistory(_))
+        ));
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
+    #[test]
+    fn chatgpt_account_header_is_case_insensitive_and_last_wins() {
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("ChatGPT-Account-ID".into(), "first".into());
+        headers.insert("x-other".into(), "ignored".into());
+        headers.insert("chatgpt-account-id".into(), "last".into());
+        assert_eq!(
+            crate::chatgpt_account_id_from_headers(&headers),
+            Some("last")
+        );
+    }
+
+    #[test]
+    fn turn_routing_state_clones_share_scope_and_fresh_scopes_are_independent() {
+        let state = TurnRoutingState::fresh();
+        let shared = state.clone();
+        assert!(shared.capture_first("first".to_string()));
+        assert!(!state.capture_first("second".to_string()));
+        assert_eq!(state.value(), Some("first"));
+        assert_eq!(shared.value(), Some("first"));
+        assert!(TurnRoutingState::default().value().is_none());
+    }
+
+    fn native_manifest_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": NativeCompactionCompatibility::SCHEMA_VERSION,
+            "backend_family": NativeCompactionCompatibility::CODEX_RESPONSES_FAMILY,
+            "model": "gpt-test",
+            "replacement_segment_start": 0,
+            "replacement_segment_items": 1,
+            "item_metadata": [{
+                "input_index": 0,
+                "kind": "compaction",
+                "item_id": "cmp-test",
+                "internal_chat_message_metadata_passthrough": null
+            }]
+        })
+    }
+
+    #[test]
+    fn provider_item_loads_all_legacy_conversation_tags() {
+        let ordinary: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "response_output_metadata",
+            "response_id": "resp-test",
+            "output_items": 0,
+            "items": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            ordinary,
+            ConversationItem::Provider(ref provider) if provider.is_response_output_metadata()
+        ));
+
+        let mut native = native_manifest_json();
+        native["type"] = serde_json::json!("native_compaction_metadata");
+        let native: ConversationItem = serde_json::from_value(native).unwrap();
+        assert!(matches!(
+            native,
+            ConversationItem::Provider(ref provider) if provider.is_native_compaction_metadata()
+        ));
+
+        let encrypted: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "compaction",
+            "id": "cmp-test",
+            "encrypted_content": "ciphertext"
+        }))
+        .unwrap();
+        assert!(matches!(
+            encrypted,
+            ConversationItem::Provider(ref provider) if provider.is_encrypted_compaction()
+        ));
+    }
+
+    #[test]
+    fn provider_items_keep_legacy_persisted_tags() {
+        let ordinary = ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-test".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: None,
+        });
+        let native: NativeCompactionCompatibility =
+            serde_json::from_value(native_manifest_json()).unwrap();
+        let items = [
+            (ordinary, "response_output_metadata"),
+            (
+                ConversationItem::native_compaction_metadata(native),
+                "native_compaction_metadata",
+            ),
+            (
+                ConversationItem::encrypted_compaction(rs::CompactionSummaryItemParam {
+                    id: Some("cmp-test".into()),
+                    encrypted_content: "ciphertext".into(),
+                }),
+                "compaction",
+            ),
+        ];
+
+        for (item, expected_type) in items {
+            let value = serde_json::to_value(&item).unwrap();
+            assert_eq!(value["type"], expected_type);
+            assert!(value.get("provider").is_none());
+            assert!(value.get("kind").is_none());
+            assert!(value.get("payload").is_none());
+            let round_trip: ConversationItem = serde_json::from_value(value).unwrap();
+            assert!(matches!(round_trip, ConversationItem::Provider(_)));
+        }
+    }
+
+    #[test]
+    fn provider_item_unknown_provider_and_kind_fail_closed() {
+        for value in [
+            serde_json::json!({
+                "type": "provider",
+                "provider": "future_provider",
+                "kind": "compaction",
+                "payload": {"id": "cmp", "encrypted_content": "cipher"}
+            }),
+            serde_json::json!({
+                "type": "provider",
+                "provider": "codex",
+                "kind": "future_kind",
+                "payload": {}
+            }),
+            serde_json::json!({
+                "type": "provider",
+                "provider": "codex",
+                "kind": "compaction",
+                "payload": {"id": "cmp", "encrypted_content": "cipher"},
+                "future_envelope_field": true
+            }),
+        ] {
+            assert!(serde_json::from_value::<ConversationItem>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_legacy_native_manifest_fails_closed() {
+        let mut value = native_manifest_json();
+        value["type"] = serde_json::json!("native_compaction_metadata");
+        value.as_object_mut().unwrap().remove("item_metadata");
+        assert!(serde_json::from_value::<ConversationItem>(value).is_err());
+    }
 
     #[test]
     fn prior_turn_interrupt_serde_round_trip_and_unknown_fallback() {

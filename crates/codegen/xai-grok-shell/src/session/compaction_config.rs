@@ -173,17 +173,25 @@ pub struct CompactionConfig {
 /// 90% of the active context window and uses that 90% value as its fallback.
 /// This also scales correctly when `GROK_DEBUG_CONTEXT_WINDOW` shrinks a model.
 pub(crate) fn resolve_codex_auto_compact_token_limit(
-    base_url: &str,
+    safety: xai_grok_sampling_types::AutoCompactSafety,
     context_window: std::num::NonZeroU64,
     configured_limit: Option<u64>,
 ) -> Option<std::num::NonZeroU64> {
-    if !xai_grok_sampling_types::capabilities_for_base_url(base_url).provider_auto_compact_safety {
+    let xai_grok_sampling_types::AutoCompactSafety::MaxContextFraction {
+        numerator,
+        denominator,
+    } = safety
+    else {
+        return None;
+    };
+    if denominator == 0 {
         return None;
     }
-    let ninety_percent = context_window.get().saturating_mul(9) / 10;
+    let provider_limit =
+        context_window.get().saturating_mul(u64::from(numerator)) / u64::from(denominator);
     let limit = configured_limit
         .filter(|limit| *limit > 0)
-        .map_or(ninety_percent, |limit| limit.min(ninety_percent));
+        .map_or(provider_limit, |limit| limit.min(provider_limit));
     std::num::NonZeroU64::new(limit)
 }
 
@@ -194,7 +202,13 @@ mod prefire_state_tests {
     #[test]
     fn codex_limit_defaults_to_ninety_percent_and_clamps_metadata() {
         let window = std::num::NonZeroU64::new(272_000).unwrap();
-        let codex = "https://chatgpt.com/backend-api/codex";
+        let codex = xai_grok_sampling_types::resolve_provider(
+            Some(xai_grok_sampling_types::ProviderId::Codex),
+            xai_grok_sampling_types::ApiBackend::Responses,
+            "http://127.0.0.1:3210/v1",
+        )
+        .capabilities()
+        .auto_compact_safety();
         assert_eq!(
             resolve_codex_auto_compact_token_limit(codex, window, None).map(|v| v.get()),
             Some(244_800)
@@ -213,7 +227,11 @@ mod prefire_state_tests {
     fn grok_does_not_receive_codex_safety_limit() {
         let window = std::num::NonZeroU64::new(500_000).unwrap();
         assert_eq!(
-            resolve_codex_auto_compact_token_limit("https://api.x.ai/v1", window, Some(244_800),),
+            resolve_codex_auto_compact_token_limit(
+                xai_grok_sampling_types::AutoCompactSafety::None,
+                window,
+                Some(244_800),
+            ),
             None
         );
     }

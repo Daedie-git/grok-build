@@ -1,56 +1,42 @@
 use super::*;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
+
+pub(super) struct PreparedAgentRebuild {
+    agent: xai_grok_agent::Agent,
+    agent_name: String,
+    system_prompt: String,
+    prompt_context: xai_grok_agent::PromptContext,
+}
+
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
         sampling_config: xai_grok_sampler::SamplerConfig,
+        sampling_identity: xai_grok_sampling_types::SamplingIdentity,
+        rebuild_definition: Option<Box<xai_grok_agent::AgentDefinition>>,
         use_concise: bool,
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
     ) -> Result<acp::ModelId, acp::Error> {
-        // This guard is intentionally the first operation: rejected switches
-        // must not mutate thresholds, credentials, prompts, signals, or
-        // persistence/notification state.
-        let mut conversation = self.chat_state_handle.get_conversation().await;
-        let account = sampling_config
-            .extra_headers
-            .iter()
-            .rev()
-            .find(|(name, _)| {
-                name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
-            })
-            .map(|(_, value)| value.as_str());
-        let compatibility = xai_grok_sampling_types::native_compaction_compatibility(&conversation)
-            .map_err(|message| acp::Error::invalid_params().data(message))?;
-        if let Some(expected) = compatibility {
-            let compatible = expected.matches_origin(
-                &sampling_config.api_backend,
-                &sampling_config.base_url,
-                &sampling_config.model,
-                account,
-            );
-            if !compatible {
-                return Err(acp::Error::invalid_params().data(
-                    "session contains identity-bound native Codex compaction history; backend, API, model, and ChatGPT account must exactly match its origin",
-                ));
-            }
-        }
-        if xai_grok_sampling_types::strip_incompatible_response_metadata(
-            &mut conversation,
-            &sampling_config.api_backend,
-            &sampling_config.base_url,
-            &sampling_config.model,
-            account,
-        ) {
-            // Full replacement deliberately persists the one-way migration so
-            // stale provider metadata cannot return after a cold restart. The
-            // read barrier confirms the chat-state actor processed the replace
-            // before the model switch reports success.
-            self.chat_state_handle.replace_conversation(conversation);
-            let _ = self.chat_state_handle.get_conversation().await;
-        }
+        // Build a candidate harness first, but do not touch live agent state,
+        // tool bindings, conversation, prompt artifacts, or persistence until
+        // the authoritative sampling transition has committed.
+        let prepared_rebuild = match rebuild_definition {
+            Some(definition) => Some(self.prepare_agent_rebuild(*definition).await?),
+            None => None,
+        };
+
+        // Build the complete proposal before asking the chat-state actor to
+        // transition its three authoritative fields. The actor revalidates
+        // history with the explicitly resolved runtime identity; rejection
+        // leaves conversation/config/credentials inert.
+        let current = self
+            .chat_state_handle
+            .get_sampling_state()
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
         let model_id = acp::ModelId::new(sampling_config.model.clone());
         let new_context_window = self.compaction.context_window_override.unwrap_or_else(|| {
             std::num::NonZeroU64::new(sampling_config.context_window).unwrap_or_else(|| {
@@ -58,6 +44,63 @@ impl SessionActor {
                     .expect("DEFAULT_CONTEXT_WINDOW is non-zero")
             })
         });
+        let proposed_config = xai_grok_sampling_types::SamplingConfig {
+            base_url: sampling_config.base_url.clone(),
+            model: sampling_config.model.clone(),
+            max_completion_tokens: sampling_config.max_completion_tokens,
+            temperature: sampling_config.temperature,
+            top_p: sampling_config.top_p,
+            api_backend: sampling_config.api_backend.clone(),
+            provider_id: sampling_config.provider_id,
+            extra_headers: sampling_config.extra_headers.clone(),
+            query_params: sampling_config.query_params.clone(),
+            env_http_headers: sampling_config.env_http_headers.clone(),
+            context_window: new_context_window,
+            reasoning_effort: sampling_config.reasoning_effort,
+            stream_tool_calls: Some(sampling_config.stream_tool_calls),
+        };
+        let session_key = self
+            .auth_manager
+            .as_ref()
+            .and_then(|am| am.current_or_expired().map(|a| a.key));
+        let proposed_credentials = xai_chat_state::Credentials {
+            api_key: sampling_config.api_key.clone(),
+            auth_type: crate::agent::config::resolve_chat_state_auth_type(
+                sampling_config.model.as_str(),
+                session_key.as_deref(),
+                current.credentials.auth_type,
+            ),
+            alpha_test_key: current.credentials.alpha_test_key,
+            client_version: sampling_config.client_version.clone(),
+        };
+        let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+            proposed_config,
+            sampling_identity,
+        )
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let transition = self
+            .chat_state_handle
+            .transition_sampling_state(target, proposed_credentials)
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        match transition {
+            Ok(applied) => {
+                if let xai_chat_state::SamplingTransitionPersistence::CommittedWithBookkeepingWarning(error) = applied.persistence {
+                    tracing::warn!(%error, "sampling identity history committed with bookkeeping warning");
+                }
+            }
+            Err(xai_chat_state::SamplingTransitionError::History(error)) => {
+                return Err(acp::Error::invalid_params().data(error.to_string()));
+            }
+            Err(error) => {
+                return Err(acp::Error::internal_error().data(error.to_string()));
+            }
+        }
+
+        if let Some(prepared) = prepared_rebuild {
+            self.install_prepared_agent_rebuild(prepared).await;
+        }
+
         let prev_threshold = self.compaction.threshold_percent.get();
         if prev_threshold != auto_compact_threshold_percent {
             tracing::info!(
@@ -86,37 +129,6 @@ impl SessionActor {
                 "supports_backend_search": sampling_config.supports_backend_search,
             })),
         );
-        self.chat_state_handle
-            .update_sampling_config(xai_grok_sampling_types::SamplingConfig {
-                base_url: sampling_config.base_url.clone(),
-                model: sampling_config.model.clone(),
-                max_completion_tokens: sampling_config.max_completion_tokens,
-                temperature: sampling_config.temperature,
-                top_p: sampling_config.top_p,
-                api_backend: sampling_config.api_backend.clone(),
-                extra_headers: sampling_config.extra_headers.clone(),
-                query_params: sampling_config.query_params.clone(),
-                env_http_headers: sampling_config.env_http_headers.clone(),
-                context_window: new_context_window,
-                reasoning_effort: sampling_config.reasoning_effort,
-                stream_tool_calls: Some(sampling_config.stream_tool_calls),
-            });
-        let existing = self.chat_state_handle.get_credentials().await;
-        let session_key = self
-            .auth_manager
-            .as_ref()
-            .and_then(|am| am.current_or_expired().map(|a| a.key));
-        self.chat_state_handle
-            .update_credentials(xai_chat_state::Credentials {
-                api_key: sampling_config.api_key.clone(),
-                auth_type: crate::agent::config::resolve_chat_state_auth_type(
-                    sampling_config.model.as_str(),
-                    session_key.as_deref(),
-                    existing.auth_type,
-                ),
-                alpha_test_key: existing.alpha_test_key,
-                client_version: sampling_config.client_version.clone(),
-            });
         self.invalidate_model_auth_memo();
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
@@ -160,29 +172,101 @@ impl SessionActor {
             });
         Ok(model_id)
     }
-    /// Handle [`SessionCommand::RebuildAgentForDefinition`].
-    ///
-    /// Builds a fresh [`xai_grok_agent::Agent`] from the cached
-    /// [`crate::session::agent_rebuild::AgentRebuildSpec`] + the supplied
-    /// [`xai_grok_agent::AgentDefinition`], replaces `self.agent`,
-    /// rewrites the system message in the conversation, persists the
-    /// new prompt artifacts, and updates `active_agent_type`.
-    ///
-    /// Triggered from `MvpAgent::set_session_model` only when the new
-    /// model's `agent_type` differs from the session's current
-    /// `active_agent_type` AND `turn_count == 0` (no user message has
-    /// been sent yet). Defense-in-depth: rejects if a turn is in flight.
-    pub(super) async fn handle_rebuild_agent_for_definition(
+
+    pub(super) async fn handle_override_model_name(
+        &self,
+        model_name: String,
+        extra_headers: indexmap::IndexMap<String, String>,
+        context_window: Option<std::num::NonZeroU64>,
+    ) -> Result<(), acp::Error> {
+        let current = self
+            .chat_state_handle
+            .get_sampling_state()
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        let mut proposed_config = current.config;
+        let old_model = proposed_config.model.clone();
+        let old_context_window = proposed_config.context_window.get();
+        proposed_config.model = model_name.clone();
+        proposed_config.extra_headers.extend(extra_headers.clone());
+        if let Some(cw) = context_window
+            && self.compaction.context_window_override.is_none()
+        {
+            proposed_config.context_window = cw;
+        }
+
+        let mut proposed_credentials = current.credentials;
+        if let Some(resolved) = crate::agent::config::try_resolve_model_credentials(
+            model_name.as_str(),
+            proposed_credentials.api_key.as_deref(),
+        ) {
+            proposed_credentials.api_key = resolved.api_key;
+            proposed_credentials.auth_type = resolved.auth_type;
+        }
+
+        let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+            proposed_config.provider_id,
+            proposed_config.api_backend.clone(),
+            &proposed_config.base_url,
+            &proposed_config.model,
+            &proposed_config.extra_headers,
+            &proposed_config.env_http_headers,
+        )
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+            proposed_config,
+            sampling_identity,
+        )
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+        let transition = self
+            .chat_state_handle
+            .transition_sampling_state(target, proposed_credentials)
+            .await
+            .ok_or_else(|| acp::Error::internal_error().data("chat-state actor unavailable"))?;
+        match transition {
+            Ok(applied) => {
+                if let xai_chat_state::SamplingTransitionPersistence::CommittedWithBookkeepingWarning(error) = applied.persistence {
+                    tracing::warn!(%error, "override history committed with bookkeeping warning");
+                }
+            }
+            Err(xai_chat_state::SamplingTransitionError::History(error)) => {
+                return Err(acp::Error::invalid_params().data(error.to_string()));
+            }
+            Err(error) => {
+                return Err(acp::Error::internal_error().data(error.to_string()));
+            }
+        }
+
+        tracing::info!(
+            target: SESSION_LOG,
+            session_id = %self.session_info.id,
+            old_model = %old_model,
+            new_model = %model_name,
+            extra_header_count = extra_headers.len(),
+            old_context_window,
+            new_context_window = ?context_window.map(|cw| cw.get()),
+            "OVERRIDE_MODEL: changing model name in sampling config"
+        );
+        // Shell-owned secondary state moves only after the actor's
+        // authoritative transition succeeds.
+        self.signals_handle().set_primary_model(&model_name);
+        self.invalidate_model_auth_memo();
+        Ok(())
+    }
+
+    /// Build and render a candidate zero-turn harness without mutating any
+    /// live session, conversation, tool binding, or persistence state.
+    pub(super) async fn prepare_agent_rebuild(
         &self,
         definition: xai_grok_agent::AgentDefinition,
-    ) -> Result<(), acp::Error> {
+    ) -> Result<PreparedAgentRebuild, acp::Error> {
         {
             let state = self.state.lock().await;
             if state.running_task.is_some() {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
                     new_agent_type = %definition.name,
-                    "handle_rebuild_agent_for_definition: turn in flight, rejecting rebuild"
+                    "prepare_agent_rebuild: turn in flight, rejecting rebuild"
                 );
                 return Err(acp::Error::internal_error()
                     .data("rebuild_agent: turn in flight, refusing to rebuild harness"));
@@ -192,7 +276,7 @@ impl SessionActor {
         tracing::info!(
             session_id = %self.session_info.id.0,
             new_agent_type = %new_agent_name,
-            "handle_rebuild_agent_for_definition: rebuilding harness"
+            "prepare_agent_rebuild: rebuilding harness"
         );
         let new_agent = self
             .rebuild_spec
@@ -203,15 +287,33 @@ impl SessionActor {
                     session_id = %self.session_info.id.0,
                     new_agent_type = %new_agent_name,
                     error = %e,
-                    "handle_rebuild_agent_for_definition: AgentBuilder::build failed"
+                    "prepare_agent_rebuild: AgentBuilder::build failed"
                 );
                 acp::Error::internal_error().data(format!(
                     "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
                 ))
             })?;
-        let new_system_prompt = new_agent.system_prompt().to_string();
-        let mut new_prompt_context = new_agent.prompt_context().clone();
-        new_prompt_context.normalize_for_persistence();
+        let system_prompt = new_agent.system_prompt().to_string();
+        let mut prompt_context = new_agent.prompt_context().clone();
+        prompt_context.normalize_for_persistence();
+        Ok(PreparedAgentRebuild {
+            agent: new_agent,
+            agent_name: new_agent_name,
+            system_prompt,
+            prompt_context,
+        })
+    }
+
+    /// Install a fully prepared harness after the authoritative sampling
+    /// transition succeeds. This retains the existing tool/resource rebinding,
+    /// prompt rewrite, persistence, and notification behavior.
+    pub(super) async fn install_prepared_agent_rebuild(&self, prepared: PreparedAgentRebuild) {
+        let PreparedAgentRebuild {
+            agent: new_agent,
+            agent_name: new_agent_name,
+            system_prompt: new_system_prompt,
+            prompt_context: new_prompt_context,
+        } = prepared;
         if let Some(handle) = self.compaction.prefire.take_handle() {
             handle.abort();
             let _ = handle.await;
@@ -293,7 +395,7 @@ impl SessionActor {
                     () = tokio::time::sleep(TIMEOUT) => {
                         tracing::warn!(
                             session_id = %self.session_info.id.0,
-                            "handle_rebuild_agent_for_definition: timed out waiting for MCP handshakes"
+                            "install_prepared_agent_rebuild: timed out waiting for MCP handshakes"
                         );
                     }
                 }
@@ -335,9 +437,8 @@ impl SessionActor {
         tracing::info!(
             session_id = %self.session_info.id.0,
             new_agent_type = %new_agent_name,
-            "handle_rebuild_agent_for_definition: harness rebuild complete"
+            "install_prepared_agent_rebuild: harness rebuild complete"
         );
-        Ok(())
     }
     /// Apply a client-supplied `systemPromptOverride` on session attach without
     /// wiping user/assistant history: swap only the leading `System` message,

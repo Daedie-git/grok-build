@@ -1095,6 +1095,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 temperature: None,
                 top_p: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
+                provider_id: None,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
@@ -1118,8 +1119,16 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 doom_loop_recovery: None,
                 header_injector: None,
             };
+            let identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+                cfg.api_backend.clone(),
+                &cfg.base_url,
+                &cfg.model,
+                &cfg.extra_headers,
+                &cfg.env_http_headers,
+            )
+            .unwrap();
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(cfg, identity, None, false, false, true, 85)
                 .await;
 
             assert!(
@@ -1127,6 +1136,120 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 "a model switch must invalidate the per-model BYOK memo so the next \
                  reconstruct recomputes under the current config"
             );
+        })
+        .await;
+}
+
+fn native_switch_history() -> Vec<xai_grok_sampling_types::ConversationItem> {
+    let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
+        "gpt-native-old",
+        Some("acct-native".into()),
+    );
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+        item_id: Some("cmp-native-switch".into()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    vec![
+        xai_grok_sampling_types::ConversationItem::native_compaction_metadata(compatibility),
+        xai_grok_sampling_types::ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-native-switch".into()),
+                encrypted_content: "opaque".into(),
+            },
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_switch_and_override_share_authoritative_rejection() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _rx) = make_actor_with_auth_and_credentials(
+                None,
+                xai_chat_state::AuthType::ApiKey,
+                "old-key".into(),
+            )
+            .await;
+            let mut current = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            current.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+            current.model = "gpt-native-old".into();
+            current.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            current.extra_headers.insert(
+                xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+                "acct-native".into(),
+            );
+            actor.chat_state_handle.update_sampling_config(current);
+            actor
+                .chat_state_handle
+                .replace_conversation(native_switch_history());
+            let _ = actor.chat_state_handle.get_sampling_state().await;
+
+            let mut proposed_headers = indexmap::IndexMap::new();
+            proposed_headers.insert(
+                xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+                "acct-native".into(),
+            );
+            let proposed_sampling = xai_grok_sampler::SamplerConfig {
+                api_key: Some("new-key".into()),
+                base_url: xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into(),
+                model: "gpt-native-other".into(),
+                api_backend: xai_grok_sampling_types::ApiBackend::Responses,
+                extra_headers: proposed_headers,
+                context_window: 256_000,
+                ..Default::default()
+            };
+            let proposed_identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+                proposed_sampling.api_backend.clone(),
+                &proposed_sampling.base_url,
+                &proposed_sampling.model,
+                &proposed_sampling.extra_headers,
+                &proposed_sampling.env_http_headers,
+            )
+            .unwrap();
+            let active_agent_before = actor.agent.borrow().definition().name.clone();
+            let mut rebuild_definition = xai_grok_agent::AgentDefinition::default_grok_build();
+            rebuild_definition.name = "staged-rebuild-must-not-install".into();
+            let full_error = actor
+                .handle_set_session_model(
+                    proposed_sampling,
+                    proposed_identity,
+                    Some(Box::new(rebuild_definition)),
+                    false,
+                    false,
+                    true,
+                    85,
+                )
+                .await
+                .expect_err("full switch must propagate native identity rejection");
+            assert_eq!(full_error.code, acp::Error::invalid_params().code);
+            assert_eq!(
+                actor.agent.borrow().definition().name,
+                active_agent_before,
+                "a prepared rebuild must not install when the sampling transition fails"
+            );
+            assert_ne!(
+                *actor.active_agent_type.lock(),
+                Some("staged-rebuild-must-not-install".into()),
+                "secondary harness identity must remain untouched"
+            );
+
+            let override_error = actor
+                .handle_override_model_name(
+                    "gpt-native-other".into(),
+                    indexmap::IndexMap::new(),
+                    None,
+                )
+                .await
+                .expect_err("override must propagate native identity rejection");
+            assert_eq!(override_error.code, acp::Error::invalid_params().code);
+
+            let state = actor.chat_state_handle.get_sampling_state().await.unwrap();
+            assert_eq!(state.config.model, "gpt-native-old");
+            assert_eq!(state.credentials.api_key.as_deref(), Some("old-key"));
         })
         .await;
 }
@@ -1188,6 +1311,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 temperature: None,
                 top_p: None,
                 api_backend: crate::sampling::ApiBackend::ChatCompletions,
+                provider_id: Some(xai_grok_sampling_types::ProviderId::Xai),
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 query_params: Default::default(),
@@ -1211,8 +1335,16 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 doom_loop_recovery: None,
                 header_injector: None,
             };
+            let identity = xai_grok_sampler::resolve_runtime_sampling_identity(
+                cfg.api_backend.clone(),
+                &cfg.base_url,
+                &cfg.model,
+                &cfg.extra_headers,
+                &cfg.env_http_headers,
+            )
+            .unwrap();
             let _ = actor
-                .handle_set_session_model(cfg, false, false, true, 85)
+                .handle_set_session_model(cfg, identity, None, false, false, true, 85)
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;

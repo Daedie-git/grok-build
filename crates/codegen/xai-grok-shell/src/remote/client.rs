@@ -52,15 +52,25 @@ async fn add_bundle_fetch_headers(
     alpha_test_key: Option<&str>,
     url: &str,
 ) -> reqwest::RequestBuilder {
-    let resolved_auth = match auth_manager {
-        Some(am) => am.auth().await.ok(),
-        None => None,
+    let trusted_destination = crate::util::is_cli_chat_proxy_url(url);
+    if !trusted_destination {
+        tracing::warn!(%url, "refusing to attach bundle credentials to an untrusted destination");
+    }
+    let resolved_auth = if trusted_destination {
+        match auth_manager {
+            Some(am) => am.auth().await.ok(),
+            None => None,
+        }
+    } else {
+        None
     };
     let mut credentials = crate::util::grok_auth_credentials::GrokAuthCredentials::new(
         resolved_auth.as_ref().map(|auth| auth.key.clone()),
     );
-    credentials.deployment_key = deployment_key.map(str::to_owned);
-    credentials.alpha_test_key = alpha_test_key.map(str::to_owned);
+    if trusted_destination {
+        credentials.deployment_key = deployment_key.map(str::to_owned);
+        credentials.alpha_test_key = alpha_test_key.map(str::to_owned);
+    }
     let mut builder = credentials
         .apply(builder, url)
         .header("x-grok-client-version", xai_grok_version::VERSION);
@@ -875,6 +885,19 @@ pub fn parse_remote_model_value(
             _ => None,
         })
         .unwrap_or_default();
+    let provider_id = get_string(obj, "providerId")
+        .or_else(|| get_string(obj, "provider_id"))
+        .or_else(|| meta.and_then(|m| get_string(m, "providerId")))
+        .or_else(|| meta.and_then(|m| get_string(m, "provider_id")))
+        .and_then(|value| match value.as_str() {
+            "xai" => Some(xai_grok_sampling_types::ProviderId::Xai),
+            "codex" => Some(xai_grok_sampling_types::ProviderId::Codex),
+            "open_ai_compatible" | "openai_compatible" => {
+                Some(xai_grok_sampling_types::ProviderId::OpenAiCompatible)
+            }
+            "custom" => Some(xai_grok_sampling_types::ProviderId::Custom),
+            _ => None,
+        });
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -889,6 +912,7 @@ pub fn parse_remote_model_value(
         api_key: get_string(obj, "apiKey").or_else(|| get_string(obj, "api_key")),
         env_key: get_env_keys(obj, "envKey").or_else(|| get_env_keys(obj, "env_key")),
         api_backend,
+        provider_id,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
@@ -1472,6 +1496,25 @@ mod tests {
         server.abort();
     }
     #[tokio::test(flavor = "current_thread")]
+    async fn bundle_headers_omit_credentials_for_untrusted_destination() {
+        let auth_manager = test_auth_manager();
+        let request = add_bundle_fetch_headers(
+            reqwest::Client::new().get("https://untrusted.example/subagents/bundle"),
+            Some(&auth_manager),
+            Some("deploy-key"),
+            Some("alpha-key"),
+            "https://untrusted.example/subagents/bundle",
+        )
+        .await
+        .build()
+        .unwrap();
+
+        for header in ["authorization", "x-xai-token-auth", "x-userid", "x-email"] {
+            assert!(request.headers().get(header).is_none(), "leaked {header}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fetch_subagent_bundle_http_failure() {
         let (proxy_base_url, _seen_headers, server) = start_bundle_server(
             axum::http::StatusCode::UNAUTHORIZED,
@@ -1594,7 +1637,8 @@ mod tests {
             "_meta": {
                 "model": "meta-model-id",
                 "contextWindow": 131072,
-                "agentType": "concise"
+                "agentType": "concise",
+                "providerId": "codex"
             }
         });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
@@ -1604,6 +1648,10 @@ mod tests {
             std::num::NonZeroU64::new(131072).unwrap()
         );
         assert_eq!(result.agent_type, "concise");
+        assert_eq!(
+            result.provider_id,
+            Some(xai_grok_sampling_types::ProviderId::Codex)
+        );
     }
     #[test]
     fn parse_remote_model_value_reads_codex_auto_compact_limit() {

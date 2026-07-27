@@ -241,12 +241,12 @@ impl ChatStateActor {
                 }
                 xai_grok_sampling_types::ConversationItem::System(_) => {}
                 xai_grok_sampling_types::ConversationItem::BackendToolCall(_) => {}
-                xai_grok_sampling_types::ConversationItem::ResponseOutputMetadata(_)
-                | xai_grok_sampling_types::ConversationItem::Reasoning(_)
-                | xai_grok_sampling_types::ConversationItem::NativeCompactionMetadata(_) => {}
-                xai_grok_sampling_types::ConversationItem::Compaction(_) => {
-                    counts.assistant += 1;
+                xai_grok_sampling_types::ConversationItem::Provider(provider) => {
+                    if provider.is_encrypted_compaction() {
+                        counts.assistant += 1;
+                    }
                 }
+                xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}
             }
         }
         counts

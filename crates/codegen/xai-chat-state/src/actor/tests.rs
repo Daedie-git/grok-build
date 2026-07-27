@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
 use crate::StrictAppendAck;
-use crate::actor::ChatStateActor;
+use crate::actor::{ChatStateActor, await_history_replacement_ack};
 use crate::events::ChatStateEvent;
 use crate::persistence::{MockChatPersistence, MockPersistenceReceiver, PersistenceRecord};
 
@@ -24,6 +24,7 @@ fn test_config_with_window(context_window: u64) -> SamplingConfig {
         temperature: None,
         top_p: None,
         api_backend: Default::default(),
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -63,6 +64,38 @@ impl TestHarness {
     fn with_manual_persistence_ack(items: Vec<ConversationItem>) -> Self {
         let (mock, persistence_rx) = MockChatPersistence::new_with_manual_persistence_ack();
         Self::with_persistence(items, test_config(), mock, persistence_rx)
+    }
+
+    fn with_manual_history_replacement_ack(
+        items: Vec<ConversationItem>,
+        config: SamplingConfig,
+    ) -> Self {
+        let (mock, persistence_rx) = MockChatPersistence::new_with_manual_history_replacement_ack();
+        Self::with_persistence(items, config, mock, persistence_rx)
+    }
+
+    fn with_manual_history_replacement_ack_timeout(
+        items: Vec<ConversationItem>,
+        config: SamplingConfig,
+        timeout: Duration,
+    ) -> Self {
+        let (mock, persistence_rx) = MockChatPersistence::new_with_manual_history_replacement_ack();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let token = tokio_util::sync::CancellationToken::new();
+        let handle = ChatStateActor::spawn_with_persistence_ack_timeout(
+            items,
+            config,
+            Box::new(mock),
+            event_tx,
+            token.clone(),
+            timeout,
+        );
+        Self {
+            handle,
+            event_rx,
+            persistence_rx,
+            _cancellation_token: token,
+        }
     }
 
     fn with_persistence(
@@ -771,11 +804,13 @@ async fn native_compaction_replacement_survives_actor_snapshot_and_persistence()
     let replacement = vec![
         ConversationItem::system("sys"),
         retained,
-        ConversationItem::NativeCompactionMetadata(compatibility),
-        ConversationItem::Compaction(xai_grok_sampling_types::rs::CompactionSummaryItemParam {
-            id: Some("cmp_actor".into()),
-            encrypted_content: "encrypted-actor-context".into(),
-        }),
+        ConversationItem::native_compaction_metadata(compatibility),
+        ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp_actor".into()),
+                encrypted_content: "encrypted-actor-context".into(),
+            },
+        ),
     ];
     h.handle
         .replace_conversation_for_compaction(replacement.clone());
@@ -788,17 +823,23 @@ async fn native_compaction_replacement_survives_actor_snapshot_and_persistence()
     ));
     assert!(matches!(
         &snapshot.conversation[2],
-        ConversationItem::NativeCompactionMetadata(metadata)
-            if metadata.model == "gpt-test"
-                && metadata.chatgpt_account_id.as_deref() == Some("acct-test")
+        ConversationItem::Provider(provider)
+            if provider.as_native_compaction_metadata().is_some_and(|metadata| {
+                metadata.model == "gpt-test"
+                    && metadata.chatgpt_account_id.as_deref() == Some("acct-test")
+            })
     ));
-    match &snapshot.conversation[3] {
-        ConversationItem::Compaction(item) => {
-            assert_eq!(item.id.as_deref(), Some("cmp_actor"));
-            assert_eq!(item.encrypted_content, "encrypted-actor-context");
-        }
-        other => panic!("expected native compaction in snapshot, got {other:?}"),
-    }
+    let ConversationItem::Provider(provider) = &snapshot.conversation[3] else {
+        panic!(
+            "expected native compaction in snapshot, got {:?}",
+            snapshot.conversation[3]
+        )
+    };
+    let item = provider
+        .as_encrypted_compaction()
+        .expect("encrypted native compaction payload");
+    assert_eq!(item.id.as_deref(), Some("cmp_actor"));
+    assert_eq!(item.encrypted_content, "encrypted-actor-context");
     let records = h.drain_persistence();
     let persisted = records
         .iter()
@@ -814,14 +855,18 @@ async fn native_compaction_replacement_survives_actor_snapshot_and_persistence()
     ));
     assert!(matches!(
         &persisted[2],
-        ConversationItem::NativeCompactionMetadata(metadata)
-            if metadata.model == "gpt-test"
+        ConversationItem::Provider(provider)
+            if provider.as_native_compaction_metadata().is_some_and(|metadata| {
+                metadata.model == "gpt-test"
+            })
     ));
     assert!(matches!(
         &persisted[3],
-        ConversationItem::Compaction(item)
-            if item.id.as_deref() == Some("cmp_actor")
-                && item.encrypted_content == "encrypted-actor-context"
+        ConversationItem::Provider(provider)
+            if provider.as_encrypted_compaction().is_some_and(|item| {
+                item.id.as_deref() == Some("cmp_actor")
+                    && item.encrypted_content == "encrypted-actor-context"
+            })
     ));
 }
 
@@ -1274,6 +1319,7 @@ async fn update_sampling_config_is_queryable() {
         temperature: Some(0.5),
         top_p: None,
         api_backend: Default::default(),
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -1661,6 +1707,7 @@ async fn build_request_uses_sampling_config() {
         temperature: Some(0.7),
         top_p: Some(0.9),
         api_backend: Default::default(),
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -1680,6 +1727,39 @@ async fn build_request_uses_sampling_config() {
     assert_eq!(request.temperature, Some(0.7));
     assert_eq!(request.max_output_tokens, Some(8192));
     assert_eq!(request.top_p, Some(0.9));
+}
+
+#[tokio::test]
+async fn build_request_attaches_turn_routing_state_only_for_capable_provider() {
+    let mut supported_config = test_config();
+    supported_config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string();
+    let supported = TestHarness::with_config(vec![], supported_config);
+    supported.handle.begin_turn_routing_scope();
+    let state = supported.handle.get_turn_routing_state().await.unwrap();
+    assert!(state.capture_first("supported-state".to_string()));
+    let request = supported
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        request
+            .turn_routing_state
+            .as_ref()
+            .and_then(|state| state.value()),
+        Some("supported-state")
+    );
+
+    let unsupported = TestHarness::new();
+    unsupported.handle.begin_turn_routing_scope();
+    let state = unsupported.handle.get_turn_routing_state().await.unwrap();
+    assert!(state.capture_first("must-not-attach".to_string()));
+    let request = unsupported
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    assert!(request.turn_routing_state.is_none());
 }
 
 #[tokio::test]
@@ -2546,20 +2626,23 @@ async fn live_cancel_after_partial_tool_results_repairs_remaining() {
 // ============================================================================
 
 #[tokio::test]
-async fn codex_turn_state_is_fresh_per_turn_and_stable_within_turn() {
+async fn turn_routing_state_is_fresh_per_turn_and_stable_within_turn() {
     let h = TestHarness::new();
 
-    h.handle.begin_codex_turn();
-    let first = h.handle.get_codex_turn_state().await.unwrap();
-    first.set("sticky-first".to_string()).unwrap();
-    let continuation = h.handle.get_codex_turn_state().await.unwrap();
-    assert!(std::sync::Arc::ptr_eq(&first, &continuation));
-    assert_eq!(continuation.get().map(String::as_str), Some("sticky-first"));
+    h.handle.begin_turn_routing_scope();
+    let first = h.handle.get_turn_routing_state().await.unwrap();
+    assert!(first.capture_first("sticky-first".to_string()));
+    let continuation = h.handle.get_turn_routing_state().await.unwrap();
+    assert_eq!(continuation.value(), Some("sticky-first"));
 
-    h.handle.begin_codex_turn();
-    let second = h.handle.get_codex_turn_state().await.unwrap();
-    assert!(!std::sync::Arc::ptr_eq(&first, &second));
-    assert!(second.get().is_none(), "turn state must never cross turns");
+    h.handle.begin_turn_routing_scope();
+    let second = h.handle.get_turn_routing_state().await.unwrap();
+    assert!(
+        second.value().is_none(),
+        "routing state must never cross turns"
+    );
+    assert!(second.capture_first("sticky-second".to_string()));
+    assert_eq!(first.value(), Some("sticky-first"));
 }
 
 #[tokio::test]
@@ -3827,6 +3910,7 @@ async fn sampling_config_survives_compaction_replacement() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -3913,6 +3997,7 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: Default::default(),
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -4005,6 +4090,7 @@ async fn context_window_downgrade_triggers_auto_compact() {
         temperature: Some(0.7),
         top_p: Some(0.95),
         api_backend: ApiBackend::Responses,
+        provider_id: None,
         extra_headers: Default::default(),
         query_params: Default::default(),
         env_http_headers: Default::default(),
@@ -4852,4 +4938,357 @@ async fn repair_history_command_refused_while_turn_active() {
         .unwrap()
         .unwrap();
     assert_eq!(report.stripped_tool_result_ids, vec!["call_ORPHAN"]);
+}
+
+fn identity_transition_config(model: &str) -> SamplingConfig {
+    let mut config = test_config();
+    config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+    config.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    config.model = model.into();
+    config.extra_headers.insert(
+        xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+        "acct-transition".into(),
+    );
+    config
+}
+
+fn identity_transition_identity(model: &str) -> xai_grok_sampling_types::SamplingIdentity {
+    xai_grok_sampling_types::SamplingIdentity::from_sampling_config(&identity_transition_config(
+        model,
+    ))
+}
+
+fn identity_transition_target(model: &str) -> xai_grok_sampling_types::ResolvedSamplingTarget {
+    xai_grok_sampling_types::ResolvedSamplingTarget::new(
+        identity_transition_config(model),
+        identity_transition_identity(model),
+    )
+    .unwrap()
+}
+
+#[test]
+fn resolved_sampling_target_rejects_route_model_mismatch() {
+    let error = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+        identity_transition_config("gpt-config"),
+        identity_transition_identity("gpt-identity"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("does not match"));
+}
+
+fn identity_transition_sidecar(model: &str) -> ConversationItem {
+    ConversationItem::response_output_metadata(
+        xai_grok_sampling_types::ResponseOutputItemMetadata {
+            response_id: "resp-transition".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+                xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+                model,
+                Some("acct-transition".into()),
+            ),
+        },
+    )
+}
+
+fn identity_transition_native_history() -> Vec<ConversationItem> {
+    let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
+        "gpt-old",
+        Some("acct-transition".into()),
+    );
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+        item_id: Some("cmp-transition".into()),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    vec![
+        ConversationItem::native_compaction_metadata(compatibility),
+        ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-transition".into()),
+                encrypted_content: "opaque".into(),
+            },
+        ),
+    ]
+}
+
+fn transition_credentials(key: &str) -> crate::types::Credentials {
+    crate::types::Credentials {
+        api_key: Some(key.into()),
+        auth_type: crate::types::AuthType::ApiKey,
+        alpha_test_key: Some(format!("alpha-{key}")),
+        client_version: Some(format!("client-{key}")),
+    }
+}
+
+#[tokio::test]
+async fn rejected_sampling_transition_leaves_history_config_and_credentials_inert() {
+    let h = TestHarness::with_config(
+        identity_transition_native_history(),
+        identity_transition_config("gpt-old"),
+    );
+    h.handle.update_credentials(transition_credentials("old"));
+    let before = h.handle.get_sampling_state().await.unwrap();
+    let history_before = serde_json::to_vec(&h.handle.get_conversation().await).unwrap();
+
+    let result = h
+        .handle
+        .transition_sampling_state(
+            identity_transition_target("gpt-other"),
+            transition_credentials("new"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(crate::types::SamplingTransitionError::History(
+            xai_grok_sampling_types::SamplingIdentityHistoryError::IncompatibleNativeHistory
+        ))
+    ));
+
+    let after = h.handle.get_sampling_state().await.unwrap();
+    assert_eq!(after.config.model, before.config.model);
+    assert_eq!(after.credentials.api_key, before.credentials.api_key);
+    assert_eq!(
+        serde_json::to_vec(&h.handle.get_conversation().await).unwrap(),
+        history_before
+    );
+}
+
+#[tokio::test]
+async fn sampling_transition_validates_the_supplied_runtime_identity() {
+    let runtime_sidecar = ConversationItem::response_output_metadata(
+        xai_grok_sampling_types::ResponseOutputItemMetadata {
+            response_id: "resp-runtime-account".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+                xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+                "gpt-old",
+                Some("acct-runtime".into()),
+            ),
+        },
+    );
+    let h = TestHarness::with_config(vec![runtime_sidecar], identity_transition_config("gpt-old"));
+    let runtime_identity = xai_grok_sampling_types::SamplingIdentity::new(
+        xai_grok_sampling_types::ApiBackend::Responses,
+        xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+        "gpt-old",
+        Some("acct-runtime".into()),
+    );
+
+    let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+        identity_transition_config("gpt-old"),
+        runtime_identity,
+    )
+    .unwrap();
+    let result = h
+        .handle
+        .transition_sampling_state(target, transition_credentials("new"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!result.history_changed);
+    assert_eq!(h.handle.get_conversation().await.len(), 1);
+}
+
+#[tokio::test]
+async fn same_identity_atomically_updates_config_and_credentials_without_persistence() {
+    let mut h = TestHarness::with_config(
+        vec![identity_transition_sidecar("gpt-old")],
+        identity_transition_config("gpt-old"),
+    );
+    let mut proposed = identity_transition_config("gpt-old");
+    proposed.temperature = Some(0.25);
+    let target = xai_grok_sampling_types::ResolvedSamplingTarget::new(
+        proposed,
+        identity_transition_identity("gpt-old"),
+    )
+    .unwrap();
+    let result = h
+        .handle
+        .transition_sampling_state(target, transition_credentials("new"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!result.history_changed);
+    assert!(matches!(
+        result.persistence,
+        crate::types::SamplingTransitionPersistence::NotRequired
+    ));
+    let state = h.handle.get_sampling_state().await.unwrap();
+    assert_eq!(state.config.temperature, Some(0.25));
+    assert_eq!(state.credentials.api_key.as_deref(), Some("new"));
+    assert!(
+        h.persistence_rx
+            .drain()
+            .into_iter()
+            .all(|record| !matches!(record, PersistenceRecord::AcknowledgedReplaceHistory(_)))
+    );
+}
+
+#[tokio::test]
+async fn stripped_sampling_transition_waits_for_ack_and_not_committed_is_inert() {
+    let mut h = TestHarness::with_manual_history_replacement_ack(
+        vec![identity_transition_sidecar("gpt-old")],
+        identity_transition_config("gpt-old"),
+    );
+    h.handle.update_credentials(transition_credentials("old"));
+    let _ = h.handle.get_sampling_state().await;
+
+    let handle = h.handle.clone();
+    let transition = tokio::spawn(async move {
+        handle
+            .transition_sampling_state(
+                identity_transition_target("gpt-new"),
+                transition_credentials("new"),
+            )
+            .await
+            .unwrap()
+    });
+    let ack = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.persistence_rx.next_history_replacement_ack(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !transition.is_finished(),
+        "transition must wait for persistence"
+    );
+    ack.send(Err(crate::ReplaceHistoryError::NotCommitted(
+        std::io::Error::other("injected not committed"),
+    )))
+    .unwrap();
+    assert!(matches!(
+        transition.await.unwrap(),
+        Err(crate::types::SamplingTransitionError::HistoryReplacementNotCommitted(_))
+    ));
+    let state = h.handle.get_sampling_state().await.unwrap();
+    assert_eq!(state.config.model, "gpt-old");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("old"));
+    assert_eq!(h.handle.get_conversation().await.len(), 1);
+}
+
+#[tokio::test]
+async fn sampling_transition_timeout_is_inert_ignores_late_ack_and_unblocks_actor() {
+    let mut h = TestHarness::with_manual_history_replacement_ack_timeout(
+        vec![identity_transition_sidecar("gpt-old")],
+        identity_transition_config("gpt-old"),
+        Duration::from_millis(10),
+    );
+    h.handle.update_credentials(transition_credentials("old"));
+    let _ = h.handle.get_sampling_state().await;
+
+    let handle = h.handle.clone();
+    let transition = tokio::spawn(async move {
+        handle
+            .transition_sampling_state(
+                identity_transition_target("gpt-new"),
+                transition_credentials("new"),
+            )
+            .await
+            .unwrap()
+    });
+    let late_ack = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.persistence_rx.next_history_replacement_ack(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let result = transition.await.unwrap();
+    assert!(matches!(
+        result,
+        Err(crate::types::SamplingTransitionError::HistoryReplacementIndeterminate(ref error))
+            if error.kind() == std::io::ErrorKind::TimedOut
+    ));
+
+    let state = tokio::time::timeout(Duration::from_secs(1), h.handle.get_sampling_state())
+        .await
+        .expect("actor must process subsequent commands after timeout")
+        .unwrap();
+    assert_eq!(state.config.model, "gpt-old");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("old"));
+    assert_eq!(h.handle.get_conversation().await.len(), 1);
+
+    assert!(
+        late_ack
+            .send(Ok(crate::ReplaceHistoryAck::Committed))
+            .is_err(),
+        "late acknowledgement receiver must be gone"
+    );
+    let state = h.handle.get_sampling_state().await.unwrap();
+    assert_eq!(state.config.model, "gpt-old");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("old"));
+}
+
+#[tokio::test]
+async fn stripped_sampling_transition_installs_only_after_committed_ack() {
+    let mut h = TestHarness::with_manual_history_replacement_ack(
+        vec![
+            identity_transition_sidecar("gpt-old"),
+            ConversationItem::user("semantic history"),
+        ],
+        identity_transition_config("gpt-old"),
+    );
+    let handle = h.handle.clone();
+    let transition = tokio::spawn(async move {
+        handle
+            .transition_sampling_state(
+                identity_transition_target("gpt-new"),
+                transition_credentials("new"),
+            )
+            .await
+            .unwrap()
+    });
+    let ack = tokio::time::timeout(
+        Duration::from_secs(1),
+        h.persistence_rx.next_history_replacement_ack(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !transition.is_finished(),
+        "transition must wait for persistence"
+    );
+    ack.send(Ok(
+        crate::ReplaceHistoryAck::CommittedWithBookkeepingWarning(std::io::Error::other(
+            "injected bookkeeping warning",
+        )),
+    ))
+    .unwrap();
+    let applied = transition.await.unwrap().unwrap();
+    assert!(applied.history_changed);
+    assert!(matches!(
+        applied.persistence,
+        crate::types::SamplingTransitionPersistence::CommittedWithBookkeepingWarning(_)
+    ));
+    let state = h.handle.get_sampling_state().await.unwrap();
+    assert_eq!(state.config.model, "gpt-new");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("new"));
+    let history = h.handle.get_conversation().await;
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0], ConversationItem::User(_)));
+}
+
+#[tokio::test]
+async fn history_replacement_ack_timeout_is_indeterminate() {
+    let (_sender, receiver) = tokio::sync::oneshot::channel();
+    let error = await_history_replacement_ack(receiver, Duration::from_millis(5))
+        .await
+        .unwrap_err();
+    match error {
+        crate::ReplaceHistoryError::Indeterminate(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+        crate::ReplaceHistoryError::NotCommitted(error) => {
+            panic!("timeout must be indeterminate, got not committed: {error}");
+        }
+    }
 }

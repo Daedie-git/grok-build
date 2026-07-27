@@ -19,10 +19,8 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::Assistant(_) => "assistant",
         ConversationItem::ToolResult(_) => "tool_result",
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
-        ConversationItem::ResponseOutputMetadata(_) => "response_output_metadata",
+        ConversationItem::Provider(_) => "provider",
         ConversationItem::Reasoning(_) => "reasoning",
-        ConversationItem::NativeCompactionMetadata(_) => "native_compaction_metadata",
-        ConversationItem::Compaction(_) => "compaction",
     }
 }
 
@@ -332,21 +330,25 @@ impl ChatStateActor {
                 ConversationItem::Assistant(a) => a.content.len(),
                 ConversationItem::ToolResult(tr) => tr.content.len(),
                 ConversationItem::BackendToolCall(b) => b.text_summary().len(),
-                ConversationItem::ResponseOutputMetadata(_) => 0,
+                ConversationItem::Provider(provider) => {
+                    if let Some(metadata) = provider.as_native_compaction_metadata() {
+                        metadata.model.len()
+                            + metadata.backend_family.len()
+                            + metadata
+                                .chatgpt_account_id
+                                .as_deref()
+                                .map(str::len)
+                                .unwrap_or(0)
+                    } else if let Some(item) = provider.as_encrypted_compaction() {
+                        item.encrypted_content.len()
+                    } else {
+                        0
+                    }
+                }
                 ConversationItem::Reasoning(r) => {
                     xai_grok_sampling_types::reasoning_item_text(r).len()
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
                 }
-                ConversationItem::NativeCompactionMetadata(metadata) => {
-                    metadata.model.len()
-                        + metadata.backend_family.len()
-                        + metadata
-                            .chatgpt_account_id
-                            .as_deref()
-                            .map(str::len)
-                            .unwrap_or(0)
-                }
-                ConversationItem::Compaction(item) => item.encrypted_content.len(),
             })
             .sum()
     }

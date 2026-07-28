@@ -1342,23 +1342,70 @@ pub fn captured_response_to_conversation_items(
     }
 
     if require_exact {
-        if let Some(last_message_index) = exact_message_indices.last().copied() {
-            let ConversationItem::Assistant(assistant) = &mut items[last_message_index] else {
-                unreachable!("exact message index must identify an assistant item");
+        let tool_call_ids: std::collections::HashSet<String> = tool_calls
+            .iter()
+            .map(|call| call.id.as_ref().to_owned())
+            .collect();
+        let tool_owner_index =
+            if let Some(last_message_index) = exact_message_indices.last().copied() {
+                let ConversationItem::Assistant(assistant) = &mut items[last_message_index] else {
+                    unreachable!("exact message index must identify an assistant item");
+                };
+                assistant.tool_calls = tool_calls;
+                assistant.model_id = Some(model_id);
+                assistant.model_fingerprint = model_fingerprint;
+                assistant.reasoning_effort = reasoning_effort;
+                last_message_index
+            } else {
+                items.push(ConversationItem::Assistant(AssistantItem {
+                    content: std::sync::Arc::<str>::from(content),
+                    response_item_id,
+                    tool_calls,
+                    model_id: Some(model_id),
+                    model_fingerprint,
+                    reasoning_effort,
+                }));
+                items.len() - 1
             };
-            assistant.tool_calls = tool_calls;
-            assistant.model_id = Some(model_id);
-            assistant.model_fingerprint = model_fingerprint;
-            assistant.reasoning_effort = reasoning_effort;
-        } else {
-            items.push(ConversationItem::Assistant(AssistantItem {
-                content: std::sync::Arc::<str>::from(content),
-                response_item_id,
-                tool_calls,
-                model_id: Some(model_id),
-                model_fingerprint,
-                reasoning_effort,
-            }));
+
+        if !tool_call_ids.is_empty() {
+            // Exact manifests restore provider wire order independently of
+            // durable order. Results for calls from an earlier response must
+            // remain before this response's tool owner; results for the new
+            // calls must follow it. Keep all other provider output siblings
+            // before the owner so hosted-tool outputs cannot become generic
+            // assistant-message boundaries inside the result run.
+            let assistant = items.remove(tool_owner_index);
+            let mut previous_results = Vec::new();
+            let mut siblings = Vec::new();
+            let mut owned_results = Vec::new();
+            for item in items {
+                match &item {
+                    ConversationItem::ToolResult(result)
+                        if tool_call_ids.contains(&result.tool_call_id) =>
+                    {
+                        owned_results.push(item);
+                    }
+                    ConversationItem::ToolResult(_) => previous_results.push(item),
+                    _ => siblings.push(item),
+                }
+            }
+            items = previous_results;
+            items.extend(siblings);
+            items.push(assistant);
+            items.extend(owned_results);
+        } else if items
+            .iter()
+            .any(|item| matches!(item, ConversationItem::ToolResult(_)))
+        {
+            // With no new function calls, every captured result belongs to an
+            // earlier owner. Put those results before this response's semantic
+            // outputs, which may project to generic assistant messages.
+            let (previous_results, siblings): (Vec<_>, Vec<_>) = items
+                .into_iter()
+                .partition(|item| matches!(item, ConversationItem::ToolResult(_)));
+            items = previous_results;
+            items.extend(siblings);
         }
     } else {
         items.push(ConversationItem::Assistant(AssistantItem {
@@ -2451,6 +2498,385 @@ mod tests {
             assert_eq!(
                 input[4]["internal_chat_message_metadata_passthrough"]["turn_id"],
                 "turn-4"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_response_keeps_tool_owner_paired_with_later_result() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs-before", "summary": [],
+                    "encrypted_content": "cipher-before", "status": "completed"
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "message", "id": "msg-tool-owner", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "running", "annotations": []}]
+                }),
+                &origin,
+            ),
+            captured_item(
+                2,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs-after", "summary": [],
+                    "encrypted_content": "cipher-after", "status": "completed"
+                }),
+                &origin,
+            ),
+            captured_item(
+                3,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc-tool", "call_id": "call-tool",
+                    "name": "run_terminal_command", "arguments": "{}"
+                }),
+                &origin,
+            ),
+        ];
+        let mut response = completed_response();
+        response.id = "resp-tool-owner".into();
+        let mut durable = captured_response_to_conversation_items(response, output).unwrap();
+
+        assert!(matches!(
+            durable.as_slice(),
+            [
+                ConversationItem::Provider(_),
+                ConversationItem::Reasoning(_),
+                ConversationItem::Reasoning(_),
+                ConversationItem::Assistant(_),
+            ]
+        ));
+        let ConversationItem::Assistant(assistant) = durable.last().unwrap() else {
+            panic!("tool-owning assistant must end the durable response group");
+        };
+        assert_eq!(
+            assistant.response_item_id.as_deref(),
+            Some("msg-tool-owner")
+        );
+        assert_eq!(assistant.tool_calls[0].id.as_ref(), "call-tool");
+
+        let mut output_response = completed_response();
+        output_response.id = "resp-tool-output".into();
+        durable.extend(
+            captured_response_to_conversation_items(
+                output_response,
+                vec![
+                    captured_item(
+                        0,
+                        serde_json::json!({
+                            "type": "web_search_call", "id": "ws-output-group",
+                            "status": "completed",
+                            "action": {"type": "search", "query": "status", "sources": []}
+                        }),
+                        &origin,
+                    ),
+                    captured_item(
+                        1,
+                        serde_json::json!({
+                            "type": "function_call_output", "id": "fco-tool",
+                            "call_id": "call-tool", "output": "exit: 0"
+                        }),
+                        &origin,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            durable.as_slice(),
+            [
+                ConversationItem::Provider(_),
+                ConversationItem::Reasoning(_),
+                ConversationItem::Reasoning(_),
+                ConversationItem::Assistant(_),
+                ConversationItem::Provider(_),
+                ConversationItem::ToolResult(_),
+                ConversationItem::BackendToolCall(_),
+                ConversationItem::Assistant(_),
+            ]
+        ));
+        assert!(!crate::has_dangling_tool_calls(&durable));
+        assert_eq!(
+            crate::repair_dangling_tool_calls(
+                &mut durable,
+                crate::DanglingToolCallReason::UserCancelled,
+            ),
+            0,
+            "history repair must not synthesize a cancellation inside the response group"
+        );
+
+        let cold: Vec<ConversationItem> =
+            serde_json::from_slice(&serde_json::to_vec(&durable).unwrap()).unwrap();
+        let request = ConversationRequest {
+            items: cold,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = [
+            ("reasoning", Some("rs-before"), None),
+            ("message", Some("msg-tool-owner"), None),
+            ("reasoning", Some("rs-after"), None),
+            ("function_call", Some("fc-tool"), Some("call-tool")),
+            ("web_search_call", Some("ws-output-group"), None),
+            ("function_call_output", Some("fco-tool"), Some("call-tool")),
+        ];
+        for wire in [&ordinary, &compact] {
+            assert_eq!(
+                wire["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(input_identity)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        // Recover histories written before the tool-owning Assistant was moved
+        // to the end of its response group. Integrity repair used to insert a
+        // synthetic cancellation before the trailing reasoning sibling, then
+        // the real result arrived after it.
+        let mut poisoned = durable;
+        let assistant = poisoned.remove(3);
+        poisoned.insert(2, assistant);
+        poisoned.insert(
+            3,
+            ConversationItem::tool_result(
+                "call-tool",
+                "Tool execution was cancelled by the user (tool `run_terminal_command` was not executed).",
+            ),
+        );
+        assert_eq!(crate::dedup_duplicate_tool_results(&mut poisoned), 1);
+        assert!(!crate::has_dangling_tool_calls(&poisoned));
+        assert_eq!(
+            crate::repair_dangling_tool_calls(
+                &mut poisoned,
+                crate::DanglingToolCallReason::UserCancelled,
+            ),
+            0
+        );
+        let recovered = ConversationRequest {
+            items: poisoned,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ordinary_wire(&recovered, &origin)["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(input_identity)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn exact_response_places_tool_owner_before_captured_result() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs-mixed", "summary": [],
+                    "encrypted_content": "cipher-mixed", "status": "completed"
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc-mixed", "call_id": "call-mixed",
+                    "name": "read_file", "arguments": "{}"
+                }),
+                &origin,
+            ),
+            captured_item(
+                2,
+                serde_json::json!({
+                    "type": "function_call_output", "id": "fco-mixed",
+                    "call_id": "call-mixed", "output": "contents"
+                }),
+                &origin,
+            ),
+        ];
+        let mut response = completed_response();
+        response.id = "resp-mixed-call-output".into();
+        let mut durable = captured_response_to_conversation_items(response, output).unwrap();
+
+        assert!(matches!(
+            durable.as_slice(),
+            [
+                ConversationItem::Provider(_),
+                ConversationItem::Reasoning(_),
+                ConversationItem::Assistant(_),
+                ConversationItem::ToolResult(_),
+            ]
+        ));
+        assert!(!crate::has_dangling_tool_calls(&durable));
+        assert_eq!(
+            crate::repair_dangling_tool_calls(
+                &mut durable,
+                crate::DanglingToolCallReason::UserCancelled,
+            ),
+            0
+        );
+
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = [
+            ("reasoning", Some("rs-mixed"), None),
+            ("function_call", Some("fc-mixed"), Some("call-mixed")),
+            (
+                "function_call_output",
+                Some("fco-mixed"),
+                Some("call-mixed"),
+            ),
+        ];
+        for wire in [&ordinary, &compact] {
+            assert_eq!(
+                wire["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(input_identity)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn exact_mixed_response_keeps_previous_and_new_results_with_their_owners() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let mut first_response = completed_response();
+        first_response.id = "resp-previous-call".into();
+        let mut durable = captured_response_to_conversation_items(
+            first_response,
+            vec![captured_item(
+                0,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc-previous",
+                    "call_id": "call-previous", "name": "read_file", "arguments": "{}"
+                }),
+                &origin,
+            )],
+        )
+        .unwrap();
+
+        let mut mixed_response = completed_response();
+        mixed_response.id = "resp-mixed-owners".into();
+        durable.extend(
+            captured_response_to_conversation_items(
+                mixed_response,
+                vec![
+                    captured_item(
+                        0,
+                        serde_json::json!({
+                            "type": "function_call", "id": "fc-new",
+                            "call_id": "call-new", "name": "grep", "arguments": "{}"
+                        }),
+                        &origin,
+                    ),
+                    captured_item(
+                        1,
+                        serde_json::json!({
+                            "type": "function_call_output", "id": "fco-new",
+                            "call_id": "call-new", "output": "new result"
+                        }),
+                        &origin,
+                    ),
+                    captured_item(
+                        2,
+                        serde_json::json!({
+                            "type": "function_call_output", "id": "fco-previous",
+                            "call_id": "call-previous", "output": "previous result"
+                        }),
+                        &origin,
+                    ),
+                ],
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            durable.as_slice(),
+            [
+                ConversationItem::Provider(_),
+                ConversationItem::Assistant(_),
+                ConversationItem::Provider(_),
+                ConversationItem::ToolResult(previous),
+                ConversationItem::Assistant(_),
+                ConversationItem::ToolResult(new),
+            ] if previous.tool_call_id == "call-previous" && new.tool_call_id == "call-new"
+        ));
+        assert!(!crate::has_dangling_tool_calls(&durable));
+        assert_eq!(
+            crate::repair_dangling_tool_calls(
+                &mut durable,
+                crate::DanglingToolCallReason::UserCancelled,
+            ),
+            0
+        );
+
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let expected = [
+            ("function_call", Some("fc-previous"), Some("call-previous")),
+            ("function_call", Some("fc-new"), Some("call-new")),
+            ("function_call_output", Some("fco-new"), Some("call-new")),
+            (
+                "function_call_output",
+                Some("fco-previous"),
+                Some("call-previous"),
+            ),
+        ];
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        for wire in [&ordinary, &compact] {
+            assert_eq!(
+                wire["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(input_identity)
+                    .collect::<Vec<_>>(),
+                expected
             );
         }
     }

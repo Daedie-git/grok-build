@@ -3069,6 +3069,23 @@ pub enum DanglingToolCallReason {
     HarnessHalted { class: &'static str },
 }
 
+/// Whether an item may sit between a tool-owning `Assistant` and its following
+/// `ToolResult` run without ending the assistant turn.
+///
+/// Responses providers persist reasoning as sibling conversation items, and
+/// exact-response manifests are provider-only ordering metadata that can begin
+/// a later response group containing the real results. Neither item emits a
+/// generic assistant-message boundary, so neither should make integrity repair
+/// invent a dangling tool result. Hosted backend-tool calls are deliberately
+/// excluded because Chat Completions projects them as assistant messages.
+pub fn is_tool_result_run_transparent(item: &ConversationItem) -> bool {
+    match item {
+        ConversationItem::Reasoning(_) => true,
+        ConversationItem::Provider(provider) => provider.is_response_output_metadata(),
+        _ => false,
+    }
+}
+
 /// Insert synthetic `ToolResult` items for any tool calls that lack a result.
 ///
 /// When a turn is cancelled mid-tool-execution, the conversation can have an
@@ -3077,8 +3094,9 @@ pub enum DanglingToolCallReason {
 ///
 /// Scans the entire conversation front-to-back. For every assistant message
 /// that has `tool_calls`, it checks which calls are answered by the
-/// immediately following `ToolResult` items and inserts synthetic results
-/// for any that are missing, preserving the original call order. `reason`
+/// following `ToolResult` run (allowing assistant-output siblings between the
+/// owner and results) and inserts synthetic results for any that are missing,
+/// preserving the original call order. `reason`
 /// controls the wording of those synthetic results.
 ///
 /// A full scan is necessary because old sessions (or sessions that switched
@@ -3106,12 +3124,16 @@ pub fn repair_dangling_tool_calls(
                 .map(|tc| (tc.id.clone(), tc.name.clone()))
                 .collect();
 
-            // Collect answered IDs from the immediately following ToolResult items.
+            // Collect answered IDs from the following ToolResult run. Responses
+            // reasoning siblings and exact-response manifests do not emit a
+            // generic message boundary, so they are transparent to pairing.
             let mut answered = std::collections::HashSet::new();
             let mut j = i + 1;
             while j < conversation.len() {
                 if let ConversationItem::ToolResult(tr) = &conversation[j] {
                     answered.insert(tr.tool_call_id.clone());
+                    j += 1;
+                } else if is_tool_result_run_transparent(&conversation[j]) {
                     j += 1;
                 } else {
                     break;
@@ -3150,11 +3172,11 @@ pub fn repair_dangling_tool_calls(
 
 /// Read-only counterpart to [`repair_dangling_tool_calls`]: returns `true` if
 /// any assistant message has a tool call that is not answered by a `ToolResult`
-/// in the immediately-following run of results.
+/// in the following run of results and assistant-output siblings.
 ///
 /// Lets callers decide whether the repair *would* fire (and therefore already
 /// signal a cancellation to the model) without mutating the conversation. Uses
-/// the same forward-scan / immediately-following-results logic as
+/// the same forward-scan / result-run logic as
 /// [`repair_dangling_tool_calls`], short-circuiting on the first unanswered call.
 pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
     let mut i = 0;
@@ -3162,12 +3184,15 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
         if let ConversationItem::Assistant(a) = &conversation[i]
             && !a.tool_calls.is_empty()
         {
-            // Collect answered IDs from the immediately following ToolResults.
+            // Collect answered IDs from the following ToolResult run while
+            // allowing assistant-output siblings between the owner and result.
             let mut answered = std::collections::HashSet::new();
             let mut j = i + 1;
             while j < conversation.len() {
                 if let ConversationItem::ToolResult(tr) = &conversation[j] {
                     answered.insert(tr.tool_call_id.clone());
+                    j += 1;
+                } else if is_tool_result_run_transparent(&conversation[j]) {
                     j += 1;
                 } else {
                     break;
@@ -3207,10 +3232,11 @@ fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) ->
 /// entries sharing the same `tool_call_id`.  The LLM API rejects this with
 /// "each tool_use must have a single result".
 ///
-/// This function scans the `ToolResult` items immediately following each
-/// assistant message.  If a `tool_call_id` appears more than once, only the
-/// **last** occurrence is kept (the real result), and earlier duplicates are
-/// removed.
+/// This function scans the `ToolResult` run following each assistant message,
+/// allowing Responses reasoning siblings and exact-response manifests inside
+/// that run. If a `tool_call_id` appears more than once, only the **last**
+/// occurrence is kept
+/// (the real result), and earlier duplicates are removed.
 ///
 /// Returns the number of duplicate entries removed.
 pub fn dedup_duplicate_tool_results(conversation: &mut Vec<ConversationItem>) -> usize {
@@ -3222,11 +3248,15 @@ pub fn dedup_duplicate_tool_results(conversation: &mut Vec<ConversationItem>) ->
         if let ConversationItem::Assistant(a) = &conversation[i]
             && !a.tool_calls.is_empty()
         {
-            // Scan the run of ToolResult items immediately after.
+            // Scan the following ToolResult run. Assistant-output siblings are
+            // transparent so a stale synthetic result can be deduplicated
+            // against the real result on the far side of provider reasoning.
             let start = i + 1;
             let mut end = start;
             while end < conversation.len() {
-                if matches!(&conversation[end], ConversationItem::ToolResult(_)) {
+                if matches!(&conversation[end], ConversationItem::ToolResult(_))
+                    || is_tool_result_run_transparent(&conversation[end])
+                {
                     end += 1;
                 } else {
                     break;
@@ -7742,6 +7772,22 @@ mod tests {
         })
     }
 
+    fn backend_search_call() -> ConversationItem {
+        let output: rs::OutputItem = serde_json::from_value(serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws-boundary",
+            "status": "completed",
+            "action": {"type": "search", "query": "query", "sources": []}
+        }))
+        .unwrap();
+        let rs::OutputItem::WebSearchCall(call) = output else {
+            unreachable!("test fixture must be a web-search call");
+        };
+        ConversationItem::BackendToolCall(BackendToolCallItem {
+            kind: BackendToolKind::WebSearch(call),
+        })
+    }
+
     #[test]
     fn test_repair_no_tool_calls() {
         let mut conv = vec![
@@ -7808,6 +7854,30 @@ mod tests {
             assistant_with_calls(&[("c1", "a"), ("c2", "b")]),
             ConversationItem::tool_result("c1", "ok"),
         ]));
+    }
+
+    #[test]
+    fn backend_tool_call_remains_a_generic_result_boundary() {
+        let mut conv = vec![
+            assistant_with_calls(&[("c1", "read_file")]),
+            backend_search_call(),
+            ConversationItem::tool_result("c1", "displaced"),
+        ];
+        let messages = conversation_to_chat_messages(conv.clone());
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[2].role, Role::Tool);
+
+        assert!(has_dangling_tool_calls(&conv));
+        assert_eq!(
+            repair_dangling_tool_calls(&mut conv, DanglingToolCallReason::UserCancelled),
+            1
+        );
+        assert_matches!(&conv[1], ConversationItem::ToolResult(result) => {
+            assert_eq!(result.tool_call_id, "c1");
+        });
+        assert!(matches!(conv[2], ConversationItem::BackendToolCall(_)));
     }
 
     #[test]

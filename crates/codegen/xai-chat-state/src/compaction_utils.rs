@@ -4,7 +4,9 @@
 //! no I/O, no actor state. They live in `xai-chat-state` so that both
 //! this crate and `xai-grok-shell` can share them without duplication.
 use std::collections::BTreeSet;
-use xai_grok_sampling_types::{ContentPart, ConversationItem, ToolResultItem};
+use xai_grok_sampling_types::{
+    ContentPart, ConversationItem, ToolResultItem, is_tool_result_run_transparent,
+};
 /// Drops tool results and flattens assistant `tool_calls` into
 /// `[Called tools: ...]` text annotations.
 ///
@@ -1009,14 +1011,15 @@ pub fn repair_history(items: &mut Vec<ConversationItem>) -> HistoryRepairReport 
         synthetic_results_inserted,
     }
 }
-/// Strip `ToolResult`s that are not in the contiguous run immediately
-/// following the `Assistant` declaring their `tool_call_id` — both orphans
-/// (owner gone: the bricked-session case) and displaced results. Returns the
+/// Strip `ToolResult`s that are not in the result run following the `Assistant`
+/// declaring their `tool_call_id` — both orphans (owner gone: the
+/// bricked-session case) and displaced results. Responses reasoning siblings
+/// and exact-response manifests are transparent within that run. Returns the
 /// stripped ids in order.
 ///
 /// Deliberately stricter than [`sanitize_compacted_history`]'s "matching id
-/// anywhere before" (providers require adjacency), and deliberately the same
-/// contiguous-run rule as [`repair_dangling_tool_calls`] /
+/// anywhere before" and deliberately uses the same result-run rule as
+/// [`repair_dangling_tool_calls`] /
 /// [`dedup_duplicate_tool_results`] so the [`repair_history`] passes agree on
 /// which calls are answered (a leniency mismatch would make the dangling pass
 /// insert synthetic duplicates next to kept results).
@@ -1040,6 +1043,7 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
                 false
             }
         }
+        item if is_tool_result_run_transparent(item) => true,
         _ => {
             run_ids.clear();
             true
@@ -2466,6 +2470,40 @@ actual user question";
             other => panic!("expected tool result, got {other:?}"),
         }
     }
+    #[test]
+    fn repair_history_keeps_results_across_response_siblings() {
+        use xai_grok_sampling_types::{ResponseOutputItemMetadata, rs};
+
+        let mut items = vec![
+            ConversationItem::assistant_tool_calls(vec![call("call_A")]),
+            ConversationItem::tool_result("call_A", "stale synthetic cancellation"),
+            ConversationItem::Reasoning(rs::ReasoningItem {
+                id: "rs-after-message".into(),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("cipher".into()),
+                status: None,
+            }),
+            ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+                response_id: "resp-output".into(),
+                output_items: 0,
+                items: vec![],
+                origin: None,
+            }),
+            ConversationItem::tool_result("call_A", "real result"),
+        ];
+        let report = repair_history(&mut items);
+        assert_eq!(report.duplicates_removed, 1);
+        assert!(report.stripped_tool_result_ids.is_empty());
+        assert_eq!(report.synthetic_results_inserted, 0);
+        assert!(matches!(items[1], ConversationItem::Reasoning(_)));
+        assert!(matches!(items[2], ConversationItem::Provider(_)));
+        let ConversationItem::ToolResult(result) = &items[3] else {
+            panic!("real result must remain after the response siblings");
+        };
+        assert_eq!(result.content.as_ref(), "real result");
+    }
+
     #[test]
     fn repair_history_is_noop_and_idempotent_on_valid_history() {
         let valid = vec![

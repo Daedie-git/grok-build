@@ -342,4 +342,3 @@ Always-approve:   Ctrl+O (toggle YOLO)
 New session:      Ctrl+N (press again, then choose normal/worktree)
 Quit:             Ctrl+Q (or Ctrl+D in VSCode)
 ```
-

@@ -430,8 +430,7 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`,
-/// skipping unset/blank/invalid entries and trimming values.
+/// Resolve `env_http_headers` (`header -> env var`) into `headers` via `getenv`, skipping unset/blank/invalid entries and trimming values.
 fn apply_env_http_headers(
     env_http_headers: &IndexMap<String, String>,
     getenv: impl Fn(&str) -> Option<String>,

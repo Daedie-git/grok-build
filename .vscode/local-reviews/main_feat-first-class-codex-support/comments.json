@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "sourceBranch": "main",
-  "targetBranch": "feat/first-class-codex-support",
-  "sourceCommit": "6e386420825bd44ae648c63e7c8cba12fcec9401",
-  "targetCommit": "50b9160121d52b03406dd9e76c0a66fdbcf8a704",
-  "threads": []
-}

@@ -31,7 +31,7 @@ mod yolo_toggle_report_tests {
 /// teardown. A no-op in builds without a scratch producer.
 fn cleanup_session_scratch(_session: &SessionActor) {}
 impl SessionActor {
-    /// Serialize terminal task-wake admission with interactive cancellation.
+    /// Serialize terminal task/subagent wake admission with interactive cancellation.
     pub(super) async fn admit_task_completion_wake(
         &self,
         origin: &super::PromptOrigin,
@@ -41,8 +41,10 @@ impl SessionActor {
             respond_to,
             fallback,
         } = admission;
-        let super::PromptOrigin::TaskCompleted { task_id } = origin else {
-            return respond_to.send(true).is_ok().then_some(fallback);
+        let completion_id = match origin {
+            super::PromptOrigin::TaskCompleted { task_id } => task_id,
+            super::PromptOrigin::SubagentCompleted { subagent_id } => subagent_id,
+            _ => return respond_to.send(true).is_ok().then_some(fallback),
         };
         let gate_suppressed = self
             .tool_context
@@ -59,7 +61,7 @@ impl SessionActor {
                 "shell.task_wake.actor_admission",
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({
-                    "task_id": task_id,
+                    "completion_id": completion_id,
                     "gate": gate_suppressed,
                     "state": state_suppressed,
                     "admitted": false,
@@ -77,7 +79,7 @@ impl SessionActor {
             "shell.task_wake.actor_admission",
             Some(self.session_info.id.0.as_ref()),
             Some(serde_json::json!({
-                "task_id": task_id,
+                "completion_id": completion_id,
                 "gate": gate_suppressed,
                 "state": state_suppressed,
                 "admitted": true,

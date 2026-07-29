@@ -1599,10 +1599,11 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        xai_grok_sampling_types::patch_response_message_item_ids(
+        xai_grok_sampling_types::patch_response_message_metadata(
             &mut request_body,
-            &request.response_message_item_ids,
-        );
+            &request.response_message_metadata,
+        )
+        .map_err(SamplingError::serialization_message)?;
         xai_grok_sampling_types::patch_response_item_metadata_passthrough(
             &mut request_body,
             &request.response_item_metadata_passthrough,
@@ -1751,10 +1752,11 @@ impl SamplingClient {
             }
         }
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        xai_grok_sampling_types::patch_response_message_item_ids(
+        xai_grok_sampling_types::patch_response_message_metadata(
             &mut request_body,
-            &request.response_message_item_ids,
-        );
+            &request.response_message_metadata,
+        )
+        .map_err(SamplingError::serialization_message)?;
         xai_grok_sampling_types::patch_response_item_metadata_passthrough(
             &mut request_body,
             &request.response_item_metadata_passthrough,
@@ -2596,6 +2598,7 @@ mod tests {
             kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
             item_id: Some("cmp_test".into()),
             internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
         }];
         let request = ConversationRequest {
             items: vec![
@@ -3952,10 +3955,11 @@ mod tests {
             xai_grok_sampling_types::conversation_request_to_codex_create_response(&request),
         )
         .unwrap();
-        xai_grok_sampling_types::patch_response_message_item_ids(
+        xai_grok_sampling_types::patch_response_message_metadata(
             &mut wire,
-            &xai_grok_sampling_types::response_message_item_ids(&request),
-        );
+            &xai_grok_sampling_types::response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
         let metadata = xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
             &request,
             Some(&origin),
@@ -4034,10 +4038,11 @@ mod tests {
             xai_grok_sampling_types::conversation_request_to_codex_create_response(&request),
         )
         .unwrap();
-        xai_grok_sampling_types::patch_response_message_item_ids(
+        xai_grok_sampling_types::patch_response_message_metadata(
             &mut wire,
-            &xai_grok_sampling_types::response_message_item_ids(&request),
-        );
+            &xai_grok_sampling_types::response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
         let metadata = xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
             &request,
             Some(&origin),
@@ -4170,6 +4175,266 @@ mod tests {
                 turn_id
             );
         }
+    }
+
+    #[tokio::test]
+    async fn captured_http_bodies_preserve_reloaded_native_user_replay_fields_on_both_endpoints() {
+        let ordinary_body = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let compact_body = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ordinary_sink = std::sync::Arc::clone(&ordinary_body);
+        let compact_sink = std::sync::Arc::clone(&compact_body);
+        let app = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |request: axum::extract::Request| {
+                    let sink = std::sync::Arc::clone(&ordinary_sink);
+                    async move {
+                        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        *sink.lock().unwrap() =
+                            Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                        axum::Json(serde_json::json!({
+                            "id": "resp-http", "object": "response", "created_at": 0,
+                            "model": "gpt-codex", "status": "completed", "output": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                axum::routing::post(move |request: axum::extract::Request| {
+                    let sink = std::sync::Arc::clone(&compact_sink);
+                    async move {
+                        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        *sink.lock().unwrap() =
+                            Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                        axum::Json(serde_json::json!({"output": []}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let compact_response: xai_grok_sampling_types::CodexCompactResponse =
+            serde_json::from_value(serde_json::json!({
+                "output": [
+                    {
+                        "type": "message", "id": "msg-http-a", "role": "user",
+                        "status": null, "phase": "commentary",
+                        "content": [{"type": "input_text", "text": "first retained"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-a"}
+                    },
+                    {
+                        "type": "reasoning", "id": "rs-http", "summary": [],
+                        "encrypted_content": "reasoning-http", "status": "completed",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-rs"}
+                    },
+                    {
+                        "type": "message", "id": "msg-http-b", "role": "user",
+                        "status": "completed", "phase": null,
+                        "content": [{"type": "input_text", "text": "second retained"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-b"}
+                    },
+                    {
+                        "type": "compaction", "id": "cmp-http",
+                        "encrypted_content": "compaction-http",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-cmp"}
+                    }
+                ]
+            }))
+            .unwrap();
+        let converted = xai_grok_sampling_types::codex_compact_output_to_conversation(
+            compact_response.output,
+            xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-codex", None),
+        )
+        .unwrap();
+        let mut reloaded: Vec<ConversationItem> = serde_json::from_slice(
+            &serde_json::to_vec(&converted).expect("persist converted native history"),
+        )
+        .expect("cold reload converted native history");
+        reloaded.push(ConversationItem::user("ordinary local successor"));
+        let request = ConversationRequest {
+            items: reloaded,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+
+        let config = SamplerConfig {
+            api_key: Some("test-token".into()),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-codex".into(),
+            api_backend: ApiBackend::Responses,
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Codex),
+            ..SamplerConfig::default()
+        };
+        let client = SamplingClient::new(config).unwrap();
+        client
+            .conversation_responses(request.clone())
+            .await
+            .unwrap();
+        client
+            .conversation_compact_responses(request)
+            .await
+            .unwrap();
+
+        let ordinary = ordinary_body.lock().unwrap().take().unwrap();
+        let compact = compact_body.lock().unwrap().take().unwrap();
+        for (endpoint, body) in [("/responses", ordinary), ("/responses/compact", compact)] {
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 5, "{endpoint}: {body:#}");
+            assert_eq!(input[0]["id"], "msg-http-a");
+            assert!(input[0].get("status").unwrap().is_null());
+            assert_eq!(input[0]["phase"], "commentary");
+            assert_eq!(input[1]["id"], "rs-http");
+            assert_eq!(input[2]["id"], "msg-http-b");
+            assert_eq!(input[2]["status"], "completed");
+            assert!(input[2].get("phase").unwrap().is_null());
+            assert_eq!(input[3]["id"], "cmp-http");
+            assert_eq!(input[4]["role"], "user");
+            assert!(input[4].get("status").is_none());
+            assert!(input[4].get("phase").is_none());
+            assert_eq!(
+                input[..4]
+                    .iter()
+                    .map(
+                        |item| item["internal_chat_message_metadata_passthrough"]["turn_id"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .collect::<Vec<_>>(),
+                [
+                    "turn-http-a",
+                    "turn-http-rs",
+                    "turn-http-b",
+                    "turn-http-cmp"
+                ],
+                "{endpoint} must preserve native item ordering and ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_native_user_bindings_are_rejected_before_either_http_request() {
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&request_count);
+        let handler = move || {
+            let count = std::sync::Arc::clone(&count);
+            async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(serde_json::json!({"output": []}))
+            }
+        };
+        let app = axum::Router::new()
+            .route("/v1/responses", axum::routing::post(handler.clone()))
+            .route("/v1/responses/compact", axum::routing::post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let compact_response: xai_grok_sampling_types::CodexCompactResponse =
+            serde_json::from_value(serde_json::json!({
+                "output": [
+                    {
+                        "type": "message", "id": "msg-corrupt-a", "role": "user",
+                        "status": null,
+                        "content": [{"type": "input_text", "text": "a"}]
+                    },
+                    {
+                        "type": "message", "id": "msg-corrupt-b", "role": "user",
+                        "phase": "commentary",
+                        "content": [{"type": "input_text", "text": "b"}]
+                    },
+                    {"type": "compaction", "id": "cmp-corrupt", "encrypted_content": "opaque"}
+                ]
+            }))
+            .unwrap();
+        let valid = xai_grok_sampling_types::codex_compact_output_to_conversation(
+            compact_response.output,
+            xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-codex", None),
+        )
+        .unwrap();
+        let mut corruptions = Vec::new();
+
+        let mut removed = valid.clone();
+        let ConversationItem::User(user) = &mut removed[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = None;
+        corruptions.push(("removed", removed));
+
+        let mut mutated = valid.clone();
+        let ConversationItem::User(user) = &mut mutated[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = Some(xai_grok_sampling_types::UserMessageProviderMetadata::codex(
+            xai_grok_sampling_types::ProviderReplayField::Value(rs::OutputStatus::Completed),
+            xai_grok_sampling_types::ProviderReplayField::Missing,
+        ));
+        corruptions.push(("mutated", mutated));
+
+        let mut swapped = valid;
+        let first = match &swapped[0] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let second = match &swapped[1] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let ConversationItem::User(user) = &mut swapped[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = second;
+        let ConversationItem::User(user) = &mut swapped[1] else {
+            unreachable!()
+        };
+        user.provider_metadata = first;
+        corruptions.push(("swapped", swapped));
+
+        let config = SamplerConfig {
+            api_key: Some("test-token".into()),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-codex".into(),
+            api_backend: ApiBackend::Responses,
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Codex),
+            ..SamplerConfig::default()
+        };
+        let client = SamplingClient::new(config).unwrap();
+        for (name, items) in corruptions {
+            let request = ConversationRequest {
+                items,
+                model: Some("gpt-codex".into()),
+                ..Default::default()
+            };
+            for error in [
+                client
+                    .conversation_responses(request.clone())
+                    .await
+                    .unwrap_err(),
+                client
+                    .conversation_compact_responses(request.clone())
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SamplingError::InvalidConfiguration(_)),
+                    "{name}: {error}"
+                );
+            }
+        }
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "all corruption variants must fail before transport"
+        );
     }
 
     #[test]

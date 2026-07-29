@@ -90,8 +90,9 @@ impl ResponsesWireAdapter {
                 let response =
                     xai_grok_sampling_types::conversation_request_to_codex_create_response(request);
                 let mut wrapper = CreateResponseWrapper::new(response);
-                wrapper.response_message_item_ids =
-                    xai_grok_sampling_types::response_message_item_ids(request);
+                wrapper.response_message_metadata =
+                    xai_grok_sampling_types::response_message_metadata(request)
+                        .map_err(SamplingError::serialization_message)?;
                 wrapper.response_item_metadata_passthrough =
                     xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
                         request,

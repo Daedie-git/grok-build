@@ -5,7 +5,7 @@
 //!
 //! # Retry behavior summary
 //!
-//! **Retried** (up to [`DEFAULT_MAX_RETRIES`] = 15, ~6 min with 30s backoff cap):
+//! **Retried** (up to [`DEFAULT_MAX_RETRIES`] = 5 total attempts):
 //! - 500, 502, 503, 504, 520 (server errors)
 //! - Connection errors (timeout, refused, reset)
 //! - `EventStreamError` / `StreamError` (mid-stream failures)
@@ -42,11 +42,12 @@ use xai_grok_sampling_types::SamplingError;
 /// no point burning a long backoff just to be rate-limited again.
 pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = 2;
 
-/// Default max retries when no env or model override is set.
-/// With 30s backoff cap this gives ~6 min of retry budget:
-/// retries 1-4 are exponential (2s+4s+8s+16s ≈ 30s), retries
-/// 5-15 are flat at ~30s each (≈ 5.5 min).
-pub const DEFAULT_MAX_RETRIES: u32 = 15;
+/// Default maximum number of total request attempts when no env or model
+/// override is set. The retry actor counts the initial request in this budget,
+/// so `5` permits four retries. This keeps an interactive failure bounded to
+/// roughly 30 seconds of scheduled backoff while still recovering the transient
+/// one- and two-retry failures that dominate production logs.
+pub const DEFAULT_MAX_RETRIES: u32 = 5;
 
 /// Resolve max API retries from an optional env override, model config,
 /// or default ([`DEFAULT_MAX_RETRIES`]).
@@ -477,6 +478,10 @@ mod tests {
 
     #[test]
     fn resolve_max_retries_default() {
+        assert_eq!(
+            DEFAULT_MAX_RETRIES, 5,
+            "interactive requests must not silently regain the former six-minute budget"
+        );
         assert_eq!(
             resolve_max_retries_with_env(None, None),
             DEFAULT_MAX_RETRIES

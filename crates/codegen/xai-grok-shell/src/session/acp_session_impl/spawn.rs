@@ -1219,8 +1219,9 @@ pub(crate) async fn spawn_session_actor(
     if retry_only_before_output {
         sampler_config_initial.doom_loop_recovery = None;
     }
+    let resolved_max_retries = xai_grok_sampler::resolve_max_retries(max_retries);
     let sampler_retry_policy = xai_grok_sampler::RetryPolicy {
-        max_retries: max_retries.unwrap_or(5),
+        max_retries: resolved_max_retries,
         rate_limit_retry_threshold: 2,
         retry_only_before_output,
     };
@@ -1579,6 +1580,7 @@ pub(crate) async fn spawn_session_actor(
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
             bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode,
@@ -1623,7 +1625,7 @@ pub(crate) async fn spawn_session_actor(
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(inference_idle_timeout_secs),
         max_turns,
-        max_retries: xai_grok_sampler::resolve_max_retries(max_retries),
+        max_retries: resolved_max_retries,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config

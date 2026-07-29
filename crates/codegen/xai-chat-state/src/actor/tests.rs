@@ -778,9 +778,14 @@ async fn acknowledged_compaction_install_does_not_persist_twice() {
 #[tokio::test]
 async fn native_compaction_replacement_survives_actor_snapshot_and_persistence() {
     let mut h = TestHarness::new();
+    let replay_metadata = xai_grok_sampling_types::UserMessageProviderMetadata::codex(
+        xai_grok_sampling_types::ProviderReplayField::Missing,
+        xai_grok_sampling_types::ProviderReplayField::Missing,
+    );
     let mut retained = ConversationItem::user("retained objective");
     if let ConversationItem::User(user) = &mut retained {
         user.response_item_id = Some("msg_actor_retained".into());
+        user.provider_metadata = Some(replay_metadata.clone());
     }
     let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
         "gpt-test",
@@ -793,12 +798,14 @@ async fn native_compaction_replacement_survives_actor_snapshot_and_persistence()
             kind: xai_grok_sampling_types::NativeCompactionItemKind::Message,
             item_id: Some("msg_actor_retained".into()),
             internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: Some(replay_metadata),
         },
         xai_grok_sampling_types::NativeCompactionItemMetadata {
             input_index: 1,
             kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
             item_id: Some("cmp_actor".into()),
             internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
         },
     ];
     let replacement = vec![
@@ -5002,6 +5009,7 @@ fn identity_transition_native_history() -> Vec<ConversationItem> {
         kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
         item_id: Some("cmp-transition".into()),
         internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
     }];
     vec![
         ConversationItem::native_compaction_metadata(compatibility),

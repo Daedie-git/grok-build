@@ -1151,6 +1151,7 @@ fn native_switch_history() -> Vec<xai_grok_sampling_types::ConversationItem> {
         kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
         item_id: Some("cmp-native-switch".into()),
         internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
     }];
     vec![
         xai_grok_sampling_types::ConversationItem::native_compaction_metadata(compatibility),

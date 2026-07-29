@@ -436,6 +436,7 @@ impl SessionActor {
                         && matches!(
                             &item.origin,
                             super::PromptOrigin::TaskCompleted { .. }
+                                | super::PromptOrigin::SubagentCompleted { .. }
                                 | super::PromptOrigin::WorkflowCompleted { .. }
                         )
                     {

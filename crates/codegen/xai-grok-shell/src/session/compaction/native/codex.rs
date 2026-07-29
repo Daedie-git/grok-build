@@ -116,10 +116,10 @@ impl NativeCompactionFailureSource {
     }
 
     pub(in super::super) fn suppresses_auto_compaction(&self) -> bool {
-        // Preserve the prior orchestration contract: terminal request errors
-        // suppress another automatic attempt, while a successfully decoded HTTP
-        // response that fails replacement validation returns immediately.
-        matches!(self, Self::Sampling(_))
+        // Both terminal request failures and decoded-but-invalid replacements
+        // will fail again for an unchanged automatic-compaction input. Manual
+        // `/compact` remains available through the separate orchestration path.
+        true
     }
 }
 
@@ -590,6 +590,7 @@ mod tests {
             base_url,
             model: "gpt-test".into(),
             api_backend: xai_grok_sampling_types::ApiBackend::Responses,
+            provider_id: Some(ProviderId::Codex),
             ..Default::default()
         };
         config.extra_headers.insert(
@@ -776,5 +777,15 @@ mod tests {
                 estimated_input_tokens,
             } if counters.attempts == 1 && estimated_input_tokens > 0
         ));
+    }
+
+    #[test]
+    fn invalid_native_replacement_suppresses_automatic_resubmission() {
+        let failure =
+            NativeCompactionFailureSource::InvalidResponse("unsupported replay fields".into());
+        assert!(
+            failure.suppresses_auto_compaction(),
+            "a decoded but unusable replacement is deterministic for unchanged history"
+        );
     }
 }

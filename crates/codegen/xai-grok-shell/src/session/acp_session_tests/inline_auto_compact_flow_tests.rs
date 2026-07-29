@@ -115,6 +115,7 @@ async fn create_test_actor(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
             bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
@@ -310,6 +311,8 @@ async fn codex_safety_gate_triggers_at_cli_limit_despite_suppression() {
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(244_800, 272_000, 99, gateway_tx, persistence_tx).await;
             if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
             }
@@ -342,6 +345,8 @@ async fn codex_safety_gate_stays_inactive_below_cli_limit() {
             let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = create_test_actor(244_799, 272_000, 90, gateway_tx, persistence_tx).await;
             if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
             }
@@ -611,6 +616,7 @@ async fn create_test_actor_with_memory(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
             bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
@@ -1396,6 +1402,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
                     bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,

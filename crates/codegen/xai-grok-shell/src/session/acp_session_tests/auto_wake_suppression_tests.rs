@@ -329,7 +329,7 @@ async fn closed_admission_ack_stores_fallback_before_prompt_rejection() {
         .await;
 }
 #[tokio::test(flavor = "current_thread")]
-async fn non_task_prompt_is_not_subject_to_task_wake_barrier() {
+async fn subagent_completion_uses_the_same_durable_wake_barrier() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -340,8 +340,8 @@ async fn non_task_prompt_is_not_subject_to_task_wake_barrier() {
             actor.state.lock().await.notifications_suppressed = true;
             let (admission, response_rx) = task_wake_admission(
                 "sub-1",
-                NotificationSource::BashTaskCompleted {
-                    task_id: "sub-1".to_string(),
+                NotificationSource::SubagentCompleted {
+                    subagent_id: "sub-1".to_string(),
                 },
             );
             assert!(
@@ -353,10 +353,18 @@ async fn non_task_prompt_is_not_subject_to_task_wake_barrier() {
                         admission,
                     )
                     .await
-                    .is_some(),
-                "subagent completion is outside terminal task-wake suppression scope"
+                    .is_none(),
+                "suppressed subagent wake must fall back to durable notification delivery"
             );
-            assert_eq!(response_rx.await, Ok(true));
+            assert_eq!(response_rx.await, Ok(false));
+            let state = actor.state.lock().await;
+            assert!(matches!(
+                state.pending_notifications.as_slice(),
+                [PendingNotification {
+                    source: NotificationSource::SubagentCompleted { subagent_id },
+                    ..
+                }] if subagent_id == "sub-1"
+            ));
         })
         .await;
 }

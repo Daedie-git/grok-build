@@ -92,8 +92,10 @@ pub fn native_compaction_compatibility(
         return Err("native compaction identity metadata has no opaque item".into());
     }
     if let Some(descriptor) = descriptor {
-        if descriptor.schema_version != NativeCompactionCompatibility::SCHEMA_VERSION {
-            return Err("legacy native compaction history cannot be replayed safely".into());
+        if !descriptor.has_supported_replay_schema() {
+            return Err(
+                "legacy or unknown native compaction history cannot be replayed safely".into(),
+            );
         }
         if descriptor.replacement_segment_start != 0 {
             return Err("native compaction manifest has an invalid segment start".into());
@@ -118,10 +120,12 @@ pub fn native_compaction_compatibility(
                 ConversationItem::User(user) => replay_items.push((
                     NativeCompactionItemKind::Message,
                     user.response_item_id.as_deref(),
+                    user.provider_metadata.as_ref(),
                 )),
                 ConversationItem::Reasoning(reasoning) => replay_items.push((
                     NativeCompactionItemKind::Reasoning,
                     Some(reasoning.id.as_str()),
+                    None,
                 )),
                 ConversationItem::Provider(provider) => {
                     if provider.is_native_compaction_metadata() {
@@ -135,6 +139,7 @@ pub fn native_compaction_compatibility(
                     replay_items.push((
                         NativeCompactionItemKind::Compaction,
                         compaction.id.as_deref(),
+                        None,
                     ));
                 }
                 _ => {
@@ -149,7 +154,7 @@ pub fn native_compaction_compatibility(
         }
         if replay_items
             .iter()
-            .filter(|(kind, _)| *kind == NativeCompactionItemKind::Compaction)
+            .filter(|(kind, _, _)| *kind == NativeCompactionItemKind::Compaction)
             .count()
             != 1
         {
@@ -166,13 +171,75 @@ pub fn native_compaction_compatibility(
                     "native compaction manifest has missing, extra, or unordered indices".into(),
                 );
             }
-            let Some((kind, item_id)) = replay_items.get(expected_index) else {
+            let Some((kind, item_id, user_provider_metadata)) = replay_items.get(expected_index)
+            else {
                 return Err("native compaction manifest input index is out of range".into());
             };
             if *kind != metadata.kind || *item_id != metadata.item_id.as_deref() {
                 return Err("native compaction manifest does not match its replay item".into());
             }
+            match descriptor.schema_version {
+                NativeCompactionCompatibility::SCHEMA_VERSION => {
+                    if *kind == NativeCompactionItemKind::Message {
+                        let Some(owner_metadata) = *user_provider_metadata else {
+                            return Err(
+                                "schema-v3 retained user is missing provider replay metadata"
+                                    .into(),
+                            );
+                        };
+                        if metadata.user_message_provider_metadata.as_ref() != Some(owner_metadata)
+                        {
+                            return Err(
+                                "native compaction manifest does not match retained user replay metadata"
+                                    .into(),
+                            );
+                        }
+                    } else if metadata.user_message_provider_metadata.is_some() {
+                        return Err(
+                            "native compaction manifest binds user replay fields to a non-message entry"
+                                .into(),
+                        );
+                    }
+                }
+                NativeCompactionCompatibility::PREVIOUS_SCHEMA_VERSION => {
+                    if user_provider_metadata.is_some()
+                        || metadata.user_message_provider_metadata.is_some()
+                    {
+                        return Err(
+                            "schema-v2 native compaction cannot contain retained user replay metadata"
+                                .into(),
+                        );
+                    }
+                }
+                _ => unreachable!("supported schema checked above"),
+            }
         }
+        let all_user_metadata = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ConversationItem::User(user) if user.provider_metadata.is_some()
+                )
+            })
+            .count();
+        let replacement_user_metadata = replay_items
+            .iter()
+            .filter(|(_, _, user_provider_metadata)| user_provider_metadata.is_some())
+            .count();
+        if all_user_metadata != replacement_user_metadata {
+            return Err(
+                "retained user provider metadata sits outside the native replacement segment"
+                    .into(),
+            );
+        }
+    } else if items.iter().any(|item| {
+        matches!(
+            item,
+            ConversationItem::User(user) if user.provider_metadata.is_some()
+        )
+    }) {
+        return Err("retained user provider metadata has no native compaction manifest".into());
     }
     Ok(descriptor)
 }

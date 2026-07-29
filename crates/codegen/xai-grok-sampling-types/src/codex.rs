@@ -6,10 +6,10 @@
 
 use crate::rs;
 use crate::{
-    AssistantItem, BackendToolCallItem, BackendToolKind, ContentPart, ConversationItem,
-    ConversationRequest, InternalChatMessageMetadataPassthrough, NativeCompactionCompatibility,
-    NativeCompactionItemKind, NativeCompactionItemMetadata, ReasoningEffort, ToolCall,
-    ToolResultItem,
+    AssistantItem, BackendToolCallItem, BackendToolKind, CodexResponseMessageMetadata, ContentPart,
+    ConversationItem, ConversationRequest, InternalChatMessageMetadataPassthrough,
+    NativeCompactionCompatibility, NativeCompactionItemKind, NativeCompactionItemMetadata,
+    ProviderReplayField, ReasoningEffort, ToolCall, ToolResultItem, UserMessageProviderMetadata,
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,10 +76,10 @@ pub struct CodexCompactMessage {
     pub id: Option<String>,
     pub role: rs::Role,
     pub content: Vec<CodexCompactMessageContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<rs::OutputStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+    pub status: ProviderReplayField<rs::OutputStatus>,
+    #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+    pub phase: ProviderReplayField<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
 }
@@ -135,10 +135,10 @@ pub enum CodexCompactOutputItem {
         id: Option<String>,
         role: rs::Role,
         content: Vec<CodexCompactMessageContent>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        status: Option<rs::OutputStatus>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        phase: Option<String>,
+        #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+        status: ProviderReplayField<rs::OutputStatus>,
+        #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+        phase: ProviderReplayField<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
     },
@@ -215,7 +215,7 @@ pub fn conversation_request_to_codex_compact_request_for_origin(
     let created = conversation_request_to_codex_create_response(req);
     let input = match created.input {
         rs::InputParam::Items(items) => {
-            let mut message_ids = response_message_item_ids(req).into_iter();
+            let mut message_metadata = response_message_metadata(req)?.into_iter();
             let metadata = response_item_metadata_passthrough_for_origin(req, origin)?;
             let mut input = items
                 .into_iter()
@@ -231,10 +231,13 @@ pub fn conversation_request_to_codex_compact_request_for_origin(
                         rs::InputItem::EasyMessage(message)
                             if matches!(message.role, rs::Role::User | rs::Role::Assistant) =>
                         {
-                            let message_id = message_ids.next().flatten();
-                            CodexCompactInputItem::Message(easy_message_with_response_id(
+                            let mut message_metadata = message_metadata
+                                .next()
+                                .expect("Responses conversion emitted an unexpected message");
+                            message_metadata.item_id = item_id.or(message_metadata.item_id);
+                            CodexCompactInputItem::Message(easy_message_with_response_metadata(
                                 message,
-                                item_id.or(message_id),
+                                message_metadata,
                                 passthrough,
                             ))
                         }
@@ -246,6 +249,7 @@ pub fn conversation_request_to_codex_compact_request_for_origin(
                     }
                 })
                 .collect();
+            debug_assert!(message_metadata.next().is_none());
             reorder_response_input(&mut input, &metadata)?;
             input
         }
@@ -274,21 +278,43 @@ pub fn conversation_request_to_codex_compact_request_for_origin(
     })
 }
 
-/// IDs corresponding one-for-one with user/assistant message records emitted
-/// by Responses conversion. System messages are instructions on Codex and
-/// assistant items without text emit only tool calls, so neither consumes a
-/// slot here.
-pub fn response_message_item_ids(req: &ConversationRequest) -> Vec<Option<String>> {
-    req.items
+/// Provider fields corresponding one-for-one with user/assistant message
+/// records emitted by Responses conversion. System messages are instructions
+/// on Codex and assistant items without text emit only tool calls, so neither
+/// consumes a slot here.
+pub fn response_message_metadata(
+    req: &ConversationRequest,
+) -> std::result::Result<Vec<CodexResponseMessageMetadata>, String> {
+    // This also proves every provider-owned user envelope belongs to a valid
+    // identity-bound native replacement before any wire patch can replay it.
+    crate::native_compaction_compatibility(&req.items)?;
+    Ok(req
+        .items
         .iter()
         .filter_map(|item| match item {
-            ConversationItem::User(user) => Some(user.response_item_id.clone()),
+            ConversationItem::User(user) => {
+                let (status, phase) = user
+                    .provider_metadata
+                    .as_ref()
+                    .map(UserMessageProviderMetadata::codex_fields)
+                    .map(|(status, phase)| (status.clone(), phase.clone()))
+                    .unwrap_or_default();
+                Some(CodexResponseMessageMetadata {
+                    item_id: user.response_item_id.clone(),
+                    status,
+                    phase,
+                })
+            }
             ConversationItem::Assistant(assistant) if !assistant.content.is_empty() => {
-                Some(assistant.response_item_id.clone())
+                Some(CodexResponseMessageMetadata {
+                    item_id: assistant.response_item_id.clone(),
+                    status: ProviderReplayField::Missing,
+                    phase: ProviderReplayField::Missing,
+                })
             }
             _ => None,
         })
-        .collect()
+        .collect())
 }
 
 /// Derive all provider metadata/order bindings from the durable conversation.
@@ -641,46 +667,72 @@ fn response_input_permutation(
     Ok(permutation)
 }
 
-/// Restore provider message IDs after serializing through async-openai.
+/// Restore provider message fields after serializing through async-openai.
 ///
-/// The pinned `InputMessage` type cannot represent the optional `id` accepted
-/// by Responses. The durable conversation retains it, and this narrow wire
-/// patch restores it without weakening the rest of the typed request model.
-pub fn patch_response_message_item_ids(
+/// `EasyInputMessage` cannot represent the optional provider ID, status, or
+/// phase accepted by Codex Responses. Validate alignment before mutating so an
+/// internal conversion drift fails closed rather than attaching fields to the
+/// wrong message.
+pub fn patch_response_message_metadata(
     body: &mut serde_json::Value,
-    message_ids: &[Option<String>],
-) {
-    if message_ids.is_empty() {
-        return;
+    message_metadata: &[CodexResponseMessageMetadata],
+) -> std::result::Result<(), String> {
+    // Standard Responses requests carry no Codex side table and must remain
+    // untouched even though the shared transport calls this seam.
+    if message_metadata.is_empty() {
+        return Ok(());
     }
-    let Some(input) = body.get_mut("input").and_then(|value| value.as_array_mut()) else {
-        return;
-    };
-    let mut ids = message_ids.iter();
-    for item in input {
-        let is_conversation_message = item.get("type").and_then(|value| value.as_str())
-            == Some("message")
-            && matches!(
-                item.get("role").and_then(|value| value.as_str()),
-                Some("user" | "assistant")
-            );
-        if !is_conversation_message {
-            continue;
+    let input = body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "Responses request input is not an array".to_string())?;
+    let message_indices = input
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && matches!(
+                    item.get("role").and_then(serde_json::Value::as_str),
+                    Some("user" | "assistant")
+                ))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if message_indices.len() != message_metadata.len() {
+        return Err("Responses message metadata no longer aligns with serialized input".into());
+    }
+    for (input_index, metadata) in message_indices.into_iter().zip(message_metadata) {
+        let item = &mut input[input_index];
+        let role = item.get("role").and_then(serde_json::Value::as_str);
+        if (!metadata.status.is_missing() || !metadata.phase.is_missing()) && role != Some("user") {
+            return Err("Codex retained user metadata is bound to a non-user message".into());
         }
-        let Some(response_item_id) = ids.next() else {
-            break;
-        };
-        if let Some(id) = response_item_id
-            && let Some(object) = item.as_object_mut()
-        {
+        let object = item
+            .as_object_mut()
+            .ok_or_else(|| "Responses message input is not an object".to_string())?;
+        if let Some(id) = &metadata.item_id {
             object.insert("id".into(), serde_json::Value::String(id.clone()));
         }
+        if !metadata.status.is_missing() {
+            object.insert(
+                "status".into(),
+                serde_json::to_value(&metadata.status)
+                    .expect("Codex message status is serializable"),
+            );
+        }
+        if !metadata.phase.is_missing() {
+            object.insert(
+                "phase".into(),
+                serde_json::to_value(&metadata.phase).expect("Codex message phase is serializable"),
+            );
+        }
     }
+    Ok(())
 }
 
-fn easy_message_with_response_id(
+fn easy_message_with_response_metadata(
     message: rs::EasyInputMessage,
-    id: Option<String>,
+    metadata: CodexResponseMessageMetadata,
     internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
 ) -> CodexCompactMessage {
     let content = match message.content {
@@ -706,11 +758,11 @@ fn easy_message_with_response_id(
     };
     CodexCompactMessage {
         r#type: rs::MessageType::Message,
-        id,
+        id: metadata.item_id,
         role: message.role,
         content,
-        status: None,
-        phase: None,
+        status: metadata.status,
+        phase: metadata.phase,
         internal_chat_message_metadata_passthrough,
     }
 }
@@ -725,6 +777,9 @@ pub fn codex_compact_output_to_conversation(
     output: Vec<CodexCompactOutputItem>,
     mut compatibility: NativeCompactionCompatibility,
 ) -> std::result::Result<Vec<ConversationItem>, String> {
+    if compatibility.schema_version != NativeCompactionCompatibility::SCHEMA_VERSION {
+        return Err("new native compaction output requires the current manifest schema".into());
+    }
     let mut items = Vec::new();
     let mut item_metadata = Vec::new();
     for item in output {
@@ -744,11 +799,6 @@ pub fn codex_compact_output_to_conversation(
                 if matches!(role, rs::Role::System | rs::Role::Developer) {
                     continue;
                 }
-                if status.is_some() || phase.is_some() {
-                    return Err(format!(
-                        "unsupported compact message fields for {role:?}: status/phase cannot be replayed exactly"
-                    ));
-                }
                 if content
                     .iter()
                     .any(|part| !matches!(part, CodexCompactMessageContent::InputText { .. }))
@@ -762,6 +812,7 @@ pub fn codex_compact_output_to_conversation(
                     rs::Role::User => ConversationItem::User(crate::UserItem {
                         content,
                         response_item_id: id.clone(),
+                        provider_metadata: Some(UserMessageProviderMetadata::codex(status, phase)),
                         ..Default::default()
                     }),
                     rs::Role::Assistant => {
@@ -817,11 +868,16 @@ pub fn codex_compact_output_to_conversation(
                 internal_chat_message_metadata_passthrough,
             ),
         };
+        let user_message_provider_metadata = match &conversation_item {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => None,
+        };
         item_metadata.push(NativeCompactionItemMetadata {
             input_index: items.len(),
             kind,
             item_id,
             internal_chat_message_metadata_passthrough: metadata,
+            user_message_provider_metadata,
         });
         items.push(conversation_item);
     }
@@ -1803,6 +1859,68 @@ mod tests {
         );
         assert_eq!(input[2]["call_id"], "call_read");
         assert_eq!(input[3]["call_id"], "call_read");
+        for message_index in [0, 4] {
+            assert!(input[message_index].get("status").is_none());
+            assert!(input[message_index].get("phase").is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_user_messages_stay_default_clean_on_disk_and_both_codex_wires() {
+        let ordinary = ConversationItem::user("ordinary");
+        let durable = serde_json::to_value(&ordinary).unwrap();
+        assert!(durable.get("provider_metadata").is_none());
+        assert!(durable.get("status").is_none());
+        assert!(durable.get("phase").is_none());
+
+        // A pre-feature persisted user remains readable and serializes without
+        // inventing provider metadata.
+        let old: ConversationItem = serde_json::from_value(serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": "old session"}]
+        }))
+        .unwrap();
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("provider_metadata")
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<ConversationItem>(serde_json::json!({
+                "type": "user",
+                "content": [{"type": "text", "text": "future"}],
+                "provider_metadata": {
+                    "provider": "codex",
+                    "payload": {"status": "completed", "future": true}
+                }
+            }))
+            .is_err(),
+            "unknown durable provider fields must fail closed"
+        );
+
+        let request = ConversationRequest {
+            items: vec![ordinary],
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let compact =
+            serde_json::to_value(conversation_request_to_codex_compact_request(&request).unwrap())
+                .unwrap();
+        let compact_user = &compact["input"][0];
+        assert!(compact_user.get("status").is_none());
+        assert!(compact_user.get("phase").is_none());
+
+        let mut responses =
+            serde_json::to_value(conversation_request_to_codex_create_response(&request)).unwrap();
+        patch_response_message_metadata(
+            &mut responses,
+            &response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
+        let responses_user = &responses["input"][0];
+        assert!(responses_user.get("status").is_none());
+        assert!(responses_user.get("phase").is_none());
     }
 
     #[test]
@@ -1813,6 +1931,8 @@ mod tests {
                     "type": "message",
                     "id": "msg_user_retained",
                     "role": "user",
+                    "status": "completed",
+                    "phase": "commentary",
                     "content": [{"type": "input_text", "text": "Keep this user turn."}],
                     "internal_chat_message_metadata_passthrough": {"turn_id": "turn-message-1"}
                 },
@@ -1864,6 +1984,19 @@ mod tests {
         assert_eq!(item.encrypted_content, "encrypted-native-compaction");
 
         let persisted = serde_json::to_vec(&replacement).expect("persist replacement history");
+        let persisted_json: serde_json::Value =
+            serde_json::from_slice(&persisted).expect("inspect durable replacement JSON");
+        assert_eq!(
+            persisted_json[0]["provider_metadata"],
+            serde_json::json!({
+                "provider": "codex",
+                "payload": {
+                    "status": "completed",
+                    "phase": "commentary"
+                }
+            }),
+            "durable user owner must retain both provider fields"
+        );
         let replacement: Vec<ConversationItem> =
             serde_json::from_slice(&persisted).expect("restart replacement history");
         let restored_identity = crate::native_compaction_compatibility(&replacement)
@@ -1875,6 +2008,21 @@ mod tests {
             "gpt-test",
             Some("acct-test"),
         ));
+        let mut mislabeled_as_previous_schema = replacement.clone();
+        mislabeled_as_previous_schema
+            .iter_mut()
+            .find_map(|item| match item {
+                ConversationItem::Provider(provider) => {
+                    provider.as_native_compaction_metadata_mut()
+                }
+                _ => None,
+            })
+            .unwrap()
+            .schema_version = NativeCompactionCompatibility::PREVIOUS_SCHEMA_VERSION;
+        assert!(
+            crate::native_compaction_compatibility(&mislabeled_as_previous_schema).is_err(),
+            "schema v2 cannot claim newly represented retained-user fields"
+        );
 
         let next_request = ConversationRequest {
             items: replacement,
@@ -1891,7 +2039,8 @@ mod tests {
             input[0]["internal_chat_message_metadata_passthrough"]["turn_id"],
             "turn-message-1"
         );
-        assert!(input[0].get("status").is_none());
+        assert_eq!(input[0]["status"], "completed");
+        assert_eq!(input[0]["phase"], "commentary");
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["id"], "rs_compacted");
         assert_eq!(
@@ -1920,10 +2069,11 @@ mod tests {
         // history. Restore IDs across the pinned async-openai InputMessage gap.
         let created = conversation_request_to_codex_create_response(&next_request);
         let mut successor_wire = serde_json::to_value(created).expect("serialize successor");
-        patch_response_message_item_ids(
+        patch_response_message_metadata(
             &mut successor_wire,
-            &response_message_item_ids(&next_request),
-        );
+            &response_message_metadata(&next_request).unwrap(),
+        )
+        .unwrap();
         patch_response_item_metadata_passthrough(
             &mut successor_wire,
             &response_item_metadata_passthrough_for_origin(&next_request, None).unwrap(),
@@ -1931,6 +2081,8 @@ mod tests {
         .unwrap();
         let successor_input = successor_wire["input"].as_array().expect("input array");
         assert_eq!(successor_input[0]["id"], "msg_user_retained");
+        assert_eq!(successor_input[0]["status"], "completed");
+        assert_eq!(successor_input[0]["phase"], "commentary");
         assert_eq!(successor_input[1]["id"], "rs_compacted");
         assert_eq!(successor_input[2]["id"], "msg_retained");
         assert_eq!(successor_input[3]["id"], "cmp_123");
@@ -1959,9 +2111,17 @@ mod tests {
             "output": [
                 {
                     "type": "message",
-                    "id": "msg_retained",
+                    "id": "msg_retained_a",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "retained"}]
+                    "status": null,
+                    "content": [{"type": "input_text", "text": "retained a"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_retained_b",
+                    "role": "user",
+                    "phase": "commentary",
+                    "content": [{"type": "input_text", "text": "retained b"}]
                 },
                 {
                     "type": "reasoning",
@@ -1989,26 +2149,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(manifest.replacement_segment_start, 0);
-        assert_eq!(manifest.replacement_segment_items, 3);
-        assert_eq!(manifest.item_metadata.len(), 3);
+        assert_eq!(manifest.replacement_segment_items, 4);
+        assert_eq!(manifest.item_metadata.len(), 4);
         assert!(
             manifest.item_metadata[0]
-                .internal_chat_message_metadata_passthrough
-                .is_none()
+                .user_message_provider_metadata
+                .is_some()
         );
         assert!(
             manifest.item_metadata[1]
-                .internal_chat_message_metadata_passthrough
+                .user_message_provider_metadata
                 .is_some()
         );
         assert!(
             manifest.item_metadata[2]
-                .internal_chat_message_metadata_passthrough
+                .user_message_provider_metadata
                 .is_none()
         );
+        assert!(
+            manifest.item_metadata[3]
+                .user_message_provider_metadata
+                .is_none()
+        );
+        assert!(
+            manifest.item_metadata[2]
+                .internal_chat_message_metadata_passthrough
+                .is_some()
+        );
 
-        let mut persisted = serde_json::to_value(&replacement).unwrap();
-        let descriptor = persisted
+        let mut missing_table = serde_json::to_value(&replacement).unwrap();
+        let descriptor = missing_table
             .as_array_mut()
             .unwrap()
             .iter_mut()
@@ -2016,8 +2186,49 @@ mod tests {
             .unwrap();
         descriptor.as_object_mut().unwrap().remove("item_metadata");
         assert!(
-            serde_json::from_value::<Vec<ConversationItem>>(persisted).is_err(),
-            "schema-v2 manifest must not disappear through a serde default"
+            serde_json::from_value::<Vec<ConversationItem>>(missing_table).is_err(),
+            "the complete manifest table is never serde-defaulted"
+        );
+
+        let mut missing_v3_binding = serde_json::to_value(&replacement).unwrap();
+        let descriptor = missing_v3_binding
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|item| item["type"] == "native_compaction_metadata")
+            .unwrap();
+        descriptor["item_metadata"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("user_message_provider_metadata");
+        let missing_v3_binding: Vec<ConversationItem> =
+            serde_json::from_value(missing_v3_binding).unwrap();
+        assert!(
+            crate::native_compaction_compatibility(&missing_v3_binding).is_err(),
+            "schema v3 must fail closed when a retained-user binding key is omitted"
+        );
+
+        let mut previous_schema = serde_json::to_value(&replacement).unwrap();
+        for item in previous_schema.as_array_mut().unwrap() {
+            if item["type"] == "user" {
+                item.as_object_mut().unwrap().remove("provider_metadata");
+            }
+            if item["type"] == "native_compaction_metadata" {
+                item["schema_version"] =
+                    serde_json::json!(NativeCompactionCompatibility::PREVIOUS_SCHEMA_VERSION);
+                for entry in item["item_metadata"].as_array_mut().unwrap() {
+                    entry
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("user_message_provider_metadata");
+                }
+            }
+        }
+        let previous_schema: Vec<ConversationItem> =
+            serde_json::from_value(previous_schema).expect("schema-v2 missing keys deserialize");
+        assert!(
+            crate::native_compaction_compatibility(&previous_schema).is_ok(),
+            "valid schema-v2 history without retained-user replay metadata remains accepted"
         );
 
         fn manifest_mut(items: &mut [ConversationItem]) -> &mut NativeCompactionCompatibility {
@@ -2032,21 +2243,70 @@ mod tests {
                 .unwrap()
         }
 
+        let mut removed_user_metadata = replacement.clone();
+        let ConversationItem::User(user) = &mut removed_user_metadata[1] else {
+            unreachable!()
+        };
+        user.provider_metadata = None;
+        assert!(crate::native_compaction_compatibility(&removed_user_metadata).is_err());
+
+        let mut mutated_user_metadata = replacement.clone();
+        let ConversationItem::User(user) = &mut mutated_user_metadata[1] else {
+            unreachable!()
+        };
+        user.provider_metadata = Some(UserMessageProviderMetadata::codex(
+            ProviderReplayField::Value(rs::OutputStatus::Completed),
+            ProviderReplayField::Missing,
+        ));
+        assert!(crate::native_compaction_compatibility(&mutated_user_metadata).is_err());
+
+        let mut swapped_user_metadata = replacement.clone();
+        let first = match &swapped_user_metadata[1] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let second = match &swapped_user_metadata[2] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let ConversationItem::User(user) = &mut swapped_user_metadata[1] else {
+            unreachable!()
+        };
+        user.provider_metadata = second;
+        let ConversationItem::User(user) = &mut swapped_user_metadata[2] else {
+            unreachable!()
+        };
+        user.provider_metadata = first;
+        assert!(crate::native_compaction_compatibility(&swapped_user_metadata).is_err());
+
+        for non_message_index in [2, 3] {
+            let mut metadata_on_non_message = replacement.clone();
+            let user_binding = manifest_mut(&mut metadata_on_non_message).item_metadata[0]
+                .user_message_provider_metadata
+                .clone();
+            manifest_mut(&mut metadata_on_non_message).item_metadata[non_message_index]
+                .user_message_provider_metadata = user_binding;
+            assert!(
+                crate::native_compaction_compatibility(&metadata_on_non_message).is_err(),
+                "user replay fields on non-message manifest entry {non_message_index} must fail"
+            );
+        }
+
         let mut missing = replacement.clone();
-        manifest_mut(&mut missing).item_metadata.remove(1);
+        manifest_mut(&mut missing).item_metadata.remove(2);
         assert!(crate::native_compaction_compatibility(&missing).is_err());
 
         let mut extra = replacement.clone();
-        let extra_entry = manifest_mut(&mut extra).item_metadata[1].clone();
+        let extra_entry = manifest_mut(&mut extra).item_metadata[2].clone();
         manifest_mut(&mut extra).item_metadata.push(extra_entry);
         assert!(crate::native_compaction_compatibility(&extra).is_err());
 
         let mut duplicate = replacement.clone();
-        manifest_mut(&mut duplicate).item_metadata[1].input_index = 0;
+        manifest_mut(&mut duplicate).item_metadata[2].input_index = 0;
         assert!(crate::native_compaction_compatibility(&duplicate).is_err());
 
         let mut wrong_index = replacement.clone();
-        manifest_mut(&mut wrong_index).item_metadata[1].input_index = 2;
+        manifest_mut(&mut wrong_index).item_metadata[2].input_index = 3;
         assert!(crate::native_compaction_compatibility(&wrong_index).is_err());
 
         let mut wrong_kind = replacement.clone();
@@ -2054,7 +2314,7 @@ mod tests {
         assert!(crate::native_compaction_compatibility(&wrong_kind).is_err());
 
         let mut wrong_id = replacement.clone();
-        manifest_mut(&mut wrong_id).item_metadata[2].item_id = Some("cmp-other".into());
+        manifest_mut(&mut wrong_id).item_metadata[3].item_id = Some("cmp-other".into());
         assert!(crate::native_compaction_compatibility(&wrong_id).is_err());
 
         let mut truncated = replacement.clone();
@@ -2064,6 +2324,10 @@ mod tests {
         let mut legacy = replacement.clone();
         manifest_mut(&mut legacy).schema_version = 1;
         assert!(crate::native_compaction_compatibility(&legacy).is_err());
+
+        let mut unknown = replacement.clone();
+        manifest_mut(&mut unknown).schema_version = 4;
+        assert!(crate::native_compaction_compatibility(&unknown).is_err());
 
         let mut reordered = replacement;
         reordered.swap(1, 2);
@@ -2077,6 +2341,7 @@ mod tests {
             user.response_item_id = Some("msg-retained".into());
         }
         let mut compatibility = NativeCompactionCompatibility::codex("gpt-test", None);
+        compatibility.schema_version = NativeCompactionCompatibility::PREVIOUS_SCHEMA_VERSION;
         compatibility.replacement_segment_items = 2;
         compatibility.item_metadata = vec![
             NativeCompactionItemMetadata {
@@ -2084,12 +2349,14 @@ mod tests {
                 kind: NativeCompactionItemKind::Message,
                 item_id: Some("msg-retained".into()),
                 internal_chat_message_metadata_passthrough: None,
+                user_message_provider_metadata: None,
             },
             NativeCompactionItemMetadata {
                 input_index: 1,
                 kind: NativeCompactionItemKind::Compaction,
                 item_id: Some("cmp-retained".into()),
                 internal_chat_message_metadata_passthrough: None,
+                user_message_provider_metadata: None,
             },
         ];
         let replacement = vec![
@@ -2108,6 +2375,21 @@ mod tests {
         appended.push(ConversationItem::assistant("later assistant"));
         appended.push(ConversationItem::user("later user"));
         assert!(crate::native_compaction_compatibility(&appended).is_ok());
+
+        let mut provider_metadata_outside_segment = appended.clone();
+        let ConversationItem::User(later_user) =
+            provider_metadata_outside_segment.last_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        later_user.provider_metadata = Some(UserMessageProviderMetadata::codex(
+            ProviderReplayField::Value(rs::OutputStatus::Completed),
+            ProviderReplayField::Missing,
+        ));
+        assert!(
+            crate::native_compaction_compatibility(&provider_metadata_outside_segment).is_err(),
+            "provider-owned replay fields must remain bound to the immutable native segment"
+        );
 
         let mut removed_inside_segment = replacement.clone();
         removed_inside_segment.remove(1);
@@ -2148,40 +2430,196 @@ mod tests {
     }
 
     #[test]
-    fn native_compact_rejects_message_phase_status_images_and_unknown_fields() {
-        for message in [
-            serde_json::json!({
-                "type": "message",
-                "id": "msg_status",
-                "role": "user",
-                "status": "completed",
-                "content": [{"type": "input_text", "text": "retained"}]
-            }),
-            serde_json::json!({
-                "type": "message",
-                "id": "msg_phase",
-                "role": "user",
-                "phase": "commentary",
-                "content": [{"type": "input_text", "text": "retained"}]
-            }),
-            serde_json::json!({
-                "type": "message",
-                "id": "msg_image",
-                "role": "user",
-                "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
-            }),
+    fn native_compact_accepts_optional_user_status_and_phase() {
+        for (message, expected_status, expected_phase) in [
+            (
+                serde_json::json!({
+                    "type": "message",
+                    "id": "msg_status",
+                    "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "input_text", "text": "retained"}]
+                }),
+                ProviderReplayField::Value(rs::OutputStatus::Completed),
+                ProviderReplayField::Missing,
+            ),
+            (
+                serde_json::json!({
+                    "type": "message",
+                    "id": "msg_phase",
+                    "role": "user",
+                    "phase": "commentary",
+                    "content": [{"type": "input_text", "text": "retained"}]
+                }),
+                ProviderReplayField::Missing,
+                ProviderReplayField::Value("commentary".to_string()),
+            ),
+            (
+                serde_json::json!({
+                    "type": "message",
+                    "id": "msg_both",
+                    "role": "user",
+                    "status": "in_progress",
+                    "phase": "analysis",
+                    "content": [{"type": "input_text", "text": "retained"}]
+                }),
+                ProviderReplayField::Value(rs::OutputStatus::InProgress),
+                ProviderReplayField::Value("analysis".to_string()),
+            ),
         ] {
             let response: CodexCompactResponse = serde_json::from_value(serde_json::json!({
                 "output": [message, {"type": "compaction", "encrypted_content": "opaque"}]
             }))
-            .expect("known but unsupported fields deserialize for an actionable conversion error");
-            let error = codex_compact_output_to_conversation(
+            .expect("supported response shape");
+            let replacement = codex_compact_output_to_conversation(
                 response.output,
                 NativeCompactionCompatibility::codex("gpt-test", None),
             )
-            .expect_err("lossy message projection must fail closed");
-            assert!(error.contains("unsupported compact message"), "{error}");
+            .expect("optional retained-user replay fields must be accepted");
+            let ConversationItem::User(user) = &replacement[0] else {
+                panic!("expected retained user message")
+            };
+            let metadata = user
+                .provider_metadata
+                .as_ref()
+                .expect("provider metadata must be retained");
+            let (status, phase) = metadata.codex_fields();
+            assert_eq!(status, &expected_status);
+            assert_eq!(phase, &expected_phase);
         }
+    }
+
+    #[test]
+    fn native_compact_null_presence_survives_durable_reload_and_both_successor_wires() {
+        let response: CodexCompactResponse = serde_json::from_value(serde_json::json!({
+            "output": [
+                {
+                    "type": "message", "id": "msg_null_status", "role": "user",
+                    "status": null,
+                    "content": [{"type": "input_text", "text": "status null only"}]
+                },
+                {
+                    "type": "message", "id": "msg_null_phase", "role": "user",
+                    "phase": null,
+                    "content": [{"type": "input_text", "text": "phase null only"}]
+                },
+                {
+                    "type": "message", "id": "msg_null_both", "role": "user",
+                    "status": null, "phase": null,
+                    "content": [{"type": "input_text", "text": "both null"}]
+                },
+                {"type": "compaction", "id": "cmp_nulls", "encrypted_content": "opaque"}
+            ]
+        }))
+        .unwrap();
+        let replacement = codex_compact_output_to_conversation(
+            response.output,
+            NativeCompactionCompatibility::codex("gpt-null", None),
+        )
+        .unwrap();
+
+        let durable = serde_json::to_value(&replacement).unwrap();
+        for (item_index, status_present, phase_present) in
+            [(0, true, false), (1, false, true), (2, true, true)]
+        {
+            let payload = durable[item_index]["provider_metadata"]["payload"]
+                .as_object()
+                .unwrap();
+            assert_eq!(payload.contains_key("status"), status_present);
+            assert_eq!(payload.contains_key("phase"), phase_present);
+            if status_present {
+                assert!(payload["status"].is_null());
+            }
+            if phase_present {
+                assert!(payload["phase"].is_null());
+            }
+        }
+        let manifest = durable
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "native_compaction_metadata")
+            .unwrap();
+        for (item_index, status_present, phase_present) in
+            [(0, true, false), (1, false, true), (2, true, true)]
+        {
+            let payload =
+                manifest["item_metadata"][item_index]["user_message_provider_metadata"]["payload"]
+                    .as_object()
+                    .unwrap();
+            assert_eq!(payload.contains_key("status"), status_present);
+            assert_eq!(payload.contains_key("phase"), phase_present);
+        }
+
+        let replacement: Vec<ConversationItem> =
+            serde_json::from_value(durable).expect("cold reload retained tri-state fields");
+        crate::native_compaction_compatibility(&replacement).unwrap();
+        let request = ConversationRequest {
+            items: replacement,
+            model: Some("gpt-null".into()),
+            ..Default::default()
+        };
+        let compact_wire =
+            serde_json::to_value(conversation_request_to_codex_compact_request(&request).unwrap())
+                .unwrap();
+        let mut ordinary_wire =
+            serde_json::to_value(conversation_request_to_codex_create_response(&request)).unwrap();
+        patch_response_message_metadata(
+            &mut ordinary_wire,
+            &response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
+        patch_response_item_metadata_passthrough(
+            &mut ordinary_wire,
+            &response_item_metadata_passthrough(&request).unwrap(),
+        )
+        .unwrap();
+
+        for wire in [&compact_wire, &ordinary_wire] {
+            let input = wire["input"].as_array().unwrap();
+            assert_eq!(input[0]["id"], "msg_null_status");
+            assert!(input[0].get("status").unwrap().is_null());
+            assert!(input[0].get("phase").is_none());
+            assert_eq!(input[1]["id"], "msg_null_phase");
+            assert!(input[1].get("status").is_none());
+            assert!(input[1].get("phase").unwrap().is_null());
+            assert_eq!(input[2]["id"], "msg_null_both");
+            assert!(input[2].get("status").unwrap().is_null());
+            assert!(input[2].get("phase").unwrap().is_null());
+        }
+
+        let unknown_status = serde_json::from_value::<CodexCompactResponse>(serde_json::json!({
+            "output": [{
+                "type": "message", "role": "user", "status": "future_status",
+                "content": [{"type": "input_text", "text": "unknown"}]
+            }]
+        }));
+        assert!(
+            unknown_status.is_err(),
+            "unknown status must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn native_compact_still_rejects_images_and_unknown_fields() {
+        let response: CodexCompactResponse = serde_json::from_value(serde_json::json!({
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_image",
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "https://example.test/image.png"}]
+                },
+                {"type": "compaction", "encrypted_content": "opaque"}
+            ]
+        }))
+        .expect("known unsupported content deserializes for an actionable conversion error");
+        let error = codex_compact_output_to_conversation(
+            response.output,
+            NativeCompactionCompatibility::codex("gpt-test", None),
+        )
+        .expect_err("lossy image projection must fail closed");
+        assert!(error.contains("unsupported compact message"), "{error}");
 
         let error = serde_json::from_value::<CodexCompactResponse>(serde_json::json!({
             "output": [{
@@ -2388,7 +2826,8 @@ mod tests {
     ) -> serde_json::Value {
         let mut wire =
             serde_json::to_value(conversation_request_to_codex_create_response(request)).unwrap();
-        patch_response_message_item_ids(&mut wire, &response_message_item_ids(request));
+        patch_response_message_metadata(&mut wire, &response_message_metadata(request).unwrap())
+            .unwrap();
         let metadata =
             response_item_metadata_passthrough_for_origin(request, Some(origin)).unwrap();
         patch_response_item_metadata_passthrough(&mut wire, &metadata).unwrap();
@@ -3203,6 +3642,7 @@ mod tests {
             kind: NativeCompactionItemKind::Compaction,
             item_id: Some("cmp_1".into()),
             internal_chat_message_metadata_passthrough: Some(native_metadata),
+            user_message_provider_metadata: None,
         }];
         let origin =
             crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
@@ -3249,7 +3689,11 @@ mod tests {
             response_item_metadata_passthrough_for_origin(&request, Some(&origin)).unwrap();
         let mut ordinary_wire =
             serde_json::to_value(conversation_request_to_codex_create_response(&request)).unwrap();
-        patch_response_message_item_ids(&mut ordinary_wire, &response_message_item_ids(&request));
+        patch_response_message_metadata(
+            &mut ordinary_wire,
+            &response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
         patch_response_item_metadata_passthrough(&mut ordinary_wire, &metadata).unwrap();
         let ordinary_input = ordinary_wire["input"].as_array().unwrap();
         assert_eq!(ordinary_input[0]["type"], "compaction");

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider_history::{
     LegacyProviderItemRef, NativeCompactionCompatibility, ProviderItem, ResponseOutputItemMetadata,
+    UserMessageProviderMetadata,
 };
 use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
@@ -299,6 +300,10 @@ pub struct UserItem {
     /// request. Ordinary locally-created messages leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_item_id: Option<String>,
+    /// Provider-owned fields from a retained user message. Kept in one sealed
+    /// envelope so ordinary conversation logic remains provider-neutral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<UserMessageProviderMetadata>,
     /// Set when this item was synthesized by the runtime rather than typed by
     /// a real user.  `None` for all genuine user messages.
     ///
@@ -1068,6 +1073,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1082,6 +1088,7 @@ impl ConversationItem {
         Self::User(UserItem {
             content: parts,
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1100,6 +1107,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1119,6 +1127,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SystemReminder),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1149,6 +1158,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1163,6 +1173,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
             cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
@@ -1181,6 +1192,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::AutoContinue),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1199,6 +1211,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1218,6 +1231,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::Interjection),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1232,6 +1246,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1246,6 +1261,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1260,6 +1276,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1274,6 +1291,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::GoalSummary),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1292,6 +1310,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1306,6 +1325,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1320,6 +1340,7 @@ impl ConversationItem {
                 text: Arc::<str>::from(content.into()),
             }],
             response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::StopHookFeedback),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -3823,6 +3844,7 @@ mod tests {
             kind: NativeCompactionItemKind::Compaction,
             item_id: Some("cmp-identity".into()),
             internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
         }];
         vec![
             ConversationItem::native_compaction_metadata(compatibility),

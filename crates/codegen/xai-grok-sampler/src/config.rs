@@ -195,7 +195,7 @@ pub type SharedHeaderInjector = std::sync::Arc<dyn HeaderInjector>;
 /// Retry knobs for the sampler's internal transport-error retry loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
-    /// Maximum number of retries before giving up.
+    /// Maximum number of total request attempts, including the initial request.
     pub max_retries: u32,
     /// After this many rate-limit (429) retries, escalate to the caller.
     /// Lower than `max_retries` because rate-limit waits can be long.

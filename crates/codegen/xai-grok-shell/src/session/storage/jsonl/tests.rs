@@ -1048,6 +1048,7 @@ async fn verbatim_copy_after_native_compaction_then_rewind_uses_latest_marker() 
         kind: NativeCompactionItemKind::Compaction,
         item_id: Some("cmp-copy".into()),
         internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
     }];
     let authoritative = vec![
         ConversationItem::system("system"),

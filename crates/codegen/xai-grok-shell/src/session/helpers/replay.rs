@@ -1154,6 +1154,7 @@ mod tests {
             kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
             item_id: Some("cmp-verify".into()),
             internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
         }];
         let checkpoint = CompactionCheckpointFile {
             checkpoint_id: "tx-verify".into(),

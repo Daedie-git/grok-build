@@ -94,14 +94,66 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
         && responses_event_has_meaningful_content(event)
 }
 
+/// Preserve the provider's structured terminal disposition instead of
+/// collapsing every in-stream failure to HTTP 500. The sampler's retry policy
+/// relies on the status to distinguish permanent request failures from
+/// transient availability failures.
+fn response_event_error(code: Option<&str>, message: String) -> SamplingError {
+    let normalized = code.unwrap_or_default().trim().to_ascii_lowercase();
+    let normalized_message = message.to_ascii_lowercase();
+    let numeric_status = normalized
+        .parse::<u16>()
+        .ok()
+        .and_then(|status| reqwest::StatusCode::from_u16(status).ok());
+    let status = numeric_status.unwrap_or_else(|| match normalized.as_str() {
+        "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
+            reqwest::StatusCode::BAD_REQUEST
+        }
+        "authentication_error" | "unauthorized" => reqwest::StatusCode::UNAUTHORIZED,
+        "permission_error" | "forbidden" => reqwest::StatusCode::FORBIDDEN,
+        "not_found_error" => reqwest::StatusCode::NOT_FOUND,
+        "rate_limit_error" | "rate_limit_exceeded" => reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "service_unavailable_error" | "overloaded_error" => {
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        }
+        "timeout_error" | "vector_store_timeout" => reqwest::StatusCode::GATEWAY_TIMEOUT,
+        _ if normalized_message.contains("invalid_request_error")
+            || normalized_message.contains("invalid_prompt")
+            || xai_grok_sampling_types::is_context_length_error(&normalized_message) =>
+        {
+            reqwest::StatusCode::BAD_REQUEST
+        }
+        _ if normalized_message.contains("authentication_error") => {
+            reqwest::StatusCode::UNAUTHORIZED
+        }
+        _ if normalized_message.contains("permission_error") => reqwest::StatusCode::FORBIDDEN,
+        _ if normalized_message.contains("rate_limit_error")
+            || normalized_message.contains("rate_limit_exceeded") =>
+        {
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        }
+        _ => reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+    });
+    let message = match code {
+        Some(code) if !code.is_empty() => format!("{code}: {message}"),
+        _ => message,
+    };
+    SamplingError::Api {
+        status,
+        message,
+        model_metadata: None,
+        retry_after_secs: None,
+        should_retry: None,
+    }
+}
+
 /// Transform a raw Responses API event stream into a stream of
 /// [`SamplingEvent`]s.
 ///
 /// Yields exactly one terminal event ([`SamplingEvent::Completed`] or
 /// [`SamplingEvent::Failed`]) per request. Server-side `ResponseFailed`
-/// and `ResponseError` events are translated to
-/// `SamplingError::Api { status: 500, .. }` so the actor's retry loop
-/// treats them as retryable.
+/// and `ResponseError` events retain their structured error disposition so
+/// only transient failures enter the actor's retry loop.
 ///
 /// `doom_loop` is the collector returned alongside `raw_stream` by
 /// `SamplingClient::conversation_stream_responses`; any signals the SSE
@@ -418,18 +470,17 @@ where
 
                 ResponseStreamEvent::ResponseFailed(failed_event) => {
                     let response = failed_event.response;
-                    let error_message = response
-                        .error
-                        .as_ref()
-                        .map(|e| format!("{}: {}", e.code, e.message))
-                        .unwrap_or_else(|| "Response failed with unknown error".to_string());
-                    let err = SamplingError::Api {
-                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                        message: error_message,
-                        model_metadata: None,
-                        retry_after_secs: None,
-                        should_retry: None,
-                    };
+                    let err = response.error.as_ref().map_or_else(
+                        || {
+                            response_event_error(
+                                None,
+                                "Response failed with unknown error".to_string(),
+                            )
+                        },
+                        |error| {
+                            response_event_error(Some(error.code.as_str()), error.message.clone())
+                        },
+                    );
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -438,15 +489,10 @@ where
                 }
 
                 ResponseStreamEvent::ResponseError(error_event) => {
-                    let code = error_event.code.unwrap_or_else(|| "error".to_string());
-                    let error_message = format!("{}: {}", code, error_event.message);
-                    let err = SamplingError::Api {
-                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                        message: error_message,
-                        model_metadata: None,
-                        retry_after_secs: None,
-                        should_retry: None,
-                    };
+                    let err = response_event_error(
+                        error_event.code.as_deref(),
+                        error_event.message,
+                    );
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -730,10 +776,10 @@ mod tests {
         build_response(rs_types::Status::Completed)
     }
 
-    fn failed_response_with_error(message: &str) -> rs_types::Response {
+    fn failed_response_with_error(code: &str, message: &str) -> rs_types::Response {
         let mut r = build_response(rs_types::Status::Failed);
         r.error = Some(rs_types::ErrorObject {
-            code: "server_error".into(),
+            code: code.into(),
             message: message.into(),
         });
         r
@@ -828,16 +874,16 @@ mod tests {
     #[test]
     fn empty_failed_response_is_not_treated_as_output() {
         let event = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
-            response: failed_response_with_error("boom"),
+            response: failed_response_with_error("server_error", "boom"),
             sequence_number: 0,
         });
         assert!(!responses_event_may_have_output(&event));
     }
 
     #[tokio::test]
-    async fn response_failed_yields_failed_500() {
+    async fn response_failed_server_error_remains_retryable_500() {
         let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
-            response: failed_response_with_error("boom"),
+            response: failed_response_with_error("server_error", "boom"),
             sequence_number: 0,
         });
         let raw = stream::iter(vec![Ok(failed)]).boxed();
@@ -854,10 +900,65 @@ mod tests {
             SamplingEvent::Failed { error, .. } => {
                 assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
                 assert_eq!(error.status_code, Some(500));
+                assert!(error.is_retryable);
                 assert!(error.message.contains("boom"));
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn response_failed_invalid_request_is_non_retryable_400() {
+        let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("invalid_request_error", "bad history"),
+            sequence_number: 0,
+        });
+        let events = collect(stream_responses(
+            stream::iter(vec![Ok(failed)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert_eq!(error.status_code, Some(400));
+                assert!(!error.is_retryable);
+                assert!(error.message.contains("invalid_request_error"));
+                assert!(error.message.contains("bad history"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_event_error_preserves_retry_disposition() {
+        for code in ["invalid_request_error", "authentication_error", "403"] {
+            let error = response_event_error(Some(code), "permanent".into());
+            assert!(!error.is_retryable(), "{code} must not be retried");
+        }
+        for code in [
+            "server_error",
+            "service_unavailable_error",
+            "overloaded_error",
+            "503",
+        ] {
+            let error = response_event_error(Some(code), "transient".into());
+            assert!(error.is_retryable(), "{code} must remain retryable");
+        }
+        let wrapped =
+            response_event_error(Some("error"), "invalid_request_error: bad history".into());
+        assert!(!wrapped.is_retryable());
+        assert!(matches!(
+            wrapped,
+            SamplingError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

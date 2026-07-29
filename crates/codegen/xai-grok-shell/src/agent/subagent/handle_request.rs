@@ -1,6 +1,9 @@
 use super::*;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
+
+const FINALIZATION_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(super) fn canonical_total_tokens(totals: &xai_chat_state::UsageTotals) -> u64 {
     totals.total_tokens()
 }
@@ -37,7 +40,10 @@ pub(super) async fn record_subagent_usage(
             {
                 return false;
             }
-            ack.await.is_ok()
+            matches!(
+                tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await,
+                Ok(Ok(()))
+            )
         }
     }
 }
@@ -1691,7 +1697,10 @@ pub(crate) async fn run_shell_child(
                 )
                 .is_ok()
             {
-                ack.await.is_ok()
+                matches!(
+                    tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await,
+                    Ok(Ok(()))
+                )
             } else {
                 false
             }
@@ -1711,7 +1720,7 @@ pub(crate) async fn run_shell_child(
                 ))
                 .is_ok()
             {
-                let _ = ack.await;
+                let _ = tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await;
             }
         }
     }

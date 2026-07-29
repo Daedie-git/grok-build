@@ -23,6 +23,10 @@ use super::types::{
 use crate::register_resource;
 use xai_tool_runtime::ToolError;
 
+const DEFAULT_BLOCKING_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const QUERY_RESPONSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const NON_BLOCKING_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Abstraction over the mechanism used to spawn, query, and cancel subagents.
 ///
 /// Injected into `Resources` as [`SubagentBackendResource`] so that
@@ -310,7 +314,27 @@ impl SubagentBackend for ChannelBackend {
         if sent.is_err() {
             return None;
         }
-        response_rx.await.ok().flatten()
+        let response_timeout = if block {
+            std::time::Duration::from_millis(
+                timeout_ms.unwrap_or(DEFAULT_BLOCKING_QUERY_TIMEOUT.as_millis() as u64),
+            )
+            .saturating_add(QUERY_RESPONSE_GRACE)
+        } else {
+            NON_BLOCKING_QUERY_TIMEOUT
+        };
+        match tokio::time::timeout(response_timeout, response_rx).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(_)) => None,
+            Err(_) => {
+                tracing::warn!(
+                    subagent_id = id,
+                    block,
+                    timeout_ms = response_timeout.as_millis() as u64,
+                    "subagent coordinator query response timed out"
+                );
+                None
+            }
+        }
     }
 
     async fn cancel(&self, id: &str) -> SubagentCancelOutcome {

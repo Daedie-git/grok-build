@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::coordinator_state::{
     ActiveChild, BlockingWaiter, BufferedCompletion, ChildRecord, CompletedChild, InternalEvent,
-    ListRequest, PendingChild, ProgressFuture, ProgressTarget, ReplyFuture, TaggedFuture,
+    ListRequest, PendingChild, ProgressFuture, ReplyFuture, TaggedFuture, TimedProgressFuture,
     active_summary, background_at_deadline, background_if_caller_gone, completed_snapshot,
     completion_summary, sleep_until, workflow_outstanding,
 };
@@ -56,7 +56,9 @@ pub struct SubagentCoordinator<R: ChildRunner> {
     >,
     validations: FuturesUnordered<ReplyFuture<R::ValidateFuture, SubagentValidateTypeOutcome>>,
     descriptions: FuturesUnordered<ReplyFuture<R::DescribeFuture, SubagentDescribeOutcome>>,
-    progress: FuturesUnordered<ProgressFuture<<R::Control as ChildControl>::ProgressFuture>>,
+    progress: FuturesUnordered<
+        ProgressFuture<TimedProgressFuture<<R::Control as ChildControl>::ProgressFuture>>,
+    >,
     list_requests: HashMap<u64, ListRequest>,
     next_list_request_id: u64,
 }
@@ -134,6 +136,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 Some((respond_to, outcome)) = self.descriptions.next(), if !self.descriptions.is_empty() => {
                     let _ = respond_to.send(outcome);
                 }
+                _ = sleep_until(deadline), if deadline.is_some() => self.process_deadlines(),
                 Some((seed, target, progress)) = self.progress.next(), if !self.progress.is_empty() => {
                     self.finish_progress(seed, target, progress);
                 }
@@ -146,7 +149,6 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         None => commands_open = false,
                     }
                 }
-                _ = sleep_until(deadline), if deadline.is_some() => self.process_deadlines(),
             }
             while self.completed.len() > MAX_COMPLETED_ENTRIES {
                 let Some(id) = self.completed_order.pop_front() else {
@@ -844,11 +846,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 if waiter.respond_to.is_closed() {
                     continue;
                 }
-                if self.active.contains_key(&id) {
-                    self.queue_active_progress(&id, ProgressTarget::Query(waiter.respond_to));
-                } else {
-                    let _ = waiter.respond_to.send(self.ready_snapshot(&id));
-                }
+                // A deadline is a hard boundary: never replace an expired wait
+                // with another asynchronous progress lookup. Apart from
+                // violating the caller's timeout, moving the responder into a
+                // stalled progress future means `finish_child` can no longer
+                // find and resolve it.
+                let _ = waiter.respond_to.send(self.snapshot_without_progress(&id));
             }
         }
     }

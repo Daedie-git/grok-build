@@ -1282,9 +1282,28 @@ impl SessionActor {
         max_wait: std::time::Duration,
     ) -> UsageDrainOutcome {
         const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + max_wait;
+        let deadline = tokio::time::Instant::now() + max_wait;
         loop {
-            let reply = self.outstanding_reply_for_prompt(prompt_id).await;
+            let reply = match tokio::time::timeout_at(
+                deadline,
+                self.outstanding_reply_for_prompt(prompt_id),
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(_) => {
+                    tracing::warn!(
+                        prompt_id,
+                        max_wait_ms = max_wait.as_millis() as u64,
+                        "subagent usage drain timed out while querying coordinator; usage may under-count"
+                    );
+                    return UsageDrainOutcome {
+                        fail_closed: true,
+                        background_live: false,
+                        sticky_report: false,
+                    };
+                }
+            };
             match reply.as_ref() {
                 None => {
                     tracing::warn!(
@@ -1305,7 +1324,7 @@ impl SessionActor {
                     };
                 }
                 Some(r) => {
-                    if std::time::Instant::now() >= deadline {
+                    if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(
                             prompt_id,
                             count = r.live_ids.len(),
@@ -1320,7 +1339,7 @@ impl SessionActor {
                     }
                 }
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)).await;
         }
     }
     pub(super) async fn snapshot_prompt_usage(
@@ -2289,12 +2308,22 @@ impl SessionActor {
                 self.send_available_commands_update().await;
             }
             turn_span_totals.record(&tracing::Span::current(), &response);
-            let _ = self.compaction.auto_compact_suppressed.compare_exchange(
-                crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS,
-                crate::session::compaction_config::SUPPRESS_NONE,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            if self
+                .compaction
+                .auto_compact_suppressed
+                .compare_exchange(
+                    crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS,
+                    crate::session::compaction_config::SUPPRESS_NONE,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.compaction.auto_compact_retry_not_before_ms.store(
+                    crate::session::compaction_config::AUTO_COMPACT_RETRY_READY,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             self.clear_auth_compact_suppression();
             let model_duration_ms = model_timer.elapsed().as_millis() as u64;
             {

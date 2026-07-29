@@ -31,9 +31,9 @@ pub use self::codex::{
     conversation_request_to_codex_compact_request_for_origin,
     conversation_request_to_codex_create_response, is_codex_backend_url,
     model_rejects_reasoning_summary, normalize_create_response_for_codex,
-    patch_response_item_metadata_passthrough, patch_response_message_item_ids,
+    patch_response_item_metadata_passthrough, patch_response_message_metadata,
     response_item_metadata_passthrough, response_item_metadata_passthrough_for_origin,
-    response_message_item_ids,
+    response_message_metadata,
 };
 pub use self::conversation::*;
 pub use self::doom_loop::{
@@ -50,10 +50,11 @@ pub use self::provider_capabilities::{
     capabilities_for_protocol, resolve_provider,
 };
 pub use self::provider_history::{
-    InternalChatMessageMetadataPassthrough, NativeCompactionCompatibility,
-    NativeCompactionItemKind, NativeCompactionItemMetadata, ProviderItem, ResponseMetadataOrigin,
-    ResponseOutputItemKind, ResponseOutputItemMetadata, ResponseOutputItemOrder,
-    ResponsesInputItemMetadata, ResponsesInputItemOrder,
+    CodexResponseMessageMetadata, InternalChatMessageMetadataPassthrough,
+    NativeCompactionCompatibility, NativeCompactionItemKind, NativeCompactionItemMetadata,
+    ProviderItem, ProviderReplayField, ResponseMetadataOrigin, ResponseOutputItemKind,
+    ResponseOutputItemMetadata, ResponseOutputItemOrder, ResponsesInputItemMetadata,
+    ResponsesInputItemOrder, UserMessageProviderMetadata,
 };
 pub use self::provider_history_policy::{
     SamplingIdentityHistoryError, native_compaction_compatibility,

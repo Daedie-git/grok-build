@@ -243,11 +243,18 @@ impl SamplingError {
             SamplingError::InvalidConfiguration(_) => false,
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
+            SamplingError::Api {
+                should_retry: Some(false),
+                ..
+            } => false,
             SamplingError::Api { status, .. } => {
                 matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 520)
             }
             SamplingError::EventStreamError(_) => true,
-            SamplingError::StreamError { .. } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => is_retryable_stream_error(error_type, message),
             SamplingError::IdleTimeout { .. } => false,
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
@@ -289,6 +296,46 @@ impl SamplingError {
             _ => false,
         }
     }
+}
+
+/// Classify structured error envelopes delivered inside an SSE stream.
+///
+/// Providers use these envelopes for both transient availability failures and
+/// permanent request/auth failures. Treating every envelope as retryable
+/// repeatedly submits malformed history and invalid requests. Unknown types
+/// remain retryable for backward compatibility; only well-known permanent
+/// dispositions fail closed.
+fn is_retryable_stream_error(error_type: &str, message: &str) -> bool {
+    if is_context_length_error(message) {
+        return false;
+    }
+
+    let kind = error_type.trim().to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    let permanent_marker = |value: &str| {
+        matches!(
+            value,
+            "invalid_request_error"
+                | "authentication_error"
+                | "permission_error"
+                | "insufficient_quota"
+                | "account_deactivated"
+                | "billing_error"
+                | "not_found_error"
+        )
+    };
+    !permanent_marker(kind.as_str())
+        && ![
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "insufficient_quota",
+            "account_deactivated",
+            "billing_error",
+            "not_found_error",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 impl From<reqwest::Error> for SamplingError {
@@ -545,6 +592,54 @@ mod tests {
         // Verify the existing contract hasn't changed — EventStreamError is retryable.
         let err = SamplingError::EventStreamError("connection reset".into());
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn structured_stream_errors_distinguish_permanent_and_transient_failures() {
+        for error_type in [
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "insufficient_quota",
+        ] {
+            let err = SamplingError::StreamError {
+                error_type: error_type.into(),
+                message: "same request will fail again".into(),
+            };
+            assert!(!err.is_retryable(), "{error_type} must be terminal");
+        }
+        assert!(
+            !SamplingError::StreamError {
+                error_type: "unknown".into(),
+                message: "invalid_request_error: bad history".into(),
+            }
+            .is_retryable(),
+            "permanent markers wrapped in an unknown envelope must still be terminal"
+        );
+
+        for error_type in [
+            "server_error",
+            "service_unavailable_error",
+            "overloaded_error",
+        ] {
+            let err = SamplingError::StreamError {
+                error_type: error_type.into(),
+                message: "try again later".into(),
+            };
+            assert!(err.is_retryable(), "{error_type} must remain retryable");
+        }
+    }
+
+    #[test]
+    fn api_should_retry_false_is_honored_by_direct_callers() {
+        let err = SamplingError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "request-content failure".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: Some(false),
+        };
+        assert!(!err.is_retryable());
     }
 
     #[test]

@@ -33,6 +33,7 @@ fn compaction_fixture(info: &Info) -> (CompactionCheckpointFile, SessionUpdate) 
         kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
         item_id: Some("cmp-recovery".into()),
         internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
     }];
     let checkpoint = CompactionCheckpointFile {
         checkpoint_id: "recovery-checkpoint".into(),
@@ -643,8 +644,35 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
                     "type": "message",
                     "id": "msg_cold",
                     "role": "user",
+                    "status": "completed",
+                    "phase": "commentary",
                     "content": [{"type": "input_text", "text": "retained"}],
                     "internal_chat_message_metadata_passthrough": {"turn_id": "turn-cold-message"}
+                },
+                {
+                    "type": "message",
+                    "id": "msg_cold_status_null",
+                    "role": "user",
+                    "status": null,
+                    "content": [{"type": "input_text", "text": "status null"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-cold-status-null"}
+                },
+                {
+                    "type": "message",
+                    "id": "msg_cold_phase_null",
+                    "role": "user",
+                    "phase": null,
+                    "content": [{"type": "input_text", "text": "phase null"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-cold-phase-null"}
+                },
+                {
+                    "type": "message",
+                    "id": "msg_cold_both_null",
+                    "role": "user",
+                    "status": null,
+                    "phase": null,
+                    "content": [{"type": "input_text", "text": "both null"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-cold-both-null"}
                 },
                 {
                     "type": "reasoning",
@@ -771,10 +799,11 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
     };
     let created = xai_grok_sampling_types::conversation_request_to_codex_create_response(&request);
     let mut wire = serde_json::to_value(created).unwrap();
-    xai_grok_sampling_types::patch_response_message_item_ids(
+    xai_grok_sampling_types::patch_response_message_metadata(
         &mut wire,
-        &xai_grok_sampling_types::response_message_item_ids(&request),
-    );
+        &xai_grok_sampling_types::response_message_metadata(&request).unwrap(),
+    )
+    .unwrap();
     xai_grok_sampling_types::patch_response_item_metadata_passthrough(
         &mut wire,
         &xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
@@ -786,11 +815,22 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
     .unwrap();
     let input = wire["input"].as_array().unwrap();
     assert_eq!(input[0]["id"], "msg_cold");
-    assert_eq!(input[1]["id"], "rs_cold");
-    assert_eq!(input[1]["encrypted_content"], "cipher-reasoning-cold");
-    assert_eq!(input[2]["id"], "cmp_cold");
-    assert_eq!(input[2]["encrypted_content"], "cipher-compaction-cold");
-    assert_eq!(input[3]["id"], "msg_after_compact");
+    assert_eq!(input[0]["status"], "completed");
+    assert_eq!(input[0]["phase"], "commentary");
+    assert_eq!(input[1]["id"], "msg_cold_status_null");
+    assert!(input[1].get("status").unwrap().is_null());
+    assert!(input[1].get("phase").is_none());
+    assert_eq!(input[2]["id"], "msg_cold_phase_null");
+    assert!(input[2].get("status").is_none());
+    assert!(input[2].get("phase").unwrap().is_null());
+    assert_eq!(input[3]["id"], "msg_cold_both_null");
+    assert!(input[3].get("status").unwrap().is_null());
+    assert!(input[3].get("phase").unwrap().is_null());
+    assert_eq!(input[4]["id"], "rs_cold");
+    assert_eq!(input[4]["encrypted_content"], "cipher-reasoning-cold");
+    assert_eq!(input[5]["id"], "cmp_cold");
+    assert_eq!(input[5]["encrypted_content"], "cipher-compaction-cold");
+    assert_eq!(input[6]["id"], "msg_after_compact");
     assert_eq!(
         input
             .iter()
@@ -802,6 +842,9 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
             .collect::<Vec<_>>(),
         [
             "turn-cold-message",
+            "turn-cold-status-null",
+            "turn-cold-phase-null",
+            "turn-cold-both-null",
             "turn-cold-reasoning",
             "turn-cold-compaction",
             "turn-after-compact"
@@ -816,6 +859,14 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(compact_wire["input"][0]["status"], "completed");
+    assert_eq!(compact_wire["input"][0]["phase"], "commentary");
+    assert!(compact_wire["input"][1].get("status").unwrap().is_null());
+    assert!(compact_wire["input"][1].get("phase").is_none());
+    assert!(compact_wire["input"][2].get("status").is_none());
+    assert!(compact_wire["input"][2].get("phase").unwrap().is_null());
+    assert!(compact_wire["input"][3].get("status").unwrap().is_null());
+    assert!(compact_wire["input"][3].get("phase").unwrap().is_null());
     assert_eq!(
         compact_wire["input"]
             .as_array()
@@ -829,6 +880,9 @@ async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
             .collect::<Vec<_>>(),
         [
             "turn-cold-message",
+            "turn-cold-status-null",
+            "turn-cold-phase-null",
+            "turn-cold-both-null",
             "turn-cold-reasoning",
             "turn-cold-compaction",
             "turn-after-compact"
@@ -864,11 +918,9 @@ async fn cold_load_rejects_missing_or_mutated_native_manifest() {
                 .as_array_mut()
                 .unwrap()
                 .iter_mut()
-                .find(|item| {
-                    item["type"] == "provider" && item["kind"] == "native_compaction_metadata"
-                })
+                .find(|item| item["type"] == "native_compaction_metadata")
                 .unwrap();
-            mutation(descriptor["payload"].as_object_mut().unwrap());
+            mutation(descriptor.as_object_mut().unwrap());
         };
 
     let mut missing = valid_value.clone();
@@ -897,6 +949,43 @@ async fn cold_load_rejects_missing_or_mutated_native_manifest() {
     });
     invalid.push(duplicate);
 
+    let mut missing_user_binding = valid_value.clone();
+    mutate_manifest(&mut missing_user_binding, &|manifest| {
+        manifest["item_metadata"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("user_message_provider_metadata");
+    });
+    invalid.push(missing_user_binding);
+
+    let mut removed_user_metadata = valid_value.clone();
+    removed_user_metadata
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["type"] == "user")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_metadata");
+    invalid.push(removed_user_metadata);
+
+    let mut mutated_user_metadata = valid_value.clone();
+    mutated_user_metadata
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["type"] == "user")
+        .unwrap()["provider_metadata"]["payload"]["status"] = serde_json::json!("completed");
+    invalid.push(mutated_user_metadata);
+
+    let mut user_fields_on_reasoning = valid_value.clone();
+    mutate_manifest(&mut user_fields_on_reasoning, &|manifest| {
+        let binding = manifest["item_metadata"][0]["user_message_provider_metadata"].clone();
+        manifest["item_metadata"][1]["user_message_provider_metadata"] = binding;
+    });
+    invalid.push(user_fields_on_reasoning);
+
     for (field, value) in [
         ("input_index", serde_json::json!(9)),
         ("kind", serde_json::json!("message")),
@@ -919,7 +1008,7 @@ async fn cold_load_rejects_missing_or_mutated_native_manifest() {
     missing_descriptor
         .as_array_mut()
         .unwrap()
-        .retain(|item| item["type"] != "provider" || item["kind"] != "native_compaction_metadata");
+        .retain(|item| item["type"] != "native_compaction_metadata");
     invalid.push(missing_descriptor);
 
     let mut legacy = valid_value;

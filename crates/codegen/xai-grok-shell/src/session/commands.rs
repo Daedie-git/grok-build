@@ -101,6 +101,7 @@ pub enum NotificationSource {
     MonitorEvent { task_id: String },
     MonitorCompleted { task_id: String },
     BashTaskCompleted { task_id: String },
+    SubagentCompleted { subagent_id: String },
 }
 impl NotificationSource {
     pub fn task_id(&self) -> &str {
@@ -108,6 +109,7 @@ impl NotificationSource {
             Self::MonitorEvent { task_id }
             | Self::MonitorCompleted { task_id }
             | Self::BashTaskCompleted { task_id } => task_id,
+            Self::SubagentCompleted { subagent_id } => subagent_id,
         }
     }
 }
@@ -170,7 +172,8 @@ pub enum SessionCommand {
         /// Also derived server-side during an interruptible wait (see
         /// [`SessionActor::queue_input`]).
         send_now: bool,
-        /// Actor-authoritative admission and deferred fallback for terminal task wakes.
+        /// Actor-authoritative admission and deferred fallback for terminal
+        /// task and subagent wakes.
         admission: Option<TaskWakeAdmission>,
         tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
         respond_to: oneshot::Sender<PromptTurnResult>,

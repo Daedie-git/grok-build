@@ -242,7 +242,7 @@ impl TaskOutputTool {
             && (!initial.pending_bash_ids.is_empty() || !initial.pending_subagent_ids.is_empty())
         {
             let deadline = tokio::time::Instant::now() + timeout;
-            wait_all_event_driven(
+            let waited_subagents = wait_all_event_driven(
                 &terminal,
                 &backend,
                 &initial.pending_bash_ids,
@@ -250,12 +250,13 @@ impl TaskOutputTool {
                 deadline,
             )
             .await;
-            resolve_tasks(
+            resolve_tasks_with_subagent_snapshots(
                 task_ids,
                 &terminal,
                 &backend,
                 &read_file_name,
                 max_output_bytes,
+                &waited_subagents,
             )
             .await
             .results
@@ -318,6 +319,25 @@ pub(crate) async fn resolve_tasks(
     read_file_name: &str,
     max_output_bytes: usize,
 ) -> ResolveResult {
+    resolve_tasks_with_subagent_snapshots(
+        task_ids,
+        terminal,
+        backend,
+        read_file_name,
+        max_output_bytes,
+        &std::collections::HashMap::new(),
+    )
+    .await
+}
+
+async fn resolve_tasks_with_subagent_snapshots(
+    task_ids: &[String],
+    terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
+    backend: &Option<SubagentBackendResource>,
+    read_file_name: &str,
+    max_output_bytes: usize,
+    waited_subagents: &std::collections::HashMap<String, SubagentSnapshot>,
+) -> ResolveResult {
     let mut results = Vec::with_capacity(task_ids.len());
     let mut pending_bash_ids = Vec::new();
     let mut pending_subagent_ids = Vec::new();
@@ -332,9 +352,15 @@ pub(crate) async fn resolve_tasks(
             continue;
         }
 
-        if let Some(be) = backend
-            && let Some(snap) = be.backend().query(id, false, None).await
+        let waited_snapshot = waited_subagents.get(id).cloned();
+        let queried_snapshot = if waited_snapshot.is_none()
+            && let Some(be) = backend
         {
+            be.backend().query(id, false, None).await
+        } else {
+            None
+        };
+        if let Some(snap) = waited_snapshot.or(queried_snapshot) {
             let is_terminal = snap.status.is_terminal();
             if let TaskOutputOutput::Result(r) = format_subagent_snapshot(&snap) {
                 if !is_terminal {
@@ -449,21 +475,32 @@ pub(crate) async fn wait_all_event_driven(
     bash_ids: &[String],
     subagent_ids: &[String],
     deadline: tokio::time::Instant,
-) {
+) -> std::collections::HashMap<String, SubagentSnapshot> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        return;
+        return std::collections::HashMap::new();
     }
 
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    enum WaitOutcome {
+        Bash,
+        Subagent(String, Option<SubagentSnapshot>),
+    }
+
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut waits: Vec<tokio::task::AbortHandle> = Vec::new();
 
     for id in bash_ids {
         let terminal = terminal.clone();
         let id = id.clone();
         let timeout = remaining;
-        handles.push(tokio::spawn(async move {
-            terminal.wait_for_completion(&id, Some(timeout)).await;
-        }));
+        let done_tx = done_tx.clone();
+        waits.push(
+            tokio::spawn(async move {
+                terminal.wait_for_completion(&id, Some(timeout)).await;
+                let _ = done_tx.send(WaitOutcome::Bash);
+            })
+            .abort_handle(),
+        );
     }
 
     for id in subagent_ids {
@@ -471,21 +508,46 @@ pub(crate) async fn wait_all_event_driven(
             let be = be.clone();
             let id = id.clone();
             let timeout_ms = remaining.as_millis() as u64;
-            handles.push(tokio::spawn(async move {
-                let _ = be.backend().query(&id, true, Some(timeout_ms)).await;
-            }));
+            let done_tx = done_tx.clone();
+            waits.push(
+                tokio::spawn(async move {
+                    let snapshot = be.backend().query(&id, true, Some(timeout_ms)).await;
+                    let _ = done_tx.send(WaitOutcome::Subagent(id, snapshot));
+                })
+                .abort_handle(),
+            );
         }
     }
+    drop(done_tx);
 
     // Tear the helper waits down on every exit path: all complete, deadline,
     // or cancellation of this future (see `AbortWaitsOnDrop`).
-    let _guard = AbortWaitsOnDrop(handles.iter().map(|h| h.abort_handle()).collect());
-
-    let all_fut = futures_util::future::join_all(handles);
-    tokio::select! {
-        _ = all_fut => {}
-        _ = tokio::time::sleep_until(deadline) => {}
+    let _guard = AbortWaitsOnDrop(waits);
+    let expected = bash_ids.len() + subagent_ids.len();
+    let mut received = 0usize;
+    let mut snapshots = std::collections::HashMap::new();
+    while received < expected {
+        tokio::select! {
+            biased;
+            outcome = done_rx.recv() => {
+                let Some(outcome) = outcome else {
+                    break;
+                };
+                received += 1;
+                if let WaitOutcome::Subagent(id, Some(snapshot)) = outcome {
+                    snapshots.insert(id, snapshot);
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
     }
+    // Capture responses already queued at the deadline before aborting helpers.
+    while let Ok(outcome) = done_rx.try_recv() {
+        if let WaitOutcome::Subagent(id, Some(snapshot)) = outcome {
+            snapshots.insert(id, snapshot);
+        }
+    }
+    snapshots
 }
 
 //
@@ -1996,6 +2058,90 @@ mod tests {
             }
             other => panic!("Expected Result(running), got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn multi_wait_uses_blocking_subagent_results_without_requerying() {
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let shared = resources.into_shared();
+        let (tool_done_tx, tool_done_rx) = tokio::sync::oneshot::channel();
+
+        let handler = tokio::spawn(async move {
+            for id in ["sub-a", "sub-b"] {
+                let req = unwrap_query(query_rx.recv().await.unwrap());
+                assert_eq!(req.subagent_id, id);
+                assert!(!req.block);
+                req.respond_to
+                    .send(Some(SubagentSnapshot {
+                        subagent_id: id.to_owned(),
+                        description: "working".to_owned(),
+                        subagent_type: "explore".to_owned(),
+                        status: SubagentSnapshotStatus::Running {
+                            turn_count: 1,
+                            tool_call_count: 1,
+                            tokens_used: 10,
+                            context_window_tokens: 1_000,
+                            context_usage_pct: 1,
+                            tools_used: Vec::new(),
+                            error_count: 0,
+                        },
+                        started_at_epoch_ms: 1,
+                        duration_ms: 10,
+                        persona: None,
+                    }))
+                    .unwrap();
+            }
+            let mut waiting_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let req = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(req.block);
+                assert!(waiting_ids.remove(req.subagent_id.as_str()));
+                let id = req.subagent_id.clone();
+                req.respond_to
+                    .send(Some(SubagentSnapshot {
+                        subagent_id: id.clone(),
+                        description: "working".to_owned(),
+                        subagent_type: "explore".to_owned(),
+                        status: SubagentSnapshotStatus::Completed {
+                            output: format!("{id} done"),
+                            tool_calls: 2,
+                            turns: 1,
+                            worktree_path: None,
+                        },
+                        started_at_epoch_ms: 1,
+                        duration_ms: 20,
+                        persona: None,
+                    }))
+                    .unwrap();
+            }
+            tool_done_rx.await.unwrap();
+            assert!(
+                query_rx.try_recv().is_err(),
+                "final rendering must use the authoritative blocking responses"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            xai_tool_runtime::Tool::run(
+                &TaskOutputTool,
+                test_ctx(shared),
+                TaskOutputToolInput {
+                    task_ids: vec!["sub-a".into(), "sub-b".into()],
+                    timeout_ms: Some(5_000),
+                },
+            ),
+        )
+        .await
+        .expect("completed blocking responses should render without another query")
+        .unwrap();
+        tool_done_tx.send(()).unwrap();
+        handler.await.unwrap();
+
+        let TaskOutputOutput::MultiResult(result) = result else {
+            panic!("expected multi-task result");
+        };
+        assert!(result.results.iter().all(|item| item.status == "completed"));
     }
 
     #[tokio::test]

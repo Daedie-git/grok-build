@@ -24,6 +24,12 @@ pub(crate) const SUPPRESS_UNTIL_SUCCESS: u8 = 3;
 /// (waiting for a sample deadlocks when context is already over the window).
 pub(crate) const SUPPRESS_AUTH: u8 = 4;
 
+/// No failed automatic-compaction cooldown is active.
+pub(crate) const AUTO_COMPACT_RETRY_READY: u64 = 0;
+/// Deterministic automatic-compaction failure. Only a context/model/history
+/// reset may make the same request viable.
+pub(crate) const AUTO_COMPACT_RETRY_AFTER_RESET: u64 = u64::MAX;
+
 /// No automatic compaction has been attempted in the current bounded subagent turn.
 pub(crate) const BOUNDED_COMPACT_NONE: u8 = 0;
 /// The bounded subagent's one allowed automatic compaction is in flight.
@@ -145,6 +151,11 @@ pub struct CompactionConfig {
     /// Auto-compaction suppression state (`SUPPRESS_*`) after a deterministic
     /// failure; the gates early-return unless `SUPPRESS_NONE`. Manual `/compact` ignores it.
     pub auto_compact_suppressed: AtomicU8,
+    /// UTC epoch deadline in milliseconds after a terminal automatic-compaction
+    /// failure. This gate is checked inside `run_compact_only`, including the
+    /// non-suppressible Codex safety path, so it prevents network re-submission
+    /// without allowing an over-limit model sample.
+    pub auto_compact_retry_not_before_ms: AtomicU64,
     /// Per-turn circuit breaker for bounded subagents. They may compact once,
     /// then must synthesize a result without tools; a second cycle fails closed.
     pub bounded_auto_compact_state: AtomicU8,

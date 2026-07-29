@@ -99,6 +99,33 @@ async fn usage_ack_precedes_terminal_presentation() {
             })
         ));
 }
+#[tokio::test(start_paused = true)]
+async fn usage_ack_wait_is_bounded() {
+    let (parent_cmd_tx, mut parent_cmd_rx) = mpsc::unbounded_channel();
+    let fold = tokio::spawn(async move {
+        record_subagent_usage(
+            Some(&parent_cmd_tx),
+            Some(vec![(
+                "test-model".to_string(),
+                xai_chat_state::UsageTotals {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    ..Default::default()
+                },
+            )]),
+            Some("parent-prompt".to_string()),
+            false,
+        )
+        .await
+    });
+    let command = parent_cmd_rx.recv().await.expect("usage command");
+    let SessionCommand::RecordSubagentUsage { respond_to, .. } = command else {
+        panic!("expected RecordSubagentUsage");
+    };
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    assert!(!fold.await.unwrap());
+    drop(respond_to);
+}
 /// Invariant: resolving a subagent applies the parent session's
 /// `--tools`/`--disallowed-tools`/`--permission-mode` — driven through
 /// `resolve_agent_definition` so the spawn path can't skip them.
@@ -349,7 +376,7 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         child_session_id: "sa-1".into(),
         ..Default::default()
     };
-    inject_subagent_completed_prompt(
+    let mut admission_rx = inject_subagent_completed_prompt(
         "sa-1",
         &result,
         &request,
@@ -357,14 +384,28 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         Some(&cmd_tx),
         "get_command_or_subagent_output",
         &None,
-    );
+    )
+    .expect("open parent channel returns an admission acknowledgement");
     match cmd_rx.try_recv().expect("expected synthetic Prompt") {
-        SessionCommand::Prompt { prompt_id, verbatim, .. } => {
+        SessionCommand::Prompt {
+            prompt_id,
+            verbatim,
+            admission: Some(admission),
+            ..
+        } => {
             assert!(prompt_id.starts_with("subagent-completed-"));
             assert!(verbatim);
+            assert!(matches!(
+                admission.fallback.source,
+                crate::session::commands::NotificationSource::SubagentCompleted {
+                    ref subagent_id
+                } if subagent_id == "sa-1"
+            ));
+            admission.respond_to.send(true).unwrap();
         }
         _ => panic!("expected SessionCommand::Prompt"),
     }
+    assert_eq!(admission_rx.try_recv(), Ok(true));
     assert_eq!(reservations.snapshot(), vec!["sa-1".to_string()]);
 }
 #[test]
@@ -374,7 +415,7 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
     let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
     reservations.reserve("sa-closed".into());
     let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
-    inject_subagent_completed_prompt(
+    let admission_rx = inject_subagent_completed_prompt(
         "sa-closed",
         &SubagentResult {
             success: true,
@@ -388,6 +429,7 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
         "get_command_or_subagent_output",
         &Some(trace_tx),
     );
+    assert!(admission_rx.is_none());
     assert!(
             reservations.contains("sa-closed"),
             "send failure must release only the reservation acquired by this attempt"
@@ -1369,6 +1411,7 @@ fn native_test_compatibility(
         kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
         item_id: item_id.map(str::to_string),
         internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
     }];
     compatibility
 }

@@ -1,8 +1,8 @@
-//! Sealed provider-owned durable history items.
+//! Sealed provider-owned durable history metadata.
 //!
 //! Provider payload enums remain private. Neutral callers use semantic
 //! constructors/accessors, while conversation persistence uses the crate-private
-//! legacy projection to preserve existing JSONL tags.
+//! projections to preserve existing JSONL tags and retain exact replay fields.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,165 @@ use crate::types::ApiBackend;
 pub struct InternalChatMessageMetadataPassthrough {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+}
+
+/// Lossless presence state for a provider replay field.
+///
+/// Container fields must use [`Self::is_missing`] as their serde skip predicate:
+/// a missing key is omitted, [`Self::Null`] is serialized as JSON `null`, and a
+/// concrete value is serialized without transformation. During deserialization,
+/// the container's serde default produces [`Self::Missing`], while a present
+/// JSON `null` reaches this type and produces [`Self::Null`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum ProviderReplayField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> ProviderReplayField<T> {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+impl<T: Serialize> Serialize for ProviderReplayField<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Missing | Self::Null => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ProviderReplayField<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+/// Provider-owned replay fields attached to a retained semantic user message.
+///
+/// The provider taxonomy stays sealed so neutral conversation consumers do not
+/// grow Codex-specific branches. Ordinary/local user messages leave this unset;
+/// every schema-v3 retained user owns an envelope, even when both fields were
+/// missing, so provenance and field presence remain explicit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserMessageProviderMetadata {
+    inner: UserMessageProviderMetadataInner,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum UserMessageProviderMetadataInner {
+    Codex(CodexUserMessageMetadata),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CodexUserMessageMetadata {
+    #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+    status: ProviderReplayField<rs::OutputStatus>,
+    #[serde(default, skip_serializing_if = "ProviderReplayField::is_missing")]
+    phase: ProviderReplayField<String>,
+}
+
+impl UserMessageProviderMetadata {
+    /// Retain Codex response-only message fields for exact input replay.
+    pub fn codex(
+        status: ProviderReplayField<rs::OutputStatus>,
+        phase: ProviderReplayField<String>,
+    ) -> Self {
+        Self {
+            inner: UserMessageProviderMetadataInner::Codex(CodexUserMessageMetadata {
+                status,
+                phase,
+            }),
+        }
+    }
+
+    pub(crate) fn codex_fields(
+        &self,
+    ) -> (
+        &ProviderReplayField<rs::OutputStatus>,
+        &ProviderReplayField<String>,
+    ) {
+        match &self.inner {
+            UserMessageProviderMetadataInner::Codex(metadata) => {
+                (&metadata.status, &metadata.phase)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UserMessageProviderName {
+    Codex,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct UserMessageProviderMetadataSerialize<'a> {
+    provider: UserMessageProviderName,
+    payload: &'a CodexUserMessageMetadata,
+}
+
+impl Serialize for UserMessageProviderMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.inner {
+            UserMessageProviderMetadataInner::Codex(metadata) => {
+                UserMessageProviderMetadataSerialize {
+                    provider: UserMessageProviderName::Codex,
+                    payload: metadata,
+                }
+                .serialize(serializer)
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserMessageProviderMetadataDeserialize {
+    provider: UserMessageProviderName,
+    payload: CodexUserMessageMetadata,
+}
+
+impl<'de> Deserialize<'de> for UserMessageProviderMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let UserMessageProviderMetadataDeserialize { provider, payload } =
+            UserMessageProviderMetadataDeserialize::deserialize(deserializer)?;
+        match provider {
+            UserMessageProviderName::Codex => Ok(Self {
+                inner: UserMessageProviderMetadataInner::Codex(payload),
+            }),
+        }
+    }
+}
+
+/// Codex fields aligned one-for-one with serialized user/assistant messages.
+/// This bridges message fields absent from async-openai's `EasyInputMessage`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexResponseMessageMetadata {
+    pub item_id: Option<String>,
+    pub status: ProviderReplayField<rs::OutputStatus>,
+    pub phase: ProviderReplayField<String>,
 }
 
 /// Ordinary Responses item shape used to bind provider metadata to the
@@ -174,7 +333,7 @@ pub enum NativeCompactionItemKind {
 /// `input_index` is the item's zero-based position in the subsequent Responses
 /// `input` array (canonical system instructions are excluded). Entries with no
 /// provider metadata are retained so deletion and reordering remain detectable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeCompactionItemMetadata {
     pub input_index: usize,
     pub kind: NativeCompactionItemKind,
@@ -182,6 +341,16 @@ pub struct NativeCompactionItemMetadata {
     pub item_id: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
+    /// Required on every schema-v3 message entry and forbidden on every
+    /// non-message entry. Schema v2 predates this owner binding, so omission
+    /// remains deserializable and is interpreted according to the manifest's
+    /// schema version during whole-history validation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub user_message_provider_metadata: Option<UserMessageProviderMetadata>,
 }
 
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -192,8 +361,16 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 /// Exact identity under which opaque native Codex history may be replayed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeCompactionCompatibility {
     pub schema_version: u8,
     pub backend_family: String,
@@ -212,9 +389,12 @@ pub struct NativeCompactionCompatibility {
 }
 
 impl NativeCompactionCompatibility {
-    /// Version 2 adds the mandatory durable passthrough-metadata side table.
-    /// Older clients reject it rather than replaying native history lossily.
-    pub const SCHEMA_VERSION: u8 = 2;
+    /// Version 2 added the mandatory passthrough-metadata side table. Version 3
+    /// signals that retained user status/phase may live on their durable owner.
+    /// New readers still accept exact version-2 manifests; old readers reject
+    /// version 3 before they can replay those newly represented fields lossily.
+    pub const SCHEMA_VERSION: u8 = 3;
+    pub const PREVIOUS_SCHEMA_VERSION: u8 = 2;
     pub const LEGACY_SCHEMA_VERSION: u8 = 1;
     pub const CODEX_RESPONSES_FAMILY: &'static str = "codex_responses";
 
@@ -230,10 +410,17 @@ impl NativeCompactionCompatibility {
         }
     }
 
+    pub fn has_supported_replay_schema(&self) -> bool {
+        matches!(
+            self.schema_version,
+            Self::PREVIOUS_SCHEMA_VERSION | Self::SCHEMA_VERSION
+        )
+    }
+
     /// Whether a proposed sampler identity can safely replay this opaque
     /// history. Every known identity component is exact-match only.
     pub fn matches_identity(&self, identity: &SamplingIdentity) -> bool {
-        self.schema_version == Self::SCHEMA_VERSION
+        self.has_supported_replay_schema()
             && self.backend_family == Self::CODEX_RESPONSES_FAMILY
             && identity.is_codex_responses()
             && self.model == identity.model

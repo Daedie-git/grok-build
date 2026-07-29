@@ -1095,10 +1095,10 @@ pub struct CreateResponseWrapper {
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
 
-    /// Provider message IDs aligned with serialized user/assistant messages.
-    /// Used only to bridge the pinned async-openai `InputMessage` type, which
-    /// omits the Responses API's optional message `id` field.
-    pub response_message_item_ids: Vec<Option<String>>,
+    /// Provider fields aligned with serialized user/assistant messages.
+    /// Bridges optional ID/status/phase fields absent from async-openai's
+    /// `EasyInputMessage` without weakening the typed request model.
+    pub response_message_metadata: Vec<crate::CodexResponseMessageMetadata>,
 
     /// Provider-owned metadata aligned to exact Responses input positions.
     /// Bridges the pinned async-openai request model without broad raw JSON.
@@ -1125,7 +1125,7 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
-            response_message_item_ids: vec![],
+            response_message_metadata: vec![],
             response_item_metadata_passthrough: vec![],
             response_metadata_origin: None,
             turn_routing_state: None,

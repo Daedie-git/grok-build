@@ -174,6 +174,19 @@ async fn channel_backend_query_non_blocking_passes_through() {
     handle.await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn channel_backend_query_has_an_outer_timeout() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();
+    let backend = ChannelBackend::new(tx);
+
+    let query = tokio::spawn(async move { backend.query("stalled-query", false, None).await });
+    let request = recv_event!(rx, Query);
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+
+    assert!(query.await.unwrap().is_none());
+    drop(request);
+}
+
 #[tokio::test]
 async fn channel_backend_query_not_found() {
     let (tx, mut rx) = mpsc::unbounded_channel::<SubagentEvent>();

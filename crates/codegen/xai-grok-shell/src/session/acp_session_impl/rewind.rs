@@ -443,6 +443,10 @@ impl SessionActor {
                     crate::session::compaction_config::SUPPRESS_NONE,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                self.compaction.auto_compact_retry_not_before_ms.store(
+                    crate::session::compaction_config::AUTO_COMPACT_RETRY_READY,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
 

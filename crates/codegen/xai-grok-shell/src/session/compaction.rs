@@ -13,9 +13,10 @@ use super::SessionActor;
 use super::is_project_instructions;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::session::compaction_config::{
-    AsyncCompactionCache, BOUNDED_COMPACT_FAILED, BOUNDED_COMPACT_FINALIZING,
-    BOUNDED_COMPACT_IN_FLIGHT, BOUNDED_COMPACT_NONE, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY,
-    SUPPRESS_TURN, SUPPRESS_UNTIL_SUCCESS,
+    AUTO_COMPACT_RETRY_AFTER_RESET, AUTO_COMPACT_RETRY_READY, AsyncCompactionCache,
+    BOUNDED_COMPACT_FAILED, BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_IN_FLIGHT,
+    BOUNDED_COMPACT_NONE, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN,
+    SUPPRESS_UNTIL_SUCCESS,
 };
 use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
@@ -513,6 +514,7 @@ pub(crate) enum AutoCompactTriggerKind {
     Forced,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoCompactTriggerInfo {
     pub tokens_used: u64,
     pub context_window: u64,
@@ -788,6 +790,12 @@ pub(crate) enum SuppressReason {
     Schema,
     Other,
 }
+
+/// Delay after a transient automatic-compaction lifecycle exhausts its own
+/// retry budget. New turns may still be processed, but they cannot immediately
+/// launch the same expensive network lifecycle again.
+const AUTO_COMPACT_FAILURE_COOLDOWN_MS: u64 = 60_000;
+
 impl SuppressReason {
     fn as_str(self) -> &'static str {
         match self {
@@ -1051,12 +1059,26 @@ impl SessionActor {
     /// Suppress AUTO compaction after a deterministic failure. Scope depends on
     /// the reason (see [`SuppressReason::suppress_state`]): size/schema sticky,
     /// credit until 200, auth until credentials recover, other clears next turn.
-    /// Telemetry + one notification per transition; manual `/compact` exempt.
+    /// Manual `/compact` is exempt.
     async fn suppress_auto_compaction(
         &self,
         reason: SuppressReason,
         estimated_tokens: u64,
         context_window: u64,
+    ) {
+        self.suppress_auto_compaction_with_error(reason, estimated_tokens, context_window, None)
+            .await;
+    }
+
+    /// Production suppression path. Adds the original provider/client failure
+    /// to the reason-specific guidance so `AutoCompactFailed.error` is useful
+    /// without emitting a duplicate notification from the outer lifecycle.
+    async fn suppress_auto_compaction_with_error(
+        &self,
+        reason: SuppressReason,
+        estimated_tokens: u64,
+        context_window: u64,
+        error_detail: Option<&str>,
     ) {
         let new_state = reason.suppress_state();
         if self
@@ -1083,7 +1105,7 @@ impl SessionActor {
                     context_window,
                 },
             );
-            let message = match reason {
+            let guidance = match reason {
                 SuppressReason::CreditBlock => {
                     "out of credits or over your spending limit. Add credits and retry."
                 }
@@ -1093,13 +1115,18 @@ impl SessionActor {
                 SuppressReason::Size => "this conversation is too large to compact.",
                 SuppressReason::Schema => "this conversation can't be summarized.",
                 SuppressReason::Other => {
-                    "it'll retry on the next turn, or start a new session using /new."
+                    "automatic retry is paused; use /compact manually or start a new session using /new."
                 }
             };
-            self.send_xai_notification(
-                crate::extensions::notification::SessionUpdate::AutoCompactFailed {
-                    error: message.to_string(),
+            let error = error_detail.map_or_else(
+                || guidance.to_string(),
+                |detail| {
+                    let detail = detail.chars().take(500).collect::<String>();
+                    format!("{guidance} Provider error: {detail}")
                 },
+            );
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::AutoCompactFailed { error },
             )
             .await;
         }
@@ -1119,11 +1146,89 @@ impl SessionActor {
             SuppressReason::Size
         } else if m.contains("status 401") || m.contains("unauthorized") {
             SuppressReason::Auth
-        } else if m.contains("invalid_request_error") {
+        } else if m.contains("invalid_request_error")
+            || m.contains("native compact response invalid")
+            || m.contains("cannot be replayed exactly")
+            || m.contains("serialization error")
+        {
             SuppressReason::Schema
         } else {
             SuppressReason::Other
         }
+    }
+
+    fn current_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX - 1)) as u64
+    }
+
+    fn clear_auto_compact_retry_gate(&self) {
+        self.compaction.auto_compact_retry_not_before_ms.store(
+            AUTO_COMPACT_RETRY_READY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Record a terminal automatic-compaction failure after its internal retry
+    /// budget is exhausted. Deterministic/schema failures stay blocked until a
+    /// state reset; transient failures receive a bounded cooldown.
+    fn record_auto_compact_retry_gate(&self) {
+        let suppression = self
+            .compaction
+            .auto_compact_suppressed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let retry_not_before_ms = if suppression == SUPPRESS_STICKY {
+            AUTO_COMPACT_RETRY_AFTER_RESET
+        } else {
+            Self::current_epoch_ms().saturating_add(AUTO_COMPACT_FAILURE_COOLDOWN_MS)
+        };
+        self.compaction
+            .auto_compact_retry_not_before_ms
+            .store(retry_not_before_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return an error when a previous automatic-compaction lifecycle has
+    /// already established that another immediate network request is unsafe or
+    /// wasteful. The Codex hard gate still calls this method and surfaces the
+    /// error, so sampling never proceeds past its provider safety limit.
+    fn auto_compact_retry_gate_error(&self) -> Option<acp::Error> {
+        let retry_not_before_ms = self
+            .compaction
+            .auto_compact_retry_not_before_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if retry_not_before_ms == AUTO_COMPACT_RETRY_READY {
+            return None;
+        }
+        if retry_not_before_ms == AUTO_COMPACT_RETRY_AFTER_RESET {
+            return Some(acp::Error::internal_error().data(
+                "automatic compaction previously failed deterministically; change the model or context, rewind, or run /compact manually before retrying",
+            ));
+        }
+
+        let now_ms = Self::current_epoch_ms();
+        if now_ms >= retry_not_before_ms {
+            let _ = self
+                .compaction
+                .auto_compact_retry_not_before_ms
+                .compare_exchange(
+                    retry_not_before_ms,
+                    AUTO_COMPACT_RETRY_READY,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            return None;
+        }
+
+        let remaining_secs = retry_not_before_ms
+            .saturating_sub(now_ms)
+            .saturating_add(999)
+            / 1_000;
+        Some(acp::Error::internal_error().data(format!(
+            "automatic compaction is cooling down after a failed lifecycle; retry in {remaining_secs}s"
+        )))
     }
     /// ACP error payload string (plain string or `{message, ...}`).
     fn acp_error_message(err: &acp::Error) -> String {
@@ -1184,12 +1289,19 @@ impl SessionActor {
     }
     /// Clear [`SUPPRESS_AUTH`] on login/token refresh (credit suppress waits for a 200).
     pub(crate) fn clear_auth_compact_suppression(&self) {
-        let _ = self.compaction.auto_compact_suppressed.compare_exchange(
-            SUPPRESS_AUTH,
-            SUPPRESS_NONE,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        if self
+            .compaction
+            .auto_compact_suppressed
+            .compare_exchange(
+                SUPPRESS_AUTH,
+                SUPPRESS_NONE,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.clear_auto_compact_retry_gate();
+        }
     }
     /// Credit or auth suppress — a model switch cannot clear these.
     fn is_account_state_suppressed(&self) -> bool {
@@ -1529,10 +1641,11 @@ impl SessionActor {
                     );
                     span.record("compaction_outcome", CompactionOutcome::Failed.as_str());
                     if auto_trigger && suppress_auto {
-                        self.suppress_auto_compaction(
+                        self.suppress_auto_compaction_with_error(
                             Self::classify_suppress_reason(&message),
                             estimated_input_tokens,
                             context_window,
+                            Some(&message),
                         )
                         .await;
                     }
@@ -1771,10 +1884,11 @@ impl SessionActor {
                                 }
                                 last_failure_outcome = CompactionOutcome::Deterministic;
                                 if auto_trigger {
-                                    self.suppress_auto_compaction(
+                                    self.suppress_auto_compaction_with_error(
                                         SuppressReason::Size,
                                         estimated_input_tokens,
                                         context_window,
+                                        Some(&message),
                                     )
                                     .await;
                                 }
@@ -1785,10 +1899,11 @@ impl SessionActor {
                                 last_failure_outcome = CompactionOutcome::Deterministic;
                                 if auto_trigger {
                                     let reason = Self::classify_suppress_reason(&message);
-                                    self.suppress_auto_compaction(
+                                    self.suppress_auto_compaction_with_error(
                                         reason,
                                         estimated_input_tokens,
                                         context_window,
+                                        Some(&message),
                                     )
                                     .await;
                                 }
@@ -2308,6 +2423,7 @@ impl SessionActor {
             self.compaction
                 .auto_compact_suppressed
                 .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+            self.clear_auto_compact_retry_gate();
         }
         self.last_idle_flush_conversation_len
             .store(new_len, std::sync::atomic::Ordering::Relaxed);
@@ -2681,6 +2797,7 @@ impl SessionActor {
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+        self.clear_auto_compact_retry_gate();
         if prev.context_window <= cfg.context_window.get() {
             return Ok(());
         }
@@ -2739,6 +2856,14 @@ impl SessionActor {
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        if let Some(error) = self.auto_compact_retry_gate_error() {
+            tracing::warn!(
+                trigger = ?trigger_info.kind,
+                error = %error,
+                "automatic compaction retry gate prevented an immediate repeated lifecycle"
+            );
+            return Err(error);
+        }
         let bounded_claimed = self.claim_bounded_auto_compaction()?;
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
@@ -2833,6 +2958,7 @@ impl SessionActor {
                     if bounded_claimed {
                         self.finish_bounded_auto_compaction(false);
                     }
+                    self.record_auto_compact_retry_gate();
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
                         error: message.clone(),
                     })
@@ -2843,6 +2969,7 @@ impl SessionActor {
                     self.finish_bounded_auto_compaction(true);
                     self.push_system_reminder(BOUNDED_SUBAGENT_FINALIZE_REMINDER);
                 }
+                self.clear_auto_compact_retry_gate();
                 span.record("success", true);
                 self.send_xai_notification(XaiSessionUpdate::AutoCompactCompleted {
                     tokens_before: Some(trigger_info.tokens_used),
@@ -2860,16 +2987,16 @@ impl SessionActor {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
+                self.record_auto_compact_retry_gate();
                 if self
                     .compaction
                     .auto_compact_suppressed
                     .load(std::sync::atomic::Ordering::Relaxed)
                     == SUPPRESS_NONE
                 {
-                    self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
-                        error: String::new(),
-                    })
-                    .await;
+                    let error = Self::acp_error_message(&e);
+                    self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed { error })
+                        .await;
                 }
                 Err(e)
             }
@@ -3166,6 +3293,7 @@ mod inline_auto_compact_flow_tests {
                 context_window_override: None,
                 count: std::sync::atomic::AtomicU64::new(0),
                 auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
                 bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                 previous_model: std::cell::Cell::new(None),
                 compaction_mode: xai_chat_state::CompactionMode::Transcript,
@@ -3571,6 +3699,49 @@ mod inline_auto_compact_flow_tests {
                     .auto_compact_suppressed
                     .store(SUPPRESS_NONE, Relaxed);
                 assert!(actor.check_auto_compact_needed().await.is_some());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_auto_compact_failure_uses_expiring_cooldown() {
+        use crate::session::compaction_config::AUTO_COMPACT_RETRY_READY;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let persistence_tx = successful_timeline_persistence();
+                let actor = create_test_actor(1_000, 200_000, 85, gateway_tx, persistence_tx).await;
+
+                actor.record_auto_compact_retry_gate();
+                let retry_at = actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed);
+                assert!(retry_at > SessionActor::current_epoch_ms());
+                assert!(
+                    SessionActor::acp_error_message(
+                        &actor
+                            .auto_compact_retry_gate_error()
+                            .expect("cooldown active")
+                    )
+                    .contains("cooling down")
+                );
+
+                actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .store(SessionActor::current_epoch_ms().saturating_sub(1), Relaxed);
+                assert!(actor.auto_compact_retry_gate_error().is_none());
+                assert_eq!(
+                    actor
+                        .compaction
+                        .auto_compact_retry_not_before_ms
+                        .load(Relaxed),
+                    AUTO_COMPACT_RETRY_READY
+                );
             })
             .await;
     }
@@ -4188,6 +4359,92 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_auto_compact_reports_error_and_blocks_identical_retry() {
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        use crate::session::compaction_config::AUTO_COMPACT_RETRY_AFTER_RESET;
+        use crate::session::storage::SessionUpdate;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+                let actor = Arc::new(
+                    create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await,
+                );
+                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.base_url = spawn_deterministic_400_server().await;
+                actor.chat_state_handle.update_sampling_config(cfg);
+                actor.chat_state_handle.replace_conversation(vec![
+                    ConversationItem::system("sys"),
+                    ConversationItem::user("compact me"),
+                ]);
+                let trigger = AutoCompactTriggerInfo {
+                    tokens_used: 180_000,
+                    context_window: 200_000,
+                    percentage: 90,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
+                };
+
+                actor
+                    .run_compact_only(trigger)
+                    .await
+                    .expect_err("invalid request must fail auto-compaction");
+                assert_eq!(
+                    actor
+                        .compaction
+                        .auto_compact_retry_not_before_ms
+                        .load(Relaxed),
+                    AUTO_COMPACT_RETRY_AFTER_RESET,
+                    "deterministic failure must not be re-submitted on another turn"
+                );
+
+                let mut starts = 0;
+                let mut failures = Vec::new();
+                while let Ok(msg) = persistence_rx.try_recv() {
+                    if let PersistenceMsg::Update(SessionUpdate::Xai(notification)) = msg {
+                        match notification.update {
+                            XaiSessionUpdate::AutoCompactStarted { .. } => starts += 1,
+                            XaiSessionUpdate::AutoCompactFailed { error } => failures.push(error),
+                            _ => {}
+                        }
+                    }
+                }
+                assert_eq!(starts, 1);
+                assert_eq!(failures.len(), 1);
+                assert!(
+                    failures[0].contains("invalid_request_error")
+                        || failures[0].contains("bad schema"),
+                    "the original provider error must be observable: {:?}",
+                    failures
+                );
+
+                let blocked = actor
+                    .run_compact_only(trigger)
+                    .await
+                    .expect_err("retry gate must block the identical lifecycle");
+                assert!(
+                    SessionActor::acp_error_message(&blocked)
+                        .contains("previously failed deterministically")
+                );
+                while let Ok(msg) = persistence_rx.try_recv() {
+                    if let PersistenceMsg::Update(SessionUpdate::Xai(notification)) = msg {
+                        assert!(
+                            !matches!(
+                                notification.update,
+                                XaiSessionUpdate::AutoCompactStarted { .. }
+                            ),
+                            "blocked retries must not emit a false start or hit the provider"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+
     /// A forked session whose whole-transcript inherited prefix alone exceeds
     /// the auto-compact threshold releases the prefix on compaction (so the
     /// conversation can actually shrink below the threshold) and keeps the
@@ -4428,6 +4685,8 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     Arc::new(create_test_actor(0, 100_000, 80, gateway_tx, persistence_tx).await);
                 let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
 
@@ -4466,6 +4725,8 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     Arc::new(create_test_actor(0, 100_000, 95, gateway_tx, persistence_tx).await);
                 let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
 
@@ -4628,6 +4889,8 @@ mod inline_auto_compact_flow_tests {
                 assert!(actor.bounded_subagent_must_finalize());
 
                 let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
                 actor
@@ -4714,6 +4977,8 @@ mod inline_auto_compact_flow_tests {
                 let actor =
                     Arc::new(create_test_actor(0, 100_000, 80, gateway_tx, persistence_tx).await);
                 let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
                 cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
                 actor.chat_state_handle.update_sampling_config(cfg);
 

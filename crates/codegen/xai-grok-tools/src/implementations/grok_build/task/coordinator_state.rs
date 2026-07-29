@@ -344,6 +344,48 @@ pub(super) struct ProgressFuture<F> {
     pub(super) target: Option<ProgressTarget>,
 }
 
+pub(super) struct TimedProgressFuture<F> {
+    future: Pin<Box<tokio::time::Timeout<F>>>,
+    subagent_id: String,
+    timeout: std::time::Duration,
+}
+
+impl<F> TimedProgressFuture<F>
+where
+    F: Future<Output = SubagentProgress>,
+{
+    pub(super) fn new(future: F, subagent_id: String, timeout: std::time::Duration) -> Self {
+        Self {
+            future: Box::pin(tokio::time::timeout(timeout, future)),
+            subagent_id,
+            timeout,
+        }
+    }
+}
+
+impl<F> Future for TimedProgressFuture<F>
+where
+    F: Future<Output = SubagentProgress>,
+{
+    type Output = SubagentProgress;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.future.as_mut().poll(cx) {
+            Poll::Ready(Ok(progress)) => Poll::Ready(progress),
+            Poll::Ready(Err(_)) => {
+                tracing::warn!(
+                    subagent_id = this.subagent_id,
+                    timeout_ms = this.timeout.as_millis() as u64,
+                    "subagent progress snapshot timed out; returning cached running state"
+                );
+                Poll::Ready(SubagentProgress::default())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl<F> Future for ProgressFuture<F>
 where
     F: Future<Output = SubagentProgress>,

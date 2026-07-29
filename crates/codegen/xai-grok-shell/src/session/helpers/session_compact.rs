@@ -65,6 +65,10 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
         | SamplingError::Serialization(_)
         | SamplingError::IdleTimeout { .. } => true,
         SamplingError::Api {
+            should_retry: Some(false),
+            ..
+        } => true,
+        SamplingError::Api {
             status, message, ..
         } => {
             is_context_length_error(message)
@@ -72,7 +76,9 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::REQUEST_TIMEOUT
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
-        SamplingError::StreamError { message, .. } => is_context_length_error(message),
+        SamplingError::StreamError { message, .. } => {
+            is_context_length_error(message) || !err.is_retryable()
+        }
         SamplingError::MaxTokensTruncation => true,
         SamplingError::Http(_)
         | SamplingError::EventStreamError(_)

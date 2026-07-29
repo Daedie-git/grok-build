@@ -123,6 +123,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     pending_inputs: VecDeque::new(),
                     combine_edit_holds: std::collections::HashSet::new(),
                     pending_notifications: Vec::new(),
+                    consumed_completion_tombstones: VecDeque::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     nudges_used_this_session: 0,
@@ -595,6 +596,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     pending_inputs: VecDeque::new(),
                     combine_edit_holds: std::collections::HashSet::new(),
                     pending_notifications: Vec::new(),
+                    consumed_completion_tombstones: VecDeque::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     nudges_used_this_session: 0,
@@ -850,6 +852,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 pending_inputs: VecDeque::new(),
                 combine_edit_holds: std::collections::HashSet::new(),
                 pending_notifications: Vec::new(),
+                consumed_completion_tombstones: VecDeque::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,
@@ -1642,18 +1645,40 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _persistence_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            let reservations = actor
+                .tool_context
+                .task_completion_reservations
+                .clone()
+                .expect("completion reservations");
             *actor
                 .current_prompt_id
                 .lock()
                 .expect("current_prompt_id mutex poisoned") =
                 Some("task-completed-bg-1".to_string());
-            let (wake_item, mut wake_rx) = input_with_origin_rx(
+            let (mut wake_item, mut wake_rx) = input_with_origin_rx(
                 "task-completed-bg-1",
                 crate::session::PromptOrigin::TaskCompleted {
                     task_id: "bg-1".to_string(),
                 },
             );
+            wake_item.task_wake_fallback = Some(crate::session::commands::TaskWakeFallback {
+                prompt_id: "bash-completed-bg-1".to_string(),
+                prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "completion bg-1",
+                ))],
+                source: NotificationSource::BashTaskCompleted {
+                    task_id: "bg-1".to_string(),
+                },
+                promotion_trace_start: None,
+                completion_reservation: Some(
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        reservations.clone(),
+                        "bg-1".to_string(),
+                    ),
+                ),
+            });
             let (user_item, mut user_rx) =
                 input_with_origin_rx("user-clarify", crate::session::PromptOrigin::User);
             {
@@ -1680,6 +1705,13 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
                 "the queued user prompt must survive a cancel that lands during \
                  the auto-wake turn"
             );
+            assert!(matches!(
+                state.pending_notifications.as_slice(),
+                [PendingNotification {
+                    source: NotificationSource::BashTaskCompleted { task_id },
+                    ..
+                }] if task_id == "bg-1"
+            ));
             drop(state);
             assert!(
                 matches!(
@@ -1694,6 +1726,15 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
             assert!(
                 matches!(user_rx.try_recv(), Err(TryRecvError::Empty)),
                 "the user prompt must remain pending (it runs next), not be cancelled"
+            );
+            assert!(
+                reservations.contains("bg-1"),
+                "the parked fallback must retain its completion reservation"
+            );
+            actor.consume_deferred_completions_for_user_turn().await;
+            assert!(
+                !reservations.contains("bg-1"),
+                "consuming the parked fallback must release its exact reservation"
             );
         })
         .await;
@@ -1714,7 +1755,6 @@ async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
                 .task_completion_reservations
                 .clone()
                 .expect("completion reservations");
-            reservations.reserve("bg-queued".to_string());
             let actor = Arc::new(actor);
             let (running_item, mut running_rx) =
                 input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
@@ -1732,6 +1772,13 @@ async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
                 source: NotificationSource::BashTaskCompleted {
                     task_id: "bg-queued".to_string(),
                 },
+                promotion_trace_start: None,
+                completion_reservation: Some(
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        reservations.clone(),
+                        "bg-queued".to_string(),
+                    ),
+                ),
             });
             let (queued_user, mut queued_user_rx) =
                 input_with_origin_rx("user-next", crate::session::PromptOrigin::User);
@@ -2109,6 +2156,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 pending_inputs: VecDeque::new(),
                 combine_edit_holds: std::collections::HashSet::new(),
                 pending_notifications: Vec::new(),
+                consumed_completion_tombstones: VecDeque::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 nudges_used_this_session: 0,

@@ -10,7 +10,8 @@
 use crate::DEFAULT_TOOL_OUTPUT_BYTES;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task_output::{
-    MAX_MULTI_WAIT_IDS, TaskOutputTool, resolve_tasks, wait_any_event_driven,
+    MAX_MULTI_WAIT_IDS, TaskOutputTool, render_waited_results, resolve_tasks_until_any_terminal,
+    wait_any_event_driven,
 };
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{Terminal, TruncationCfg};
@@ -192,21 +193,26 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
             (terminal, backend, rfn, mob)
         };
 
-        let initial = resolve_tasks(
+        let deadline = tokio::time::Instant::now() + timeout;
+        let initial = resolve_tasks_until_any_terminal(
             &input.task_ids,
             &terminal,
             &backend,
             &read_file_name,
             max_output_bytes,
+            deadline,
         )
         .await;
 
         let has_pending =
             !initial.pending_bash_ids.is_empty() || !initial.pending_subagent_ids.is_empty();
+        let already_completed = initial
+            .results
+            .iter()
+            .any(|result| super::is_terminal_status(&result.status));
 
-        let results = if has_pending {
-            let deadline = tokio::time::Instant::now() + timeout;
-            wait_any_event_driven(
+        let results = if has_pending && !already_completed {
+            let waited = wait_any_event_driven(
                 &terminal,
                 &backend,
                 &initial.pending_bash_ids,
@@ -214,15 +220,13 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
                 deadline,
             )
             .await;
-            resolve_tasks(
+            render_waited_results(
                 &input.task_ids,
-                &terminal,
-                &backend,
                 &read_file_name,
                 max_output_bytes,
+                initial.results,
+                &waited,
             )
-            .await
-            .results
         } else {
             initial.results
         };

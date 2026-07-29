@@ -338,6 +338,16 @@ pub(super) enum ProgressTarget {
     List { request_id: u64, index: usize },
 }
 
+impl ProgressTarget {
+    pub(super) fn is_closed(&self) -> bool {
+        match self {
+            Self::Query(respond_to) => respond_to.is_closed(),
+            Self::Inspect(respond_to) => respond_to.is_closed(),
+            Self::List { .. } => false,
+        }
+    }
+}
+
 pub(super) struct ProgressFuture<F> {
     pub(super) future: Pin<Box<F>>,
     pub(super) seed: Option<RunningSeed>,

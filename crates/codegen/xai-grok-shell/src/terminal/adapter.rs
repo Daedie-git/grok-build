@@ -37,7 +37,10 @@ pub(super) struct TrackedTask {
     signal: Option<String>,
     last_output: String,
     last_truncated: bool,
+    /// Persisted once a blocking waiter receives the completed snapshot.
     block_waited: bool,
+    /// Blocking waits that can still receive this task's completion.
+    active_block_waiters: usize,
     explicitly_killed: bool,
     kind: TaskKind,
     owner_session_id: Option<String>,
@@ -61,6 +64,7 @@ impl Default for TrackedTask {
             last_output: String::new(),
             last_truncated: false,
             block_waited: false,
+            active_block_waiters: 0,
             explicitly_killed: false,
             kind: TaskKind::Bash,
             owner_session_id: None,
@@ -97,6 +101,9 @@ impl TrackedTask {
             exit_code: out.exit_code,
             signal: out.signal,
             completed,
+            // An active waiter has not delivered anything yet. Publishing that
+            // speculative state can suppress the only completion wake if the
+            // wait future is cancelled before `finish_with_snapshot` commits.
             block_waited: self.block_waited,
             explicitly_killed: self.explicitly_killed,
             kind: self.kind,
@@ -109,6 +116,109 @@ impl TrackedTask {
 }
 
 pub(super) type TaskMap = Arc<Mutex<HashMap<String, TrackedTask>>>;
+
+/// Registers one blocking wait for exactly as long as its future can still
+/// deliver the task's completed snapshot.
+///
+/// The guard borrows the task map and task id so its lifetime is scoped to one
+/// `wait_for_completion` future. Dropping that future (including cancellation)
+/// removes only its registration, leaving concurrent waiters visible.
+struct BlockWaitGuard<'a> {
+    tasks: &'a TaskMap,
+    task_id: &'a str,
+    registered: bool,
+}
+
+impl<'a> BlockWaitGuard<'a> {
+    fn new(tasks: &'a TaskMap, task_id: &'a str) -> Self {
+        let mut tracked_tasks = tasks.lock().unwrap();
+        let registered = tracked_tasks.get_mut(task_id).is_some_and(|task| {
+            if let Some(next) = task.active_block_waiters.checked_add(1) {
+                task.active_block_waiters = next;
+                true
+            } else {
+                tracing::error!(task_id, "too many concurrent blocking task waiters");
+                false
+            }
+        });
+        drop(tracked_tasks);
+
+        Self {
+            tasks,
+            task_id,
+            registered,
+        }
+    }
+
+    /// Reconciles the queried snapshot with tracked completion state and ends
+    /// this registration in the same critical section. If the exit watcher
+    /// completed the task after `get_task` returned a running snapshot, this
+    /// upgrades the stale result before persisting `block_waited`.
+    fn finish_with_snapshot(&mut self, mut snapshot: Option<TaskSnapshot>) -> Option<TaskSnapshot> {
+        if !self.registered {
+            if let Some(snapshot) = snapshot.as_mut()
+                && snapshot.completed
+            {
+                snapshot.block_waited = true;
+            }
+            return snapshot;
+        }
+
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let block_waited = tasks.get_mut(self.task_id).is_some_and(|task| {
+            if !snapshot.as_ref().is_some_and(|snapshot| snapshot.completed) && task.completed {
+                snapshot = Some(task.to_snapshot(
+                    self.task_id,
+                    SnapshotOutput {
+                        output: task.last_output.clone(),
+                        truncated: task.last_truncated,
+                        exit_code: task.exit_code,
+                        signal: task.signal.clone(),
+                    },
+                ));
+            }
+
+            debug_assert!(task.active_block_waiters > 0);
+            task.active_block_waiters = task.active_block_waiters.saturating_sub(1);
+            if snapshot.as_ref().is_some_and(|snapshot| snapshot.completed) {
+                task.block_waited = true;
+            }
+            task.block_waited || task.active_block_waiters > 0
+        });
+        self.registered = false;
+        drop(tasks);
+
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.block_waited = block_waited;
+        }
+        snapshot
+    }
+
+    fn cancel(&mut self) {
+        if !self.registered {
+            return;
+        }
+
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(task) = tasks.get_mut(self.task_id) {
+            debug_assert!(task.active_block_waiters > 0);
+            task.active_block_waiters = task.active_block_waiters.saturating_sub(1);
+        }
+        self.registered = false;
+    }
+}
+
+impl Drop for BlockWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 fn wrap_command(command: &str) -> Result<String, ComputerError> {
     #[cfg(not(unix))]
@@ -418,13 +528,7 @@ impl TerminalBackend for AcpTerminalAdapter {
         timeout: Option<Duration>,
     ) -> Option<TaskSnapshot> {
         let timeout = timeout.unwrap_or(Duration::from_secs(30));
-
-        {
-            let mut tasks = self.tasks.lock().unwrap();
-            if let Some(task) = tasks.get_mut(task_id) {
-                task.block_waited = true;
-            }
-        }
+        let mut block_wait_guard = BlockWaitGuard::new(&self.tasks, task_id);
 
         let gateway_result = tokio::time::timeout(
             timeout,
@@ -450,14 +554,11 @@ impl TerminalBackend for AcpTerminalAdapter {
             }
             Err(_) => {
                 tracing::debug!(task_id, "timeout waiting for terminal exit");
-                let mut tasks = self.tasks.lock().unwrap();
-                if let Some(task) = tasks.get_mut(task_id) {
-                    task.block_waited = false;
-                }
             }
         }
 
-        self.get_task(task_id).await
+        let snapshot = self.get_task(task_id).await;
+        block_wait_guard.finish_with_snapshot(snapshot)
     }
 
     async fn list_tasks(&self) -> Vec<TaskSnapshot> {
@@ -749,5 +850,172 @@ mod tests {
         assert_eq!(snap.output, "live streamed bytes");
         assert!(!snap.completed);
         assert!(!snap.truncated);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_after_completion_keeps_emitted_wake_eligible() {
+        use xai_acp_lib::AcpClientMessage;
+
+        let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter = AcpTerminalAdapter::new(
+            GatewaySender::new(gateway_tx),
+            acp::SessionId::new("session"),
+        );
+        insert_task(&adapter, "pending", make_tracked_task("sleep 60"));
+        let tasks = Arc::clone(&adapter.tasks);
+
+        let mut wait =
+            Box::pin(adapter.wait_for_completion("pending", Some(Duration::from_secs(30))));
+        let pending_reply = loop {
+            tokio::select! {
+                snapshot = &mut wait => {
+                    panic!("wait unexpectedly completed: {snapshot:?}");
+                }
+                message = gateway_rx.recv() => {
+                    match message.expect("wait request") {
+                        AcpClientMessage::WaitForTerminalExit(args) => {
+                            break args.response_tx;
+                        }
+                        _ => panic!("unexpected gateway request"),
+                    }
+                }
+            }
+        };
+
+        let emitted_completion = {
+            let mut tracked = tasks.lock().unwrap();
+            assert_eq!(tracked["pending"].active_block_waiters, 1);
+            assert!(!tracked["pending"].block_waited);
+            let task = tracked.get_mut("pending").unwrap();
+            task.mark_completed(out("done", Some(0), None));
+            task.to_snapshot("pending", out("done", Some(0), None))
+        };
+        assert!(emitted_completion.completed);
+        assert!(
+            !emitted_completion.block_waited,
+            "an active waiter must not speculatively suppress the completion wake"
+        );
+
+        drop(wait);
+        drop(pending_reply);
+
+        let snapshot = {
+            let tracked = tasks.lock().unwrap();
+            assert_eq!(tracked["pending"].active_block_waiters, 0);
+            tracked["pending"].to_snapshot("pending", out("", None, None))
+        };
+        assert!(
+            !snapshot.block_waited,
+            "cancelling after completion must leave auto-wake eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_of_two_waiters_keeps_only_live_wait_visible() {
+        use xai_acp_lib::AcpClientMessage;
+
+        let (gateway_tx, mut gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter = AcpTerminalAdapter::new(
+            GatewaySender::new(gateway_tx),
+            acp::SessionId::new("session"),
+        );
+        insert_task(&adapter, "pending", make_tracked_task("sleep 60"));
+        let tasks = Arc::clone(&adapter.tasks);
+
+        let mut wait_one =
+            Box::pin(adapter.wait_for_completion("pending", Some(Duration::from_secs(30))));
+        let mut wait_two =
+            Box::pin(adapter.wait_for_completion("pending", Some(Duration::from_secs(30))));
+        let mut pending_replies = Vec::new();
+        while pending_replies.len() < 2 {
+            tokio::select! {
+                snapshot = &mut wait_one => {
+                    panic!("first wait unexpectedly completed: {snapshot:?}");
+                }
+                snapshot = &mut wait_two => {
+                    panic!("second wait unexpectedly completed: {snapshot:?}");
+                }
+                message = gateway_rx.recv() => {
+                    match message.expect("wait request") {
+                        AcpClientMessage::WaitForTerminalExit(args) => {
+                            pending_replies.push(args.response_tx);
+                        }
+                        _ => panic!("unexpected gateway request"),
+                    }
+                }
+            }
+        }
+
+        {
+            let tracked = tasks.lock().unwrap();
+            assert_eq!(tracked["pending"].active_block_waiters, 2);
+        }
+
+        drop(wait_one);
+        let one_waiter_snapshot = {
+            let tracked = tasks.lock().unwrap();
+            assert_eq!(tracked["pending"].active_block_waiters, 1);
+            tracked["pending"].to_snapshot("pending", out("", None, None))
+        };
+        assert!(
+            !one_waiter_snapshot.block_waited,
+            "a surviving waiter must remain speculative until it delivers completion"
+        );
+
+        drop(wait_two);
+        drop(pending_replies);
+        let no_waiter_snapshot = {
+            let tracked = tasks.lock().unwrap();
+            assert_eq!(tracked["pending"].active_block_waiters, 0);
+            tracked["pending"].to_snapshot("pending", out("", None, None))
+        };
+        assert!(
+            !no_waiter_snapshot.block_waited,
+            "dropping the last waiter must restore auto-wake eligibility"
+        );
+    }
+
+    #[test]
+    fn wait_finalization_upgrades_snapshot_completed_by_exit_watcher() {
+        let tasks = Arc::new(Mutex::new(HashMap::from([(
+            "racing".to_string(),
+            make_tracked_task("fast command"),
+        )])));
+        let mut guard = BlockWaitGuard::new(&tasks, "racing");
+
+        let stale_running_snapshot = {
+            let tracked = tasks.lock().unwrap();
+            tracked["racing"].to_snapshot("racing", out("partial", None, None))
+        };
+        assert!(!stale_running_snapshot.completed);
+
+        let emitted_completion = {
+            let mut tracked = tasks.lock().unwrap();
+            let task = tracked.get_mut("racing").unwrap();
+            task.mark_completed(out("complete", Some(0), None));
+            task.to_snapshot("racing", out("complete", Some(0), None))
+        };
+        assert!(
+            !emitted_completion.block_waited,
+            "completion notification stays wake-eligible until the wait delivers"
+        );
+
+        let delivered = guard
+            .finish_with_snapshot(Some(stale_running_snapshot))
+            .expect("tracked completion should replace stale snapshot");
+        assert!(delivered.completed);
+        assert_eq!(delivered.output, "complete");
+        assert_eq!(delivered.exit_code, Some(0));
+        assert!(delivered.block_waited);
+
+        let tracked = tasks.lock().unwrap();
+        assert_eq!(tracked["racing"].active_block_waiters, 0);
+        assert!(tracked["racing"].block_waited);
+        assert!(
+            tracked["racing"]
+                .to_snapshot("racing", out("complete", Some(0), None))
+                .block_waited,
+            "snapshots after successful delivery must suppress redundant wakes"
+        );
     }
 }

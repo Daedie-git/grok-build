@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use xai_grok_sampling_types::{
     ConversationResponse, EmptyResponseContext, ResponseModelMetadata, SamplingError,
+    structured_stream_error_status,
 };
 
 use crate::metrics::InferenceLatencyStats;
@@ -211,7 +212,20 @@ impl From<&SamplingError> for SamplingErrorInfo {
                 )
             }
             SamplingError::EventStreamError(_) => (SamplingErrorKind::Http, None, None, None),
-            SamplingError::StreamError { .. } => (SamplingErrorKind::Api, None, None, None),
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => {
+                let status = structured_stream_error_status(error_type, message);
+                let kind = if err.is_auth_error() {
+                    SamplingErrorKind::Auth
+                } else if err.is_rate_limited() {
+                    SamplingErrorKind::RateLimited
+                } else {
+                    SamplingErrorKind::Api
+                };
+                (kind, Some(status.as_u16()), None, None)
+            }
             SamplingError::IdleTimeout { .. } => (SamplingErrorKind::IdleTimeout, None, None, None),
             SamplingError::EmptyResponse { .. } => {
                 (SamplingErrorKind::EmptyResponse, None, None, None)
@@ -265,6 +279,33 @@ mod tests {
         assert_eq!(info.retry_after_secs, None);
         assert!(info.model_metadata.is_none());
         assert!(info.message.contains("bad token"));
+    }
+
+    #[test]
+    fn api_401_and_403_remain_api_dispositions() {
+        let unauthorized = SamplingError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            message: "expired token".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        let info = SamplingErrorInfo::from(&unauthorized);
+        assert_eq!(info.kind, SamplingErrorKind::Api);
+        assert_eq!(info.status_code, Some(401));
+        assert!(!info.is_retryable);
+
+        let forbidden = SamplingError::Api {
+            status: StatusCode::FORBIDDEN,
+            message: "policy denial".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        let info = SamplingErrorInfo::from(&forbidden);
+        assert_eq!(info.kind, SamplingErrorKind::Api);
+        assert_eq!(info.status_code, Some(403));
+        assert!(!info.is_retryable);
     }
 
     #[test]
@@ -352,8 +393,29 @@ mod tests {
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
-        assert_eq!(info.status_code, None);
+        assert_eq!(info.status_code, Some(500));
         assert!(info.is_retryable, "stream errors should be retryable");
+    }
+
+    #[test]
+    fn structured_stream_auth_and_rate_limit_preserve_disposition() {
+        let auth = SamplingError::StreamError {
+            error_type: "authentication_error".into(),
+            message: "expired token".into(),
+        };
+        let info = SamplingErrorInfo::from(&auth);
+        assert_eq!(info.kind, SamplingErrorKind::Auth);
+        assert_eq!(info.status_code, Some(401));
+        assert!(!info.is_retryable);
+
+        let rate_limit = SamplingError::StreamError {
+            error_type: "rate_limit_exceeded".into(),
+            message: "slow down".into(),
+        };
+        let info = SamplingErrorInfo::from(&rate_limit);
+        assert_eq!(info.kind, SamplingErrorKind::RateLimited);
+        assert_eq!(info.status_code, Some(429));
+        assert!(info.is_retryable);
     }
 
     #[test]

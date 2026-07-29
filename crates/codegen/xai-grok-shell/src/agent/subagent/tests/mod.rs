@@ -376,17 +376,17 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
         child_session_id: "sa-1".into(),
         ..Default::default()
     };
-    let mut admission_rx = inject_subagent_completed_prompt(
+    let mut pending_wake = inject_subagent_completed_prompt(
         "sa-1",
         &result,
         &request,
         &Some(reservations.clone()),
         Some(&cmd_tx),
         "get_command_or_subagent_output",
-        &None,
+        false,
     )
     .expect("open parent channel returns an admission acknowledgement");
-    match cmd_rx.try_recv().expect("expected synthetic Prompt") {
+    let admission = match cmd_rx.try_recv().expect("expected synthetic Prompt") {
         SessionCommand::Prompt {
             prompt_id,
             verbatim,
@@ -401,12 +401,13 @@ fn inject_subagent_completed_prompt_sends_prompt_and_marks_delivered() {
                     ref subagent_id
                 } if subagent_id == "sa-1"
             ));
-            admission.respond_to.send(true).unwrap();
+            admission
         }
         _ => panic!("expected SessionCommand::Prompt"),
-    }
-    assert_eq!(admission_rx.try_recv(), Ok(true));
+    };
     assert_eq!(reservations.snapshot(), vec!["sa-1".to_string()]);
+    admission.respond_to.send(true).unwrap();
+    assert_eq!(pending_wake.admission_rx.try_recv(), Ok(true));
 }
 #[test]
 fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
@@ -414,8 +415,7 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
     drop(cmd_rx);
     let reservations = xai_grok_tools::reminders::task_completion::TaskCompletionReservations::default();
     reservations.reserve("sa-closed".into());
-    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
-    let admission_rx = inject_subagent_completed_prompt(
+    let pending_wake = inject_subagent_completed_prompt(
         "sa-closed",
         &SubagentResult {
             success: true,
@@ -427,16 +427,169 @@ fn inject_subagent_completed_prompt_releases_reservation_when_parent_closed() {
         &Some(reservations.clone()),
         Some(&cmd_tx),
         "get_command_or_subagent_output",
-        &Some(trace_tx),
+        false,
     );
-    assert!(admission_rx.is_none());
+    assert!(pending_wake.is_none());
     assert!(
             reservations.contains("sa-closed"),
             "send failure must release only the reservation acquired by this attempt"
-        );
+    );
     reservations.release("sa-closed");
     assert!(!reservations.contains("sa-closed"));
-    assert!(trace_rx.try_recv().is_err());
+}
+fn auto_wake_completion(
+    id: &str,
+    completion_data: ShellCompletionData,
+) -> ChildCompletion<ShellCompletionData> {
+    ChildCompletion {
+        request: auto_wake_test_request(id),
+        result: SubagentResult {
+            success: true,
+            output: std::sync::Arc::from("done"),
+            subagent_id: id.to_string(),
+            child_session_id: id.to_string(),
+            ..Default::default()
+        },
+        completion_data,
+        disposition: CompletionDisposition {
+            foreground_delivered: false,
+            backgrounded: true,
+            waiter_delivered: false,
+            explicitly_killed: false,
+            should_surface: true,
+        },
+    }
+}
+#[tokio::test]
+async fn declined_subagent_wake_reports_false_without_copy_or_trace() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let (parent_cmd_tx, mut parent_cmd_rx) = mpsc::unbounded_channel();
+    ctx.parent_cmd_tx = Some(parent_cmd_tx);
+    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    ctx.synthetic_trace_tx = Some(trace_tx);
+    let completion_data = ShellCompletionData::from_context(&ctx);
+    let (gateway, _gateway_rx) = test_gateway_with_receiver();
+
+    present_child_completion(
+        auto_wake_completion("wake-declined", completion_data),
+        &gateway,
+    );
+
+    let admission = match parent_cmd_rx.recv().await.expect("synthetic prompt") {
+        SessionCommand::Prompt {
+            admission: Some(admission),
+            ..
+        } => admission,
+        _ => panic!("expected synthetic Prompt"),
+    };
+    assert!(
+        parent_cmd_rx.try_recv().is_err(),
+        "CopyFile and completion notification must wait for actor admission"
+    );
+    assert!(
+        trace_rx.try_recv().is_err(),
+        "trace request must wait for actor admission"
+    );
+    admission.respond_to.send(false).expect("decline wake");
+
+    let command = tokio::time::timeout(std::time::Duration::from_secs(1), parent_cmd_rx.recv())
+        .await
+        .expect("completion notification timeout")
+        .expect("completion notification");
+    assert!(matches!(
+        command,
+        SessionCommand::XaiSessionNotification {
+            notification: SessionNotification {
+                update: SessionUpdate::SubagentFinished {
+                    will_wake: false,
+                    ..
+                },
+                ..
+            }
+        }
+    ));
+    assert!(
+        parent_cmd_rx.try_recv().is_err(),
+        "declined wake must not request CopyFile"
+    );
+    assert!(
+        trace_rx.try_recv().is_err(),
+        "declined wake must not create a phantom synthetic trace"
+    );
+}
+#[tokio::test]
+async fn admitted_subagent_wake_reports_true_then_starts_trace() {
+    let mut ctx = ctx_with_toggle(HashMap::new());
+    let (parent_cmd_tx, mut parent_cmd_rx) = mpsc::unbounded_channel();
+    ctx.parent_cmd_tx = Some(parent_cmd_tx);
+    let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
+    ctx.synthetic_trace_tx = Some(trace_tx);
+    let completion_data = ShellCompletionData::from_context(&ctx);
+    let (gateway, _gateway_rx) = test_gateway_with_receiver();
+
+    present_child_completion(
+        auto_wake_completion("wake-admitted", completion_data),
+        &gateway,
+    );
+
+    let mut admission = match parent_cmd_rx.recv().await.expect("synthetic prompt") {
+        SessionCommand::Prompt {
+            admission: Some(admission),
+            ..
+        } => admission,
+        _ => panic!("expected synthetic Prompt"),
+    };
+    assert!(
+        parent_cmd_rx.try_recv().is_err(),
+        "CopyFile must not start before actor admission"
+    );
+    assert!(
+        trace_rx.try_recv().is_err(),
+        "trace request must not start before actor admission"
+    );
+    let promotion_trace_start = admission
+        .fallback
+        .promotion_trace_start
+        .take()
+        .expect("traced wake must carry promotion handoff");
+    admission.respond_to.send(true).expect("admit wake");
+
+    let command = tokio::time::timeout(std::time::Duration::from_secs(1), parent_cmd_rx.recv())
+        .await
+        .expect("completion notification timeout")
+        .expect("completion notification");
+    assert!(matches!(
+        command,
+        SessionCommand::XaiSessionNotification {
+            notification: SessionNotification {
+                update: SessionUpdate::SubagentFinished {
+                    will_wake: true,
+                    ..
+                },
+                ..
+            }
+        }
+    ));
+    assert!(
+        parent_cmd_rx.try_recv().is_err(),
+        "admission must not enqueue a CopyFile command"
+    );
+    assert!(
+        trace_rx.try_recv().is_err(),
+        "trace must wait for actual actor promotion"
+    );
+
+    let (_before_copy_tx, before_session_copy_rx) = tokio::sync::oneshot::channel();
+    promotion_trace_start
+        .send(before_session_copy_rx)
+        .expect("simulate actor promotion");
+
+    let trace = tokio::time::timeout(std::time::Duration::from_secs(1), trace_rx.recv())
+        .await
+        .expect("trace request timeout")
+        .expect("trace request");
+    assert_eq!(trace.prompt_id, "subagent-completed-wake-admitted");
+    assert_eq!(trace.session_id.0.as_ref(), "parent");
 }
 #[test]
 fn initializing_snapshot_is_running() {

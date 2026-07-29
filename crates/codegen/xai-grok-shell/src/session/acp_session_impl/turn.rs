@@ -270,11 +270,10 @@ impl SessionActor {
             })),
         );
         let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-        if let Some(completion_id) = origin.completion_id() {
+        if let super::super::PromptOrigin::WorkflowCompleted { completion_id } = &origin {
+            // Workflow wakes do not use TaskWakeFallback reservations, so retain
+            // their existing reported-at-start behavior.
             self.mark_completions_reported(&[completion_id]).await;
-            if let Some(reservations) = &self.tool_context.task_completion_reservations {
-                reservations.release(completion_id);
-            }
         }
         if !origin.is_synthetic() {
             self.cancel_pending_recap_for_new_prompt();
@@ -709,9 +708,13 @@ impl SessionActor {
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({ "reason": "handle_prompt_user_start" })),
             );
-            self.consume_deferred_completions_for_user_turn().await;
+            let consumed = self.consume_deferred_completions_for_user_turn().await;
+            if consumed.is_empty() {
+                self.drain_between_turn_completions_suppressing(&[]).await;
+            }
+        } else {
+            self.drain_between_turn_completions_suppressing(&[]).await;
         }
-        self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
@@ -797,7 +800,50 @@ impl SessionActor {
                     user_chat.add_image(format!("data:{};base64,{}", image.mime_type, image.data));
                 }
             }
-            if let Some(ack) = persist_ack {
+            let task_wake_completion_id = match &origin {
+                super::super::PromptOrigin::TaskCompleted { task_id } => Some(task_id.as_str()),
+                super::super::PromptOrigin::SubagentCompleted { subagent_id } => {
+                    Some(subagent_id.as_str())
+                }
+                _ => None,
+            };
+            if let Some(completion_id) = task_wake_completion_id {
+                debug_assert!(
+                    persist_ack.is_none(),
+                    "synthetic completion prompts never carry a persistence acknowledgement"
+                );
+                let fallback = {
+                    let mut state = self.state.lock().await;
+                    let Some(front) = state.pending_inputs.front_mut().filter(|input| {
+                        input.prompt_id == prompt_id && input.task_wake_fallback.is_some()
+                    }) else {
+                        tracing::debug!(
+                            prompt_id,
+                            completion_id,
+                            "completion prompt was cancelled before its chat commit"
+                        );
+                        return Err(acp::Error::internal_error()
+                            .data("completion prompt cancelled before chat commit"));
+                    };
+                    self.chat_state_handle.push_user_message(user_chat);
+                    front.task_wake_fallback.take()
+                };
+                // Finalize reporting outside the turn task so Ctrl+C cannot
+                // interrupt the async resource update after the chat commit.
+                // The fallback keeps its exact reservation alive until reporting
+                // finishes, suppressing coordinator/per-tool duplicates.
+                let session = Arc::clone(self);
+                let completion_id = completion_id.to_owned();
+                let (reported_tx, reported_rx) = oneshot::channel();
+                tokio::task::spawn_local(async move {
+                    session.mark_completions_reported(&[&completion_id]).await;
+                    drop(fallback);
+                    let _ = reported_tx.send(());
+                });
+                // Preserve the previous ordering for the normal path while
+                // leaving the detached finalizer alive if this turn is aborted.
+                let _ = reported_rx.await;
+            } else if let Some(ack) = persist_ack {
                 if self
                     .chat_state_handle
                     .push_user_message_and_ack(user_chat)

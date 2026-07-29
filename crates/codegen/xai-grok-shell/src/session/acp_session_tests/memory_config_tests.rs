@@ -88,6 +88,7 @@ async fn create_test_actor_with_memory(
         pending_inputs: VecDeque::new(),
         combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         nudges_used_this_session: 0,

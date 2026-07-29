@@ -202,6 +202,7 @@ pub(crate) struct InputItem {
     /// Who originated this prompt — user or auto-wake system.
     pub(crate) origin: super::PromptOrigin,
     /// Typed deferred completion retained while an admitted task wake is queued.
+    /// Also owns the optional trace-start sender until actual promotion.
     /// Consumed by Ctrl+C if it removes the wake before the turn starts.
     pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
@@ -283,6 +284,9 @@ pub(crate) struct State {
     pub(crate) running_task: Option<AgentTask>,
     pub(crate) pending_inputs: VecDeque<InputItem>,
     pub(crate) pending_notifications: Vec<PendingNotification>,
+    /// Explicitly consumed completion IDs whose auto-wake command may still be
+    /// in the actor mailbox or between admission and queue insertion.
+    pub(crate) consumed_completion_tombstones: VecDeque<String>,
     /// Prompt ids held out of combine-on-promote (composer edit in progress).
     pub(crate) combine_edit_holds: std::collections::HashSet<String>,
     /// When true, notifications are buffered but not drained until genuine
@@ -301,8 +305,29 @@ pub(crate) struct State {
     pub(crate) nudges_used_this_session: u32,
 }
 impl State {
+    const MAX_CONSUMED_COMPLETION_TOMBSTONES: usize = 256;
+
     pub(crate) fn clear_pending_notifications(&mut self) {
         self.pending_notifications.clear();
+    }
+    pub(crate) fn record_consumed_completion(&mut self, task_id: &str) {
+        if self
+            .consumed_completion_tombstones
+            .iter()
+            .any(|existing| existing == task_id)
+        {
+            return;
+        }
+        self.consumed_completion_tombstones
+            .push_back(task_id.to_owned());
+        while self.consumed_completion_tombstones.len() > Self::MAX_CONSUMED_COMPLETION_TOMBSTONES {
+            self.consumed_completion_tombstones.pop_front();
+        }
+    }
+    pub(crate) fn has_consumed_completion(&self, task_id: &str) -> bool {
+        self.consumed_completion_tombstones
+            .iter()
+            .any(|existing| existing == task_id)
     }
     /// Prompt id of the in-flight turn, if any. This — not
     /// `current_prompt_id` / `is_running_prompt` — is the running-turn

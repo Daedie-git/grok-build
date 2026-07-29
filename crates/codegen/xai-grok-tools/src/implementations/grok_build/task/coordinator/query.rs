@@ -23,6 +23,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         timeout_ms: Option<u64>,
         respond_to: oneshot::Sender<Option<SubagentSnapshot>>,
     ) {
+        // Tool cancellation can drop the receiver while its already-enqueued
+        // command is still waiting in the actor mailbox. Do not turn that
+        // abandoned query into progress work or a concrete blocking waiter.
+        if respond_to.is_closed() {
+            return;
+        }
         if let Some(child) = self
             .completed
             .get(&id)
@@ -43,12 +49,18 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 return;
             }
             if block {
+                if respond_to.is_closed() {
+                    return;
+                }
                 self.waiters.entry(id).or_default().push(BlockingWaiter {
                     deadline: tokio::time::Instant::now()
                         + std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000)),
                     respond_to,
                 });
             } else {
+                if respond_to.is_closed() {
+                    return;
+                }
                 self.queue_active_progress(&id, ProgressTarget::Query(respond_to));
             }
             return;
@@ -63,6 +75,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 return;
             }
             if block {
+                if respond_to.is_closed() {
+                    return;
+                }
                 self.waiters.entry(id).or_default().push(BlockingWaiter {
                     deadline: tokio::time::Instant::now()
                         + std::time::Duration::from_millis(timeout_ms.unwrap_or(30_000)),
@@ -196,6 +211,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 
     pub(super) fn queue_active_progress(&mut self, id: &str, target: ProgressTarget) {
+        // Recheck immediately before invoking the child runtime. The receiver
+        // can disappear concurrently after `handle_query`'s mailbox-entry
+        // check.
+        if target.is_closed() {
+            return;
+        }
         let Some(child) = self.active.get(id) else {
             match target {
                 ProgressTarget::Query(tx) => {

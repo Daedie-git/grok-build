@@ -15,7 +15,7 @@ use futures_util::stream::{BoxStream, Stream};
 
 use xai_grok_sampling_types::{
     ConversationItem, ConversationResponse, ResponseModelMetadata, ResponsesStreamAccumulator,
-    SamplingError, StopReason, TokenUsage, rs,
+    SamplingError, StopReason, TokenUsage, rs, structured_stream_error_status,
 };
 
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
@@ -99,45 +99,14 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
 /// relies on the status to distinguish permanent request failures from
 /// transient availability failures.
 fn response_event_error(code: Option<&str>, message: String) -> SamplingError {
-    let normalized = code.unwrap_or_default().trim().to_ascii_lowercase();
-    let normalized_message = message.to_ascii_lowercase();
-    let numeric_status = normalized
-        .parse::<u16>()
-        .ok()
-        .and_then(|status| reqwest::StatusCode::from_u16(status).ok());
-    let status = numeric_status.unwrap_or_else(|| match normalized.as_str() {
-        "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
-            reqwest::StatusCode::BAD_REQUEST
-        }
-        "authentication_error" | "unauthorized" => reqwest::StatusCode::UNAUTHORIZED,
-        "permission_error" | "forbidden" => reqwest::StatusCode::FORBIDDEN,
-        "not_found_error" => reqwest::StatusCode::NOT_FOUND,
-        "rate_limit_error" | "rate_limit_exceeded" => reqwest::StatusCode::TOO_MANY_REQUESTS,
-        "service_unavailable_error" | "overloaded_error" => {
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
-        }
-        "timeout_error" | "vector_store_timeout" => reqwest::StatusCode::GATEWAY_TIMEOUT,
-        _ if normalized_message.contains("invalid_request_error")
-            || normalized_message.contains("invalid_prompt")
-            || xai_grok_sampling_types::is_context_length_error(&normalized_message) =>
-        {
-            reqwest::StatusCode::BAD_REQUEST
-        }
-        _ if normalized_message.contains("authentication_error") => {
-            reqwest::StatusCode::UNAUTHORIZED
-        }
-        _ if normalized_message.contains("permission_error") => reqwest::StatusCode::FORBIDDEN,
-        _ if normalized_message.contains("rate_limit_error")
-            || normalized_message.contains("rate_limit_exceeded") =>
-        {
-            reqwest::StatusCode::TOO_MANY_REQUESTS
-        }
-        _ => reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-    });
+    let status = structured_stream_error_status(code.unwrap_or_default(), &message);
     let message = match code {
         Some(code) if !code.is_empty() => format!("{code}: {message}"),
         _ => message,
     };
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return SamplingError::Auth(message);
+    }
     SamplingError::Api {
         status,
         message,
@@ -934,6 +903,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn response_failed_authentication_preserves_auth_kind() {
+        let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("authentication_error", "expired credentials"),
+            sequence_number: 0,
+        });
+        let events = collect(stream_responses(
+            stream::iter(vec![Ok(failed)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Auth);
+                assert_eq!(error.status_code, None);
+                assert!(!error.is_retryable);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[test]
     fn response_event_error_preserves_retry_disposition() {
         for code in ["invalid_request_error", "authentication_error", "403"] {
@@ -945,6 +939,11 @@ mod tests {
             "service_unavailable_error",
             "overloaded_error",
             "503",
+            "521",
+            "522",
+            "523",
+            "524",
+            "529",
         ] {
             let error = response_event_error(Some(code), "transient".into());
             assert!(error.is_retryable(), "{code} must remain retryable");
@@ -959,6 +958,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn response_event_error_preserves_auth_kind_without_promoting_forbidden() {
+        let auth = response_event_error(Some("authentication_error"), "expired credentials".into());
+        let info = SamplingErrorInfo::from(&auth);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Auth);
+        assert_eq!(info.status_code, None);
+
+        let numeric_auth = response_event_error(Some("401"), "expired credentials".into());
+        let info = SamplingErrorInfo::from(&numeric_auth);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Auth);
+        assert_eq!(info.status_code, None);
+
+        let forbidden = response_event_error(Some("permission_error"), "policy denial".into());
+        let info = SamplingErrorInfo::from(&forbidden);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Api);
+        assert_eq!(info.status_code, Some(403));
+    }
+
+    #[test]
+    fn response_event_deterministic_image_and_account_codes_do_not_blindly_retry() {
+        for code in [
+            "invalid_image",
+            "invalid_image_format",
+            "invalid_base64_image",
+            "invalid_image_url",
+            "image_too_large",
+            "image_too_small",
+            "image_parse_error",
+            "invalid_image_mode",
+            "image_file_too_large",
+            "unsupported_image_media_type",
+            "empty_image_file",
+        ] {
+            let error = response_event_error(Some(code), "invalid image".into());
+            assert!(!error.is_retryable(), "{code} must not be blindly retried");
+            assert!(
+                error.is_image_processing_error(),
+                "{code} should enter image-strip recovery"
+            );
+        }
+
+        for code in [
+            "image_content_policy_violation",
+            "image_file_not_found",
+            "insufficient_quota",
+            "account_deactivated",
+            "billing_error",
+        ] {
+            let error = response_event_error(Some(code), "permanent failure".into());
+            assert!(!error.is_retryable(), "{code} must not be retried");
+        }
     }
 
     #[tokio::test]

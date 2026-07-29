@@ -503,6 +503,43 @@ impl SubagentPresentation {
         Arc::clone(&self.is_turn_active)
     }
 }
+const SUBAGENT_WAKE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct PendingSubagentWake {
+    admission_rx: oneshot::Receiver<bool>,
+    prompt_id: String,
+    completion_rx: oneshot::Receiver<SubagentPromptTurnResult>,
+    promotion_trace_start_rx: Option<crate::session::commands::PromotionTraceStart>,
+}
+
+fn emit_child_completion_notification(
+    request: &SubagentRequest,
+    result: &SubagentResult,
+    completion_data: &ShellCompletionData,
+    gateway: &GatewaySender,
+    will_wake: bool,
+) {
+    if completion_data.spawned_notification_emitted || request.run_in_background {
+        emit_subagent_notification(
+            gateway,
+            &request.parent_session_id,
+            SessionUpdate::SubagentFinished {
+                subagent_id: request.id.clone(),
+                child_session_id: result.child_session_id.clone(),
+                status: result.status().to_owned(),
+                error: result.error.clone(),
+                tool_calls: result.tool_calls,
+                turns: result.turns,
+                duration_ms: result.duration_ms,
+                tokens_used: completion_data.telemetry_tokens,
+                output: result.success.then(|| result.output.to_string()),
+                will_wake,
+            },
+            completion_data.parent_cmd_tx.as_ref(),
+        );
+    }
+}
+
 pub(crate) fn present_child_completion(
     completion: ChildCompletion<ShellCompletionData>,
     gateway: &GatewaySender,
@@ -528,7 +565,7 @@ pub(crate) fn present_child_completion(
             .load(std::sync::atomic::Ordering::Relaxed),
         parent_channel_open,
     ) && disposition.should_surface;
-    let admission_rx = should_wake
+    let pending_wake = should_wake
         .then(|| {
             inject_subagent_completed_prompt(
                 &request.id,
@@ -537,37 +574,53 @@ pub(crate) fn present_child_completion(
                 &completion_data.task_completion_reservations,
                 completion_data.parent_cmd_tx.as_ref(),
                 &completion_data.task_output_tool_name,
-                &completion_data.synthetic_trace_tx,
+                completion_data.synthetic_trace_tx.is_some(),
             )
         })
         .flatten();
-    let will_wake = admission_rx.is_some();
-    if let Some(admission_rx) = admission_rx {
-        // Keep the acknowledgement receiver alive until the parent actor has
-        // admitted the prompt. If the actor cannot admit it (or responds after
-        // the bound), its durable notification fallback retains the completion.
+    if let Some(pending_wake) = pending_wake {
+        let gateway = gateway.clone();
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), admission_rx).await;
+            let PendingSubagentWake {
+                admission_rx,
+                prompt_id,
+                completion_rx,
+                promotion_trace_start_rx,
+            } = pending_wake;
+            let admitted = tokio::time::timeout(SUBAGENT_WAKE_ADMISSION_TIMEOUT, admission_rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+
+            emit_child_completion_notification(
+                &request,
+                &result,
+                &completion_data,
+                &gateway,
+                admitted,
+            );
+
+            // Admission only means the actor retained the wake. Trace work
+            // starts when the retained InputItem is actually promoted; a
+            // declined, timed-out, or user-preempted wake drops the sender.
+            if admitted
+                && let (Some(trace_tx), Some(promotion_trace_start_rx)) = (
+                    completion_data.synthetic_trace_tx.as_ref(),
+                    promotion_trace_start_rx,
+                )
+                && let Ok(before_session_copy_rx) = promotion_trace_start_rx.await
+            {
+                let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
+                    session_id: acp::SessionId::new(request.parent_session_id.clone()),
+                    prompt_id,
+                    completion_rx,
+                    before_session_copy_rx,
+                });
+            }
         });
-    }
-    if completion_data.spawned_notification_emitted || request.run_in_background {
-        emit_subagent_notification(
-            gateway,
-            &request.parent_session_id,
-            SessionUpdate::SubagentFinished {
-                subagent_id: request.id.clone(),
-                child_session_id: result.child_session_id.clone(),
-                status: result.status().to_owned(),
-                error: result.error.clone(),
-                tool_calls: result.tool_calls,
-                turns: result.turns,
-                duration_ms: result.duration_ms,
-                tokens_used: completion_data.telemetry_tokens,
-                output: result.success.then(|| result.output.to_string()),
-                will_wake,
-            },
-            completion_data.parent_cmd_tx.as_ref(),
-        );
+    } else {
+        emit_child_completion_notification(&request, &result, &completion_data, gateway, false);
     }
 }
 /// Resolve the sampling config and model ID for a subagent.
@@ -1979,9 +2032,10 @@ fn should_auto_wake_subagent(
 ///
 /// Only called for background subagents when auto-wake is enabled
 /// and the result has not been consumed (via block-wait or explicit kill).
-/// Returns an actor-admission acknowledgement receiver; the caller must retain
-/// it until the parent admits the prompt so cancellation can durably fall back
-/// to the notification drain.
+/// Returns the pending actor-admission acknowledgement and trace inputs. The
+/// caller must retain them until the parent admits the prompt so cancellation
+/// can durably fall back to the notification drain. Session snapshot and trace
+/// work must not start until that acknowledgement is `true`.
 fn inject_subagent_completed_prompt(
     subagent_id: &str,
     result: &SubagentResult,
@@ -1991,16 +2045,17 @@ fn inject_subagent_completed_prompt(
     >,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
     task_output_tool_name: &str,
-    synthetic_trace_tx: &Option<
-        mpsc::UnboundedSender<crate::upload::turn::SyntheticTurnTraceRequest>,
-    >,
-) -> Option<oneshot::Receiver<bool>> {
+    trace_enabled: bool,
+) -> Option<PendingSubagentWake> {
     let Some(cmd_tx) = parent_cmd_tx else {
         return None;
     };
-    if let Some(reservations) = task_completion_reservations {
-        reservations.reserve(subagent_id.to_string());
-    }
+    let completion_reservation = task_completion_reservations.as_ref().map(|reservations| {
+        crate::session::commands::OwnedCompletionReservation::reserve(
+            reservations.clone(),
+            subagent_id.to_string(),
+        )
+    });
     let summary =
         xai_grok_tools::implementations::grok_build::task::completion_summary(request, result);
     let message = xai_grok_tools::reminders::task_completion::format_subagent_completion(
@@ -2009,17 +2064,14 @@ fn inject_subagent_completed_prompt(
     );
     let wrapped = xai_grok_tools::reminders::wrap_reminder(&message);
     let prompt_id = format!("subagent-completed-{subagent_id}");
-    let before_rx = if synthetic_trace_tx.is_some() {
-        let (before_tx, before_rx) = tokio::sync::oneshot::channel();
-        let _ = cmd_tx.send(SessionCommand::CopyFile {
-            respond_to: before_tx,
-        });
-        Some(before_rx)
-    } else {
-        None
-    };
     let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
     let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+    let (promotion_trace_start, promotion_trace_start_rx) = if trace_enabled {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(wrapped))];
     if cmd_tx
         .send(SessionCommand::Prompt {
@@ -2041,6 +2093,8 @@ fn inject_subagent_completed_prompt(
                     source: crate::session::commands::NotificationSource::SubagentCompleted {
                         subagent_id: subagent_id.to_owned(),
                     },
+                    promotion_trace_start,
+                    completion_reservation,
                 },
             }),
             tool_overrides_update: None,
@@ -2050,21 +2104,14 @@ fn inject_subagent_completed_prompt(
         })
         .is_err()
     {
-        if let Some(reservations) = task_completion_reservations {
-            reservations.release(subagent_id);
-        }
         return None;
     }
-    if let Some(trace_tx) = synthetic_trace_tx {
-        let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
-            session_id: acp::SessionId::new(request.parent_session_id.clone()),
-            prompt_id,
-            completion_rx,
-            before_session_copy_rx: before_rx
-                .expect("before_rx set when synthetic_trace_tx is Some"),
-        });
-    }
-    Some(admission_rx)
+    Some(PendingSubagentWake {
+        admission_rx,
+        prompt_id,
+        completion_rx,
+        promotion_trace_start_rx,
+    })
 }
 fn failure_result(request: &SubagentRequest, error: &str) -> SubagentResult {
     SubagentResult {

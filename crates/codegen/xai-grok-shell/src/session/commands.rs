@@ -113,11 +113,51 @@ impl NotificationSource {
         }
     }
 }
+/// Promotion-time handoff for a synthetic turn's "before" session snapshot.
+///
+/// The wake producer keeps the receiver while the sender travels with the
+/// admitted queue item. The actor sends the persistence copy receiver only
+/// when that item is actually promoted.
+pub(crate) type PromotionTraceStart = oneshot::Receiver<
+    oneshot::Receiver<anyhow::Result<crate::session::persistence::SessionStateCopy>>,
+>;
+pub(crate) type PromotionTraceStartSender = oneshot::Sender<
+    oneshot::Receiver<anyhow::Result<crate::session::persistence::SessionStateCopy>>,
+>;
+/// Owns exactly one completion-reservation count.
+///
+/// The owner travels with an admitted auto-wake from producer to queue item and,
+/// if the turn is preempted, into the durable notification fallback. Dropping
+/// any uncommitted path releases only the count that path acquired.
+#[derive(Debug)]
+pub(crate) struct OwnedCompletionReservation {
+    reservations: xai_grok_tools::reminders::task_completion::TaskCompletionReservations,
+    task_id: String,
+}
+impl OwnedCompletionReservation {
+    pub(crate) fn reserve(
+        reservations: xai_grok_tools::reminders::task_completion::TaskCompletionReservations,
+        task_id: String,
+    ) -> Self {
+        reservations.reserve(task_id.clone());
+        Self {
+            reservations,
+            task_id,
+        }
+    }
+}
+impl Drop for OwnedCompletionReservation {
+    fn drop(&mut self) {
+        self.reservations.release(&self.task_id);
+    }
+}
 #[derive(Debug)]
 pub struct TaskWakeFallback {
     pub prompt_id: String,
     pub prompt_blocks: Vec<acp::ContentBlock>,
     pub source: NotificationSource,
+    pub(crate) promotion_trace_start: Option<PromotionTraceStartSender>,
+    pub(crate) completion_reservation: Option<OwnedCompletionReservation>,
 }
 #[derive(Debug)]
 pub struct TaskWakeAdmission {

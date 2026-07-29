@@ -568,15 +568,29 @@ impl SessionActor {
             reported.mark_reported(id);
         }
     }
-    pub(super) async fn drain_between_turn_completions(&self) {
+    /// Drain terminal background work while suppressing completions that were
+    /// already surfaced by the user-turn notification fallback immediately
+    /// before this call.
+    ///
+    /// Those fallback IDs no longer have an auto-wake reservation: consuming
+    /// the fallback releases it. Carrying them explicitly through this drain
+    /// prevents the subagent coordinator's buffered copy from being returned a
+    /// second time while keeping the reservation lifecycle balanced.
+    pub(super) async fn drain_between_turn_completions_suppressing(
+        &self,
+        already_surfaced: &[String],
+    ) {
         let goal_loop_active = self.goal_loop_active();
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let reserved = self
+        let mut reserved = self
             .tool_context
             .task_completion_reservations
             .as_ref()
             .map(|reservations| reservations.snapshot())
             .unwrap_or_default();
+        reserved.extend_from_slice(already_surfaced);
+        reserved.sort();
+        reserved.dedup();
         let bash_completions = bridge.drain_between_turn_bash_completions(&reserved).await;
         if !bash_completions.is_empty() {
             let ids: Vec<&str> = bash_completions
@@ -620,12 +634,7 @@ impl SessionActor {
         use xai_grok_tools::implementations::grok_build::task::types::{
             SubagentCompletionsRequest, SubagentEvent,
         };
-        let suppress_ids = self
-            .tool_context
-            .task_completion_reservations
-            .as_ref()
-            .map(|reservations| reservations.snapshot())
-            .unwrap_or_default();
+        let suppress_ids = reserved;
         let parent_session_id = Some(self.session_id_string());
         let (respond_to, rx) = tokio::sync::oneshot::channel();
         if tx

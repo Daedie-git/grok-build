@@ -2,8 +2,10 @@
 //! plus auto-start of queued prompts (`maybe_start_running_task`).
 
 use super::*;
+use crate::session::commands::OwnedCompletionReservation;
 
-/// Maximum number of pending notifications before oldest are dropped.
+/// Soft cap for unowned pending notifications. Owned completion fallbacks are
+/// never evicted: they are the only durable copy of an admitted wake.
 pub(super) const MAX_PENDING_NOTIFICATIONS: usize = 50;
 
 /// A notification buffered for idle-gated drain (see `maybe_drain_notifications`).
@@ -16,38 +18,67 @@ pub(crate) struct PendingNotification {
     pub(crate) prompt_blocks: Vec<acp::ContentBlock>,
     pub(crate) priority: NotificationPriority,
     pub(crate) source: NotificationSource,
+    /// Exactly one reservation count transferred from an auto-wake producer
+    /// when its executable prompt is parked as this fallback.
+    pub(crate) owned_completion_reservation: Option<OwnedCompletionReservation>,
 }
 
 impl SessionActor {
     pub(super) fn push_pending_notification(state: &mut State, notification: PendingNotification) {
         state.pending_notifications.push(notification);
-        let excess = state
-            .pending_notifications
-            .len()
-            .saturating_sub(MAX_PENDING_NOTIFICATIONS);
-        if excess > 0 {
-            state.pending_notifications.drain(..excess);
+        let mut dropped = 0usize;
+        while state.pending_notifications.len() > MAX_PENDING_NOTIFICATIONS {
+            let Some(index) = state
+                .pending_notifications
+                .iter()
+                .position(|pending| pending.owned_completion_reservation.is_none())
+            else {
+                // All remaining entries own completion reservations. Allow a
+                // bounded-policy overflow rather than deleting the only
+                // recoverable copy of a completion.
+                break;
+            };
+            state.pending_notifications.remove(index);
+            dropped += 1;
+        }
+        if dropped > 0 {
             tracing::warn!(
-                dropped = excess,
-                "Dropped oldest pending notifications (exceeded cap of {})",
+                dropped,
+                "Dropped oldest unowned pending notifications (exceeded soft cap of {})",
                 MAX_PENDING_NOTIFICATIONS,
+            );
+        }
+        if state.pending_notifications.len() > MAX_PENDING_NOTIFICATIONS {
+            tracing::warn!(
+                pending = state.pending_notifications.len(),
+                "Pending notifications exceed soft cap because every entry owns a completion fallback"
             );
         }
     }
 
-    pub(super) fn push_task_wake_fallback(state: &mut State, fallback: TaskWakeFallback) {
+    pub(super) fn push_task_wake_fallback(&self, state: &mut State, fallback: TaskWakeFallback) {
+        let TaskWakeFallback {
+            prompt_id,
+            prompt_blocks,
+            source,
+            // A parked fallback is no longer an executable synthetic turn, so
+            // it must not create a phantom trace if a user preempts the wake.
+            promotion_trace_start: _,
+            completion_reservation,
+        } = fallback;
         Self::push_pending_notification(
             state,
             PendingNotification {
-                prompt_id: fallback.prompt_id,
-                prompt_blocks: fallback.prompt_blocks,
+                prompt_id,
+                prompt_blocks,
                 priority: NotificationPriority::Later,
-                source: fallback.source,
+                source,
+                owned_completion_reservation: completion_reservation,
             },
         );
     }
 
-    pub(super) async fn consume_deferred_completions(&self) -> Vec<String> {
+    pub(super) async fn consume_deferred_completions(self: &Arc<Self>) -> Vec<String> {
         let mut state = self.state.lock().await;
         self.sweep_monitor_buffer_into_pending(&mut state, "monitor-user-start-drain");
         let mut completion_ids: Vec<String> = state
@@ -84,6 +115,13 @@ impl SessionActor {
             }
         }
         state.pending_notifications = retained;
+        if !completion_ids.is_empty() {
+            // A completion reminder is about to become model-visible in this
+            // user turn. From this point the turn cannot be rewound as pristine:
+            // snapshot truncation would remove the reminder while the
+            // cancellation-safe reporter permanently releases its fallback.
+            state.rewindable = false;
+        }
 
         let completion_blocks =
             Self::notification_blocks(&deferred, &self.tool_context.task_output_tool_name);
@@ -100,18 +138,44 @@ impl SessionActor {
         if !completion_text.is_empty() {
             self.push_system_reminder(&completion_text);
         }
-        let completion_id_refs: Vec<&str> = completion_ids.iter().map(String::as_str).collect();
-        self.mark_completions_reported(&completion_id_refs).await;
+        if completion_ids.is_empty() {
+            return completion_ids;
+        }
+        // Reporting and coordinator consumption form one cancellation-safe
+        // commit. A caller abort between those operations used to release the
+        // reservation while leaving the coordinator's subagent copy pending,
+        // so the next user turn surfaced the completion twice. Keep the owned
+        // notifications alive until the exact IDs have also been suppressed
+        // from the between-turn drain.
+        let session = Arc::clone(self);
+        let completion_ids_to_report = completion_ids.clone();
+        let (reported_tx, reported_rx) = oneshot::channel();
+        tokio::task::spawn_local(async move {
+            let completion_id_refs: Vec<&str> = completion_ids_to_report
+                .iter()
+                .map(String::as_str)
+                .collect();
+            session.mark_completions_reported(&completion_id_refs).await;
+            session
+                .drain_between_turn_completions_suppressing(&completion_ids_to_report)
+                .await;
+            drop(deferred);
+            let _ = reported_tx.send(());
+        });
+        let _ = reported_rx.await;
         completion_ids
     }
 
-    pub(super) async fn consume_deferred_completions_for_user_turn(&self) {
-        let consumed = self.consume_deferred_completions().await;
-        if let Some(reservations) = &self.tool_context.task_completion_reservations {
-            for task_id in consumed {
-                reservations.release(&task_id);
-            }
-        }
+    /// Consume completion fallbacks parked by a declined auto-wake.
+    ///
+    /// Returns the consumed IDs so the immediately following between-turn
+    /// coordinator drain can suppress the same buffered completions even
+    /// though each parked fallback's owned reservation is released when the
+    /// consumed notification is dropped.
+    pub(super) async fn consume_deferred_completions_for_user_turn(
+        self: &Arc<Self>,
+    ) -> Vec<String> {
+        self.consume_deferred_completions().await
     }
 
     pub(super) async fn maybe_start_running_task(
@@ -240,6 +304,7 @@ impl SessionActor {
             origin,
             running_display,
             tool_overrides_update,
+            promotion_trace_start,
         ) = {
             let Some(front) = state.pending_inputs.front_mut() else {
                 return;
@@ -260,6 +325,10 @@ impl SessionActor {
                 front.origin.clone(),
                 running_display,
                 front.tool_overrides_update.take(),
+                front
+                    .task_wake_fallback
+                    .as_mut()
+                    .and_then(|fallback| fallback.promotion_trace_start.take()),
             )
         };
         self.apply_tool_overrides_update(tool_overrides_update);
@@ -309,6 +378,28 @@ impl SessionActor {
         // Promote broadcast before spawn so clients paint (and arm echo-skip)
         // before the user-message chunk can race in.
         self.broadcast_queue_changed_promoting(&state, running_display);
+
+        if let Some(promotion_trace_start) = promotion_trace_start
+            && !promotion_trace_start.is_closed()
+        {
+            let (before_copy_tx, before_session_copy_rx) = oneshot::channel();
+            if self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::CopyFile {
+                    one_shot: before_copy_tx,
+                })
+                .is_ok()
+            {
+                // The replay buffer is actor-owned. Deferred promotions reach
+                // here only after completion/cancel flushed it; immediate idle
+                // admission has no active turn stream. `persistence_tx` is also
+                // the ChatState actor's persistence channel, so FIFO ordering
+                // places this complete snapshot before any writes from the
+                // spawned prompt below.
+                let _ = promotion_trace_start.send(before_session_copy_rx);
+            }
+        }
 
         state.running_task = Some(AgentTask::new_prompt(
             self.clone(),
@@ -381,12 +472,30 @@ impl SessionActor {
                 return;
             }
 
-            // Take all notifications and build merged blocks inside the lock
+            // Owned completion fallbacks are the durable copy of an admitted
+            // wake that never committed. Do not turn them into a lossy
+            // NotificationDrain item: that item has no reservation owner and
+            // can be cancelled before its chat message is committed. Retain the
+            // completion and any associated monitor events for the next genuine
+            // user-turn drain, which pushes the reminder synchronously before
+            // releasing ownership.
             let notifications = std::mem::take(&mut state.pending_notifications);
+            let owned_task_ids: std::collections::HashSet<String> = notifications
+                .iter()
+                .filter(|notification| notification.owned_completion_reservation.is_some())
+                .map(|notification| notification.source.task_id().to_owned())
+                .collect();
+            let (retained, notifications): (Vec<_>, Vec<_>) = notifications
+                .into_iter()
+                .partition(|notification| owned_task_ids.contains(notification.source.task_id()));
+            state.pending_notifications = retained;
+            if notifications.is_empty() {
+                return;
+            }
 
             drained_task_ids = notifications
                 .iter()
-                .map(|n| n.source.task_id().to_string())
+                .map(|notification| notification.source.task_id().to_owned())
                 .collect();
 
             let (to_surface, dropped) = {
@@ -465,6 +574,7 @@ impl SessionActor {
                     source: NotificationSource::MonitorEvent {
                         task_id: event.task_id,
                     },
+                    owned_completion_reservation: None,
                 },
             );
         }

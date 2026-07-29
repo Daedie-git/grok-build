@@ -392,7 +392,11 @@ async fn handle_notification(
                     "auto-wake: suppressed completion (goal loop active)"
                 );
             } else if config.auto_wake_enabled {
-                config.task_completion_reservations.reserve(task_id.clone());
+                let completion_reservation =
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        config.task_completion_reservations.clone(),
+                        task_id.clone(),
+                    );
                 let tool_name = resolved_tool_name(&config.task_output_tool_name);
                 let read_name = resolved_tool_name(&config.read_tool_name);
                 let body = if is_monitor {
@@ -417,6 +421,13 @@ async fn handle_notification(
                     .clone();
                 let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
                 let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+                let (promotion_trace_start, promotion_trace_start_rx) =
+                    if synthetic_trace_tx.is_some() {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        (Some(tx), Some(rx))
+                    } else {
+                        (None, None)
+                    };
                 tracing::info!(
                     task_id = %task_id,
                     prompt_id = %prompt_id,
@@ -457,6 +468,8 @@ async fn handle_notification(
                                         task_id: task_id.clone(),
                                     }
                                 },
+                                promotion_trace_start,
+                                completion_reservation: Some(completion_reservation),
                             },
                         }),
                         respond_to,
@@ -464,9 +477,6 @@ async fn handle_notification(
                         parsed_prompt_tx: None,
                     })
                     .is_ok();
-                if !enqueued {
-                    config.task_completion_reservations.release(&task_id);
-                }
                 let admitted = if enqueued {
                     tokio::time::timeout(TASK_WAKE_ADMISSION_TIMEOUT, admission_rx)
                         .await
@@ -497,32 +507,30 @@ async fn handle_notification(
                                     task_id: task_id.clone(),
                                 });
                     }
-                    if let Some(trace_tx) = synthetic_trace_tx {
-                        let (before_copy_tx, before_session_copy_rx) =
-                            tokio::sync::oneshot::channel();
-                        let copy_requested = config
-                            .session_cmd_tx
-                            .send(SessionCommand::CopyFile {
-                                respond_to: before_copy_tx,
-                            })
-                            .is_ok();
-                        if copy_requested {
+                    if let (Some(trace_tx), Some(promotion_trace_start_rx)) =
+                        (synthetic_trace_tx, promotion_trace_start_rx)
+                    {
+                        let session_id = config.session_id.clone();
+                        let trace_task_id = task_id.clone();
+                        tokio::spawn(async move {
+                            let Ok(before_session_copy_rx) = promotion_trace_start_rx.await else {
+                                tracing::debug!(
+                                    task_id = %trace_task_id,
+                                    "auto-wake: turn was not promoted, skipping synthetic trace"
+                                );
+                                return;
+                            };
                             tracing::info!(
-                                task_id = %task_id,
-                                "auto-wake: sending synthetic turn trace request"
+                                task_id = %trace_task_id,
+                                "auto-wake: promoted turn, sending synthetic trace request"
                             );
                             let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
-                                session_id: config.session_id.clone(),
+                                session_id,
                                 prompt_id,
                                 completion_rx,
                                 before_session_copy_rx,
                             });
-                        } else {
-                            tracing::debug!(
-                                task_id = %task_id,
-                                "auto-wake: session snapshot request failed, skipping trace request"
-                            );
-                        }
+                        });
                     } else {
                         tracing::debug!(
                             task_id = %task_id,
@@ -835,6 +843,24 @@ mod tests {
         cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
         accepted: bool,
     ) {
+        drop(
+            handle_notification_with_admission_trace_start(
+                config,
+                notification,
+                offsets,
+                cmd_rx,
+                accepted,
+            )
+            .await,
+        );
+    }
+    async fn handle_notification_with_admission_trace_start(
+        config: &NotificationBridgeConfig,
+        notification: ToolNotification,
+        offsets: &mut HashMap<String, usize>,
+        cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+        accepted: bool,
+    ) -> Option<crate::session::commands::PromotionTraceStartSender> {
         let notification = handle_notification(config, notification, offsets);
         tokio::pin!(notification);
         let mut command = tokio::select! {
@@ -844,10 +870,15 @@ mod tests {
         let SessionCommand::Prompt { admission, .. } = &mut command else {
             panic!("expected task-wake prompt");
         };
-        admission
+        let admission = admission
             .take()
-            .expect("expected task-wake admission request")
-            .respond_to
+            .expect("expected task-wake admission request");
+        let crate::session::commands::TaskWakeAdmission {
+            respond_to,
+            mut fallback,
+        } = admission;
+        let promotion_trace_start = fallback.promotion_trace_start.take();
+        respond_to
             .send(accepted)
             .expect("notification must still be awaiting admission");
         config
@@ -855,6 +886,7 @@ mod tests {
             .send(command)
             .expect("test command receiver must remain open");
         notification.await;
+        accepted.then_some(promotion_trace_start).flatten()
     }
     fn make_test_config() -> (
         NotificationBridgeConfig,
@@ -1109,7 +1141,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(trace_tx);
         let mut offsets = HashMap::new();
-        handle_notification_with_admission(
+        let promotion_trace_start = handle_notification_with_admission_trace_start(
             &config,
             ToolNotification::TaskCompleted(make_task_snapshot("bg-wake", TaskKind::Bash)),
             &mut offsets,
@@ -1121,19 +1153,30 @@ mod tests {
             cmd_rx.recv().await,
             Some(SessionCommand::Prompt { .. })
         ));
-        match cmd_rx.recv().await {
-            Some(SessionCommand::CopyFile { respond_to }) => drop(respond_to),
-            _ => panic!("trace copy must follow accepted prompt admission"),
-        }
+        assert!(matches!(
+            cmd_rx.recv().await,
+            Some(SessionCommand::DispatchNotificationHook { .. })
+        ));
         assert_eq!(
             task_completed_will_wake(&mut gateway_rx),
             Some(true),
             "an auto-woken completion must stamp will_wake: true"
         );
         assert!(
-            trace_rx.try_recv().is_ok(),
-            "accepted admission must request a synthetic-turn trace"
+            trace_rx.try_recv().is_err(),
+            "admission alone must not request a synthetic-turn trace"
         );
+        let (_before_copy_tx, before_session_copy_rx) = tokio::sync::oneshot::channel();
+        promotion_trace_start
+            .expect("traced wake must carry a promotion handoff")
+            .send(before_session_copy_rx)
+            .expect("simulate actor promotion");
+        let trace = tokio::time::timeout(std::time::Duration::from_secs(1), trace_rx.recv())
+            .await
+            .expect("trace request timeout")
+            .expect("trace request");
+        assert_eq!(trace.prompt_id, "task-completed-bg-wake");
+        assert_eq!(trace.session_id.0.as_ref(), "test-session");
         let (config, mut gateway_rx, mut persistence_rx, mut cmd_rx) = make_test_config_full();
         let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
         *config

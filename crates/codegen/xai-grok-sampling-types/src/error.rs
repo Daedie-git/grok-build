@@ -81,6 +81,107 @@ pub struct ResponseModelMetadata {
 /// can never drift from what Display actually emits.
 const SERIALIZATION_DISPLAY_PREFIX: &str = "serialization error: ";
 
+/// Responses API image failures caused by the submitted image itself. These
+/// are deterministic for an unchanged request, but callers may recover by
+/// removing images and resubmitting.
+const RECOVERABLE_IMAGE_ERROR_CODES: &[&str] = &[
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "invalid_image_mode",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "empty_image_file",
+];
+
+fn is_recoverable_image_error_code(value: &str) -> bool {
+    RECOVERABLE_IMAGE_ERROR_CODES.contains(&value)
+}
+
+fn contains_recoverable_image_error_code(value: &str) -> bool {
+    RECOVERABLE_IMAGE_ERROR_CODES
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+/// Map a structured SSE error code and message to the HTTP-equivalent status
+/// used by downstream retry and recovery policy.
+///
+/// Some providers send a numeric status while others send symbolic codes. An
+/// unknown code remains a retryable 500 for backward compatibility. Known
+/// request, authentication, account, and image failures map to permanent 4xx
+/// statuses so replaying the unchanged request does not consume the retry
+/// budget.
+pub fn structured_stream_error_status(error_type: &str, message: &str) -> StatusCode {
+    let kind = error_type.trim().to_ascii_lowercase();
+    if let Some(status) = kind
+        .parse::<u16>()
+        .ok()
+        .and_then(|status| StatusCode::from_u16(status).ok())
+    {
+        return status;
+    }
+
+    let exact_status = match kind.as_str() {
+        "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        "authentication_error" | "unauthorized" => Some(StatusCode::UNAUTHORIZED),
+        "permission_error" | "forbidden" | "account_deactivated" => Some(StatusCode::FORBIDDEN),
+        "insufficient_quota" | "billing_error" => Some(StatusCode::PAYMENT_REQUIRED),
+        "not_found_error" | "image_file_not_found" => Some(StatusCode::NOT_FOUND),
+        "rate_limit_error" | "rate_limit_exceeded" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "service_unavailable_error" | "overloaded_error" => Some(StatusCode::SERVICE_UNAVAILABLE),
+        "timeout_error" | "vector_store_timeout" => Some(StatusCode::GATEWAY_TIMEOUT),
+        "image_content_policy_violation" => Some(StatusCode::FORBIDDEN),
+        value if is_recoverable_image_error_code(value) => Some(StatusCode::BAD_REQUEST),
+        _ => None,
+    };
+    if let Some(status) = exact_status {
+        return status;
+    }
+
+    let message = message.to_ascii_lowercase();
+    if is_context_length_error(&message)
+        || message.contains("invalid_request_error")
+        || message.contains("invalid_prompt")
+        || contains_recoverable_image_error_code(&message)
+    {
+        StatusCode::BAD_REQUEST
+    } else if message.contains("authentication_error") {
+        StatusCode::UNAUTHORIZED
+    } else if message.contains("permission_error")
+        || message.contains("account_deactivated")
+        || message.contains("image_content_policy_violation")
+    {
+        StatusCode::FORBIDDEN
+    } else if message.contains("insufficient_quota") || message.contains("billing_error") {
+        StatusCode::PAYMENT_REQUIRED
+    } else if message.contains("not_found_error") || message.contains("image_file_not_found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("rate_limit_error") || message.contains("rate_limit_exceeded") {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if message.contains("service_unavailable_error") || message.contains("overloaded_error")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if message.contains("timeout_error") || message.contains("vector_store_timeout") {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn is_retryable_api_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum SamplingError {
     #[error("{0}")]
@@ -159,24 +260,34 @@ impl SamplingError {
         // OIDC refresh and then surfaces as acp::Error::auth_required on
         // the client, which in the desktop app tears down the session and
         // can race with invalid_grant_threshold to wipe auth.json.
-        matches!(
-            self,
+        match self {
             SamplingError::Auth(_)
-                | SamplingError::Api {
-                    status: StatusCode::UNAUTHORIZED,
-                    ..
-                }
-        )
+            | SamplingError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => structured_stream_error_status(error_type, message) == StatusCode::UNAUTHORIZED,
+            _ => false,
+        }
     }
 
     pub fn is_rate_limited(&self) -> bool {
-        matches!(
-            self,
+        match self {
             SamplingError::Api {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 ..
+            } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+            } => {
+                structured_stream_error_status(error_type, message) == StatusCode::TOO_MANY_REQUESTS
             }
-        )
+            _ => false,
+        }
     }
 
     pub fn is_payload_too_large(&self) -> bool {
@@ -225,16 +336,26 @@ impl SamplingError {
 
     /// The API rejected the request because an inline image could not be
     /// processed. Matches both direct 400 and proxy-wrapped 500 responses.
-    /// Exact-case match — consistent with `is_encrypted_content_error`.
+    /// Also recognizes structured Responses API image error codes so callers
+    /// can strip the invalid image instead of replaying the same payload.
     pub fn is_image_processing_error(&self) -> bool {
-        matches!(
-            self,
+        match self {
             SamplingError::Api {
-                status,
+                status, message, ..
+            } => {
+                matches!(status.as_u16(), 400 | 500)
+                    && (message.contains("Could not process image")
+                        || contains_recoverable_image_error_code(&message.to_ascii_lowercase()))
+            }
+            SamplingError::StreamError {
+                error_type,
                 message,
-                ..
-            } if matches!(status.as_u16(), 400 | 500) && message.contains("Could not process image")
-        )
+            } => {
+                is_recoverable_image_error_code(&error_type.trim().to_ascii_lowercase())
+                    || contains_recoverable_image_error_code(&message.to_ascii_lowercase())
+            }
+            _ => false,
+        }
     }
 
     pub fn is_retryable(&self) -> bool {
@@ -247,9 +368,7 @@ impl SamplingError {
                 should_retry: Some(false),
                 ..
             } => false,
-            SamplingError::Api { status, .. } => {
-                matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504 | 520)
-            }
+            SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
             SamplingError::StreamError {
                 error_type,
@@ -306,36 +425,7 @@ impl SamplingError {
 /// remain retryable for backward compatibility; only well-known permanent
 /// dispositions fail closed.
 fn is_retryable_stream_error(error_type: &str, message: &str) -> bool {
-    if is_context_length_error(message) {
-        return false;
-    }
-
-    let kind = error_type.trim().to_ascii_lowercase();
-    let message = message.to_ascii_lowercase();
-    let permanent_marker = |value: &str| {
-        matches!(
-            value,
-            "invalid_request_error"
-                | "authentication_error"
-                | "permission_error"
-                | "insufficient_quota"
-                | "account_deactivated"
-                | "billing_error"
-                | "not_found_error"
-        )
-    };
-    !permanent_marker(kind.as_str())
-        && ![
-            "invalid_request_error",
-            "authentication_error",
-            "permission_error",
-            "insufficient_quota",
-            "account_deactivated",
-            "billing_error",
-            "not_found_error",
-        ]
-        .iter()
-        .any(|marker| message.contains(marker))
+    is_retryable_api_status(structured_stream_error_status(error_type, message))
 }
 
 impl From<reqwest::Error> for SamplingError {
@@ -601,6 +691,10 @@ mod tests {
             "authentication_error",
             "permission_error",
             "insufficient_quota",
+            "account_deactivated",
+            "billing_error",
+            "invalid_image_format",
+            "image_content_policy_violation",
         ] {
             let err = SamplingError::StreamError {
                 error_type: error_type.into(),
@@ -627,6 +721,88 @@ mod tests {
                 message: "try again later".into(),
             };
             assert!(err.is_retryable(), "{error_type} must remain retryable");
+        }
+    }
+
+    #[test]
+    fn structured_stream_status_maps_known_provider_dispositions() {
+        for (error_type, expected) in [
+            ("invalid_request_error", StatusCode::BAD_REQUEST),
+            ("authentication_error", StatusCode::UNAUTHORIZED),
+            ("permission_error", StatusCode::FORBIDDEN),
+            ("insufficient_quota", StatusCode::PAYMENT_REQUIRED),
+            ("account_deactivated", StatusCode::FORBIDDEN),
+            ("billing_error", StatusCode::PAYMENT_REQUIRED),
+            ("invalid_image_format", StatusCode::BAD_REQUEST),
+            ("image_content_policy_violation", StatusCode::FORBIDDEN),
+            ("image_file_not_found", StatusCode::NOT_FOUND),
+            ("rate_limit_exceeded", StatusCode::TOO_MANY_REQUESTS),
+            ("overloaded_error", StatusCode::SERVICE_UNAVAILABLE),
+            ("vector_store_timeout", StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            assert_eq!(
+                structured_stream_error_status(error_type, "provider failure"),
+                expected,
+                "unexpected status for {error_type}"
+            );
+        }
+
+        assert_eq!(
+            structured_stream_error_status(
+                "unknown",
+                "wrapped billing_error: update payment method"
+            ),
+            StatusCode::PAYMENT_REQUIRED
+        );
+        assert_eq!(
+            structured_stream_error_status("unknown", "unclassified upstream failure"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn known_transient_api_statuses_are_retryable() {
+        for code in [429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
+            let err = SamplingError::Api {
+                status: StatusCode::from_u16(code).unwrap(),
+                message: "transient".into(),
+                model_metadata: None,
+                retry_after_secs: None,
+                should_retry: None,
+            };
+            assert!(err.is_retryable(), "HTTP {code} must remain retryable");
+        }
+
+        let not_implemented = SamplingError::Api {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: "endpoint is not implemented".into(),
+            model_metadata: None,
+            retry_after_secs: None,
+            should_retry: None,
+        };
+        assert!(
+            !not_implemented.is_retryable(),
+            "501 is deterministic and must not be broadened with transient 5xx codes"
+        );
+    }
+
+    #[test]
+    fn structured_stream_auth_detection_excludes_forbidden() {
+        let unauthorized = SamplingError::StreamError {
+            error_type: "authentication_error".into(),
+            message: "expired token".into(),
+        };
+        assert!(unauthorized.is_auth_error());
+
+        for error_type in ["permission_error", "403", "account_deactivated"] {
+            let forbidden = SamplingError::StreamError {
+                error_type: error_type.into(),
+                message: "request is forbidden".into(),
+            };
+            assert!(
+                !forbidden.is_auth_error(),
+                "{error_type} must not trigger credential refresh"
+            );
         }
     }
 
@@ -1005,5 +1181,30 @@ mod tests {
             !err.is_retryable(),
             "direct 400 must not be retryable by is_retryable()"
         );
+    }
+
+    #[test]
+    fn structured_image_codes_are_recoverable_without_blind_retries() {
+        for error_type in RECOVERABLE_IMAGE_ERROR_CODES {
+            let err = SamplingError::StreamError {
+                error_type: (*error_type).into(),
+                message: "submitted image is invalid".into(),
+            };
+            assert!(
+                err.is_image_processing_error(),
+                "{error_type} should enter image-strip recovery"
+            );
+            assert!(
+                !err.is_retryable(),
+                "{error_type} must not blindly retry the unchanged payload"
+            );
+        }
+
+        let policy = SamplingError::StreamError {
+            error_type: "image_content_policy_violation".into(),
+            message: "image rejected by policy".into(),
+        };
+        assert!(!policy.is_image_processing_error());
+        assert!(!policy.is_retryable());
     }
 }

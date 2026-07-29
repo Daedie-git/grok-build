@@ -59,6 +59,12 @@ enum CompactionReplacement {
     LocalSummary(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCompactFailureDisposition {
+    Cooldown,
+    RetryAfterReset,
+}
+
 impl CompactionProduct {
     fn local_summary(&self) -> Option<&str> {
         match self {
@@ -1172,18 +1178,24 @@ impl SessionActor {
         );
     }
 
-    /// Record a terminal automatic-compaction failure after its internal retry
-    /// budget is exhausted. Deterministic/schema failures stay blocked until a
-    /// state reset; transient failures receive a bounded cooldown.
-    fn record_auto_compact_retry_gate(&self) {
-        let suppression = self
-            .compaction
-            .auto_compact_suppressed
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let retry_not_before_ms = if suppression == SUPPRESS_STICKY {
-            AUTO_COMPACT_RETRY_AFTER_RESET
+    fn auto_compact_failure_disposition(error: &acp::Error) -> AutoCompactFailureDisposition {
+        let reason = Self::classify_suppress_reason(&Self::acp_error_message(error));
+        if reason.suppress_state() == SUPPRESS_STICKY {
+            AutoCompactFailureDisposition::RetryAfterReset
         } else {
-            Self::current_epoch_ms().saturating_add(AUTO_COMPACT_FAILURE_COOLDOWN_MS)
+            AutoCompactFailureDisposition::Cooldown
+        }
+    }
+
+    /// Record a terminal automatic-compaction failure after its internal retry
+    /// budget is exhausted. The disposition belongs to the current lifecycle;
+    /// persistent suppression may describe an earlier successful soft overshoot.
+    fn record_auto_compact_retry_gate(&self, disposition: AutoCompactFailureDisposition) {
+        let retry_not_before_ms = match disposition {
+            AutoCompactFailureDisposition::RetryAfterReset => AUTO_COMPACT_RETRY_AFTER_RESET,
+            AutoCompactFailureDisposition::Cooldown => {
+                Self::current_epoch_ms().saturating_add(AUTO_COMPACT_FAILURE_COOLDOWN_MS)
+            }
         };
         self.compaction
             .auto_compact_retry_not_before_ms
@@ -2777,8 +2789,11 @@ impl SessionActor {
             kind: AutoCompactTriggerKind::PreflightOverflow,
         })
     }
-    /// On model change: clear sticky/other suppress and compact if the window shrank.
-    /// Leaves credit/auth suppress (a switch can't fix those) and short-circuits.
+    /// On a model or context-window change: clear sticky/other suppress and
+    /// compact if the window shrank. Model slug plus context window form the
+    /// transition identity because remote metadata can resize the same model.
+    /// Leaves credit/auth suppress (a model/context change can't fix those) and
+    /// short-circuits.
     /// Auth compact failures abort the turn (same as pre-sampling/preflight).
     pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) -> Result<(), acp::Error> {
         self.refresh_token_if_expired().await;
@@ -2788,7 +2803,8 @@ impl SessionActor {
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
             return Ok(());
         };
-        if cfg.model == prev.model_slug {
+        let context_window = cfg.context_window.get();
+        if cfg.model == prev.model_slug && context_window == prev.context_window {
             return Ok(());
         }
         if self.is_account_state_suppressed() {
@@ -2798,7 +2814,7 @@ impl SessionActor {
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
         self.clear_auto_compact_retry_gate();
-        if prev.context_window <= cfg.context_window.get() {
+        if prev.context_window <= context_window {
             return Ok(());
         }
         let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
@@ -2806,15 +2822,15 @@ impl SessionActor {
             return Ok(());
         };
         tracing::info!(
-            "Proactive model-switch compact: {} ({}) -> {} ({}), {}% full",
-            prev.model_slug,
-            prev.context_window,
-            cfg.model,
-            cfg.context_window.get(),
-            trigger_info.percentage,
+            previous_model = %prev.model_slug,
+            previous_context_window = prev.context_window,
+            model = %cfg.model,
+            context_window,
+            percentage = trigger_info.percentage,
+            "Proactive model/context-change compact after context-window shrink",
         );
         if let Err(e) = self.run_compact_only(trigger_info).await {
-            tracing::error!(error = %e, "Model-switch compaction failed");
+            tracing::error!(error = %e, "Model/context-change compaction failed");
             if Self::is_auth_compact_error(&e) {
                 return Err(self.surface_compact_auth_failure(e).await);
             }
@@ -2824,7 +2840,8 @@ impl SessionActor {
         }
         Ok(())
     }
-    /// Record the current model for model-switch detection on the next turn.
+    /// Record the current model and context budget for transition detection on
+    /// the next turn.
     pub(crate) async fn record_turn_model(&self) {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             self.compaction.previous_model.set(Some(
@@ -2958,7 +2975,9 @@ impl SessionActor {
                     if bounded_claimed {
                         self.finish_bounded_auto_compaction(false);
                     }
-                    self.record_auto_compact_retry_gate();
+                    self.record_auto_compact_retry_gate(
+                        AutoCompactFailureDisposition::RetryAfterReset,
+                    );
                     self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
                         error: message.clone(),
                     })
@@ -2987,7 +3006,7 @@ impl SessionActor {
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
-                self.record_auto_compact_retry_gate();
+                self.record_auto_compact_retry_gate(Self::auto_compact_failure_disposition(&e));
                 if self
                     .compaction
                     .auto_compact_suppressed
@@ -3171,8 +3190,8 @@ mod inline_auto_compact_flow_tests {
     use super::super::support::*;
     use super::super::*;
     use super::{
-        AutoCompactTriggerInfo, AutoCompactTriggerKind, BOUNDED_COMPACT_FINALIZING,
-        BOUNDED_COMPACT_NONE, CompactionCommitKind, SuppressReason,
+        AutoCompactFailureDisposition, AutoCompactTriggerInfo, AutoCompactTriggerKind,
+        BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_NONE, CompactionCommitKind, SuppressReason,
     };
     use crate::session::acp_session::McpReminderMode;
     use crate::terminal::AsyncTerminalRunner;
@@ -3219,6 +3238,7 @@ mod inline_auto_compact_flow_tests {
             pending_inputs: VecDeque::new(),
             combine_edit_holds: std::collections::HashSet::new(),
             pending_notifications: Vec::new(),
+            consumed_completion_tombstones: VecDeque::new(),
             notifications_suppressed: false,
             rewindable: false,
             nudges_used_this_session: 0,
@@ -3715,7 +3735,7 @@ mod inline_auto_compact_flow_tests {
                 let persistence_tx = successful_timeline_persistence();
                 let actor = create_test_actor(1_000, 200_000, 85, gateway_tx, persistence_tx).await;
 
-                actor.record_auto_compact_retry_gate();
+                actor.record_auto_compact_retry_gate(AutoCompactFailureDisposition::Cooldown);
                 let retry_at = actor
                     .compaction
                     .auto_compact_retry_not_before_ms
@@ -3782,6 +3802,77 @@ mod inline_auto_compact_flow_tests {
                         "model switch must clear {reason:?} suppression so the gates re-evaluate"
                     );
                 }
+            })
+            .await;
+    }
+    /// Remote metadata may expand a model's context window without changing its
+    /// slug. That new budget is a real lifecycle reset: deterministic
+    /// suppression and its retry-after-reset gate must clear, but expansion
+    /// itself must not launch compaction.
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_model_context_expansion_clears_sticky_and_retry_gate_without_compacting() {
+        use crate::session::compaction_config::{
+            AUTO_COMPACT_RETRY_AFTER_RESET, AUTO_COMPACT_RETRY_READY, PreviousModelInfo,
+            SUPPRESS_NONE, SUPPRESS_STICKY,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let persistence_tx = successful_timeline_persistence();
+                let actor = Arc::new(
+                    create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await,
+                );
+                let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+
+                actor
+                    .suppress_auto_compaction(SuppressReason::Size, 180_000, 100_000)
+                    .await;
+                actor
+                    .record_auto_compact_retry_gate(AutoCompactFailureDisposition::RetryAfterReset);
+                assert_eq!(
+                    actor.compaction.auto_compact_suppressed.load(Relaxed),
+                    SUPPRESS_STICKY
+                );
+                assert_eq!(
+                    actor
+                        .compaction
+                        .auto_compact_retry_not_before_ms
+                        .load(Relaxed),
+                    AUTO_COMPACT_RETRY_AFTER_RESET
+                );
+                let compactions_before = actor.compaction.count.load(Relaxed);
+
+                actor.compaction.previous_model.set(Some(PreviousModelInfo {
+                    model_slug: cfg.model.clone(),
+                    context_window: 100_000,
+                }));
+                actor
+                    .maybe_compact_on_model_switch()
+                    .await
+                    .expect("same-model expansion must reset compaction lifecycle");
+
+                assert_eq!(
+                    actor.compaction.auto_compact_suppressed.load(Relaxed),
+                    SUPPRESS_NONE,
+                    "same-model context expansion must clear deterministic suppression"
+                );
+                assert_eq!(
+                    actor
+                        .compaction
+                        .auto_compact_retry_not_before_ms
+                        .load(Relaxed),
+                    AUTO_COMPACT_RETRY_READY,
+                    "same-model context expansion must clear retry-after-reset"
+                );
+                assert_eq!(
+                    actor.compaction.count.load(Relaxed),
+                    compactions_before,
+                    "context expansion must not launch proactive compaction"
+                );
+                assert!(actor.auto_compact_retry_gate_error().is_none());
             })
             .await;
     }
@@ -4028,12 +4119,21 @@ mod inline_auto_compact_flow_tests {
         )
         .await
     }
+    /// Mock LLM that answers every request with a retryable 503.
+    async fn spawn_transient_503_server() -> String {
+        spawn_status_body_server(
+            503,
+            r#"{"error":{"type":"server_error","message":"temporarily unavailable"}}"#,
+        )
+        .await
+    }
     async fn spawn_status_body_server(status: u16, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let status_line = match status {
             400 => "400 Bad Request",
             401 => "401 Unauthorized",
+            503 => "503 Service Unavailable",
             other => panic!("add status line for {other}"),
         };
         tokio::spawn(async move {
@@ -4666,6 +4766,94 @@ mod inline_auto_compact_flow_tests {
                 assert!(
                     actor.check_auto_compact_needed().await.is_none(),
                     "sticky post-install suppression must prevent an immediate soft-threshold retry"
+                );
+            })
+            .await;
+    }
+
+    /// A sticky suppression can describe a prior successful soft-only
+    /// compaction. It must not turn a later transient Codex safety failure into
+    /// a permanent retry gate.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn codex_transient_failure_after_soft_overshoot_uses_expiring_cooldown() {
+        use crate::session::compaction_config::{AUTO_COMPACT_RETRY_AFTER_RESET, SUPPRESS_STICKY};
+        use std::sync::atomic::Ordering::Relaxed;
+        use xai_grok_test_support::MockInferenceServer;
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let persistence_tx = successful_timeline_persistence();
+                let actor =
+                    Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+                let success_server = MockInferenceServer::start().await.unwrap();
+                success_server.set_response("Summary. ".repeat(70));
+                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.base_url = success_server.url();
+                actor.chat_state_handle.update_sampling_config(cfg);
+                actor.chat_state_handle.replace_conversation(vec![
+                    ConversationItem::system("s".repeat(150_000)),
+                    ConversationItem::user("q"),
+                    ConversationItem::assistant("a"),
+                    ConversationItem::user("final query"),
+                ]);
+
+                actor
+                    .run_compact_only(AutoCompactTriggerInfo {
+                        tokens_used: 36_400,
+                        context_window: 40_000,
+                        percentage: 91,
+                        kind: AutoCompactTriggerKind::SoftThreshold,
+                    })
+                    .await
+                    .expect("soft-only overshoot must keep installed history usable");
+                assert_eq!(
+                    actor.compaction.auto_compact_suppressed.load(Relaxed),
+                    SUPPRESS_STICKY,
+                    "successful soft overshoot must leave sticky suppression"
+                );
+
+                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                cfg.base_url = spawn_transient_503_server().await;
+                actor.chat_state_handle.update_sampling_config(cfg);
+                let tokens_used = actor.chat_state_handle.get_total_tokens().await;
+                assert!(
+                    actor.codex_safety_limit_exceeded(tokens_used).await,
+                    "soft overshoot fixture must also exceed the later Codex safety limit"
+                );
+
+                actor
+                    .run_compact_only(AutoCompactTriggerInfo {
+                        tokens_used,
+                        context_window: 40_000,
+                        percentage: (tokens_used.saturating_mul(100) / 40_000).min(100) as u8,
+                        kind: AutoCompactTriggerKind::CodexSafety,
+                    })
+                    .await
+                    .expect_err("transient 503s must exhaust the Codex compaction lifecycle");
+
+                let retry_at = actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed);
+                assert_ne!(
+                    retry_at, AUTO_COMPACT_RETRY_AFTER_RESET,
+                    "stale sticky suppression must not make a transient failure permanent"
+                );
+                assert!(
+                    retry_at > SessionActor::current_epoch_ms(),
+                    "transient failure must leave an active expiring cooldown"
+                );
+                assert!(
+                    SessionActor::acp_error_message(
+                        &actor
+                            .auto_compact_retry_gate_error()
+                            .expect("transient cooldown must be active")
+                    )
+                    .contains("cooling down")
                 );
             })
             .await;
@@ -5392,39 +5580,66 @@ mod inline_auto_compact_flow_tests {
             })
             .await;
     }
-    /// Model-switch compaction fires when switching to a smaller context window.
+    /// A same-model context-window shrink must clear a deterministic lifecycle
+    /// gate and proactively compact when the transcript exceeds the new soft
+    /// budget.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_model_switch_compaction_triggers_on_downgrade() {
+    async fn same_model_context_shrink_reenables_and_triggers_compaction() {
+        use crate::session::compaction_config::PreviousModelInfo;
+        use std::sync::atomic::Ordering::Relaxed;
+        use xai_grok_test_support::MockInferenceServer;
+
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-                let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let persistence_tx = successful_timeline_persistence();
                 let actor =
-                    create_test_actor(86_000, 100_000, 85, gateway_tx, persistence_tx).await;
-                actor.compaction.previous_model.set(Some(
-                    crate::session::compaction_config::PreviousModelInfo {
-                        model_slug: "large-model".to_string(),
-                        context_window: 200_000,
-                    },
-                ));
-                let prev = actor.compaction.previous_model.take();
-                assert!(prev.is_some());
-                let prev = prev.unwrap();
-                assert_eq!(prev.context_window, 200_000);
-                let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-                assert!(prev.context_window > cfg.context_window.get());
-                let total = actor.chat_state_handle.get_estimated_total_tokens().await;
-                let trigger = actor.should_auto_compact(total, cfg.context_window);
-                assert!(trigger.is_some(), "86% > 85% threshold, should trigger");
-                actor.compaction.previous_model.set(Some(
-                    crate::session::compaction_config::PreviousModelInfo {
-                        model_slug: "small-model".to_string(),
-                        context_window: 50_000,
-                    },
-                ));
-                let prev = actor.compaction.previous_model.take().unwrap();
-                assert!(prev.context_window <= cfg.context_window.get());
+                    Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+                let server = MockInferenceServer::start().await.unwrap();
+                server.set_response("Summary. ".repeat(70));
+                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.base_url = server.url();
+                actor.chat_state_handle.update_sampling_config(cfg.clone());
+                actor.chat_state_handle.replace_conversation(vec![
+                    ConversationItem::system("s".repeat(150_000)),
+                    ConversationItem::user("q"),
+                    ConversationItem::assistant("a"),
+                    ConversationItem::user("final query"),
+                ]);
+                let total_tokens = actor.chat_state_handle.get_estimated_total_tokens().await;
+                assert!(
+                    actor
+                        .should_auto_compact(total_tokens, cfg.context_window)
+                        .is_some(),
+                    "fixture must exceed the shrunken context budget's soft threshold"
+                );
+
+                actor
+                    .suppress_auto_compaction(SuppressReason::Size, total_tokens, 80_000)
+                    .await;
+                actor
+                    .record_auto_compact_retry_gate(AutoCompactFailureDisposition::RetryAfterReset);
+                actor.compaction.previous_model.set(Some(PreviousModelInfo {
+                    model_slug: cfg.model,
+                    context_window: 80_000,
+                }));
+
+                actor
+                    .maybe_compact_on_model_switch()
+                    .await
+                    .expect("same-model shrink compaction must remain usable");
+
+                assert_eq!(
+                    server.request_count(),
+                    1,
+                    "same-model shrink must reach the compaction model"
+                );
+                assert_eq!(
+                    actor.compaction.count.load(Relaxed),
+                    1,
+                    "same-model shrink must launch exactly one compaction lifecycle"
+                );
             })
             .await;
     }

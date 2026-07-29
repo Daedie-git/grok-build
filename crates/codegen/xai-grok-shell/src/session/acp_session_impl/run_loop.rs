@@ -52,10 +52,28 @@ impl SessionActor {
             .as_ref()
             .is_some_and(|gate| gate.get());
         let mut state = self.state.lock().await;
+        let goal_loop_active = self
+            .tool_context
+            .goal_loop_active_gate
+            .load(std::sync::atomic::Ordering::Relaxed);
         let state_suppressed = state.notifications_suppressed;
-        let admitted = !gate_suppressed && !state_suppressed;
+        if state.has_consumed_completion(completion_id) {
+            drop(state);
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.actor_admission",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({
+                    "completion_id": completion_id,
+                    "consumed": true,
+                    "admitted": false,
+                })),
+            );
+            let _ = respond_to.send(false);
+            return None;
+        }
+        let admitted = !gate_suppressed && !state_suppressed && !goal_loop_active;
         if !admitted {
-            Self::push_task_wake_fallback(&mut state, fallback);
+            self.push_task_wake_fallback(&mut state, fallback);
             drop(state);
             xai_grok_telemetry::unified_log::info(
                 "shell.task_wake.actor_admission",
@@ -64,6 +82,7 @@ impl SessionActor {
                     "completion_id": completion_id,
                     "gate": gate_suppressed,
                     "state": state_suppressed,
+                    "goal_loop_active": goal_loop_active,
                     "admitted": false,
                 })),
             );
@@ -71,7 +90,7 @@ impl SessionActor {
             return None;
         }
         if respond_to.send(true).is_err() {
-            Self::push_task_wake_fallback(&mut state, fallback);
+            self.push_task_wake_fallback(&mut state, fallback);
             return None;
         }
         drop(state);
@@ -82,6 +101,7 @@ impl SessionActor {
                 "completion_id": completion_id,
                 "gate": gate_suppressed,
                 "state": state_suppressed,
+                "goal_loop_active": goal_loop_active,
                 "admitted": true,
             })),
         );
@@ -883,6 +903,7 @@ pub(super) async fn run_session(
                                             prompt_blocks,
                                             priority,
                                             source,
+                                            owned_completion_reservation: None,
                                         },
                                     );
                                 }

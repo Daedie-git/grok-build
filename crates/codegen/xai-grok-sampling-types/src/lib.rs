@@ -42,7 +42,8 @@ pub use self::doom_loop::{
 };
 pub use self::error::{
     EmptyReason, EmptyResponseContext, ResponseModelMetadata, Result, SamplingError,
-    is_context_length_error, status_user_message, user_facing_api_error_message,
+    is_context_length_error, status_user_message, structured_stream_error_status,
+    user_facing_api_error_message,
 };
 pub use self::provider_capabilities::{
     AutoCompactSafety, HostedToolPolicy, NativeCompactionKind, ProtocolIdentity,

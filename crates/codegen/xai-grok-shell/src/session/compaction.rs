@@ -99,6 +99,42 @@ fn prefire_lead_percent() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
 }
+
+/// Owned snapshot of the process-level Codex compaction strategy override.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfiguredCodexCompactionStrategy {
+    Unset,
+    Value(String),
+    InvalidEncoding,
+}
+
+impl ConfiguredCodexCompactionStrategy {
+    fn from_env_result(result: Result<String, std::env::VarError>) -> Self {
+        match result {
+            Ok(value) => Self::Value(value),
+            Err(std::env::VarError::NotPresent) => Self::Unset,
+            Err(std::env::VarError::NotUnicode(_)) => Self::InvalidEncoding,
+        }
+    }
+
+    fn as_override(&self) -> CompactionStrategyOverride<'_> {
+        match self {
+            Self::Unset => CompactionStrategyOverride::Unset,
+            Self::Value(value) => CompactionStrategyOverride::Value(value),
+            Self::InvalidEncoding => CompactionStrategyOverride::InvalidEncoding,
+        }
+    }
+}
+
+/// Snapshot the developer strategy override once at compaction invocation.
+///
+/// Keeping the global read outside `run_compact_inner` makes its policy input
+/// explicit and lets tests cover default behavior without mutating process state.
+fn configured_codex_compaction_strategy() -> ConfiguredCodexCompactionStrategy {
+    ConfiguredCodexCompactionStrategy::from_env_result(std::env::var(
+        "GROK_CODEX_COMPACTION_STRATEGY",
+    ))
+}
 /// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity. A
 /// mismatch means the prefix changed (edit / rewind / branch) since pass-1, so
 /// the cached NOTE₁ no longer summarizes the current prefix and must be dropped.
@@ -193,8 +229,40 @@ impl From<PrefireOutcome> for PrefirePass1Run {
 }
 #[cfg(test)]
 mod two_pass_prefire_helper_tests {
-    use super::{fingerprint_prefix, prefire_lead_percent};
+    use super::{
+        CompactionStrategyOverride, ConfiguredCodexCompactionStrategy, fingerprint_prefix,
+        prefire_lead_percent,
+    };
     use xai_grok_sampling_types::ConversationItem;
+
+    #[test]
+    fn strategy_environment_snapshot_distinguishes_absent_invalid_and_text_values() {
+        let unset =
+            ConfiguredCodexCompactionStrategy::from_env_result(Err(std::env::VarError::NotPresent));
+        assert_eq!(unset, ConfiguredCodexCompactionStrategy::Unset);
+        assert_eq!(unset.as_override(), CompactionStrategyOverride::Unset);
+
+        for value in ["", "local", " native_codex "] {
+            let configured =
+                ConfiguredCodexCompactionStrategy::from_env_result(Ok(value.to_owned()));
+            assert_eq!(
+                configured.as_override(),
+                CompactionStrategyOverride::Value(value)
+            );
+        }
+
+        let invalid = ConfiguredCodexCompactionStrategy::from_env_result(Err(
+            std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "synthetic non-Unicode environment value",
+            )),
+        ));
+        assert_eq!(invalid, ConfiguredCodexCompactionStrategy::InvalidEncoding);
+        assert_eq!(
+            invalid.as_override(),
+            CompactionStrategyOverride::InvalidEncoding
+        );
+    }
+
     #[test]
     fn fingerprint_stable_for_same_prefix() {
         let items = vec![
@@ -1022,6 +1090,7 @@ impl SessionActor {
         self: &Arc<Self>,
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
+        let strategy_override = configured_codex_compaction_strategy();
         self.record_compaction_variant();
         // Manual compaction runs between prompt turns and therefore receives
         // its own routing scope instead of replaying the previous turn's state.
@@ -1040,6 +1109,7 @@ impl SessionActor {
                 user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
+                strategy_override.as_override(),
             )
             .await
         {
@@ -1425,6 +1495,7 @@ impl SessionActor {
         user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
+        strategy_override: CompactionStrategyOverride<'_>,
     ) -> Result<(), acp::Error> {
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
@@ -1576,10 +1647,9 @@ impl SessionActor {
             &sampling_config.model
         );
         let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
-        let strategy_override = std::env::var("GROK_CODEX_COMPACTION_STRATEGY").ok();
         let mut strategy = select_compaction_strategy(
             provider.capabilities(),
-            strategy_override.as_deref(),
+            strategy_override,
             user_context.is_some(),
         );
         if user_context.is_some() && strategy == CompactionStrategy::LocalSummary {
@@ -2872,6 +2942,7 @@ impl SessionActor {
         trigger_info: AutoCompactTriggerInfo,
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let strategy_override = configured_codex_compaction_strategy();
         if let Some(error) = self.auto_compact_retry_gate_error() {
             tracing::warn!(
                 trigger = ?trigger_info.kind,
@@ -2909,6 +2980,7 @@ impl SessionActor {
                 None,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
+                strategy_override.as_override(),
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -3190,7 +3262,8 @@ mod inline_auto_compact_flow_tests {
     use super::super::*;
     use super::{
         AutoCompactFailureDisposition, AutoCompactTriggerInfo, AutoCompactTriggerKind,
-        BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_NONE, CompactionCommitKind, SuppressReason,
+        BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_NONE, CompactionCommitKind,
+        CompactionStrategyOverride, SuppressReason,
     };
     use crate::session::acp_session::McpReminderMode;
     use crate::terminal::AsyncTerminalRunner;
@@ -4155,6 +4228,256 @@ mod inline_auto_compact_flow_tests {
         });
         format!("http://{addr}")
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strategy_routing_matrix_hits_expected_codex_endpoints() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::response::sse::Sse;
+        use axum::routing::post;
+        use serde_json::json;
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let compact_hits = Arc::new(AtomicUsize::new(0));
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let compact_endpoint_available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let compact_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compact_hits_for_route = compact_hits.clone();
+        let compact_endpoint_available_for_route = compact_endpoint_available.clone();
+        let compact_bodies_for_route = compact_bodies.clone();
+        let responses_hits_for_route = responses_hits.clone();
+        let responses_bodies_for_route = responses_bodies.clone();
+        let app = Router::new()
+            .route(
+                "/v1/responses/compact",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let compact_hits = compact_hits_for_route.clone();
+                    let compact_endpoint_available = compact_endpoint_available_for_route.clone();
+                    let compact_bodies = compact_bodies_for_route.clone();
+                    async move {
+                        compact_hits.fetch_add(1, Ordering::SeqCst);
+                        compact_bodies.lock().unwrap().push(body);
+                        if compact_endpoint_available.load(Ordering::SeqCst) {
+                            Json(json!({
+                                "output": [{
+                                    "type": "compaction",
+                                    "id": "cmp-default-routing",
+                                    "encrypted_content": "opaque-default-routing"
+                                }]
+                            }))
+                            .into_response()
+                        } else {
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let responses_hits = responses_hits_for_route.clone();
+                    let responses_bodies = responses_bodies_for_route.clone();
+                    async move {
+                        responses_hits.fetch_add(1, Ordering::SeqCst);
+                        responses_bodies.lock().unwrap().push(body);
+                        let events = xai_grok_test_support::sse::responses_api_events_exact(
+                            &"Local route summary. ".repeat(80),
+                            "gpt-default-routing",
+                        );
+                        Sse::new(futures_util::stream::iter(
+                            events.into_iter().map(Ok::<_, Infallible>),
+                        ))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base_url = format!("http://{addr}/v1");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                struct RoutingCase {
+                    name: &'static str,
+                    strategy_override: CompactionStrategyOverride<'static>,
+                    user_context: Option<&'static str>,
+                    endpoint_available: bool,
+                    expect_native_attempt: bool,
+                    expect_native_history: bool,
+                }
+
+                let cases = [
+                    RoutingCase {
+                        name: "unset default",
+                        strategy_override: CompactionStrategyOverride::Unset,
+                        user_context: None,
+                        endpoint_available: true,
+                        expect_native_attempt: true,
+                        expect_native_history: true,
+                    },
+                    RoutingCase {
+                        name: "blank default",
+                        strategy_override: CompactionStrategyOverride::Value(" \t\r\n"),
+                        user_context: None,
+                        endpoint_available: true,
+                        expect_native_attempt: true,
+                        expect_native_history: true,
+                    },
+                    RoutingCase {
+                        name: "explicit local opt-out",
+                        strategy_override: CompactionStrategyOverride::Value("LOCAL_SUMMARY"),
+                        user_context: None,
+                        endpoint_available: true,
+                        expect_native_attempt: false,
+                        expect_native_history: false,
+                    },
+                    RoutingCase {
+                        name: "user guidance overrides native",
+                        strategy_override: CompactionStrategyOverride::Value("native"),
+                        user_context: Some("retain the edge-caserino guidance"),
+                        endpoint_available: false,
+                        expect_native_attempt: false,
+                        expect_native_history: false,
+                    },
+                    RoutingCase {
+                        name: "unavailable native endpoint falls back locally",
+                        strategy_override: CompactionStrategyOverride::Unset,
+                        user_context: None,
+                        endpoint_available: false,
+                        expect_native_attempt: true,
+                        expect_native_history: false,
+                    },
+                ];
+                let mut expected_compact_hits = 0;
+                let mut expected_responses_hits = 0;
+
+                for (case_index, case) in cases.into_iter().enumerate() {
+                    let RoutingCase {
+                        name: case_name,
+                        strategy_override,
+                        user_context,
+                        endpoint_available,
+                        expect_native_attempt,
+                        expect_native_history,
+                    } = case;
+                    compact_endpoint_available.store(endpoint_available, Ordering::SeqCst);
+                    let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                    let persistence_tx = successful_timeline_persistence();
+                    let actor =
+                        create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
+                    let canonical_system = format!("canonical instructions {case_index}");
+                    let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                    cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                    cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                    cfg.base_url = base_url.clone();
+                    cfg.model = "gpt-default-routing".into();
+                    cfg.reasoning_effort =
+                        Some(xai_grok_sampling_types::ReasoningEffort::High);
+                    cfg.extra_headers.insert(
+                        xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+                        format!("acct-default-routing-{case_index}"),
+                    );
+                    actor.chat_state_handle.update_sampling_config(cfg);
+                    actor.chat_state_handle.replace_conversation(vec![
+                        ConversationItem::system(canonical_system.clone()),
+                        ConversationItem::user("preserve the completed implementation"),
+                    ]);
+
+                    actor
+                        .run_compact_inner(
+                            user_context.map(str::to_owned),
+                            None,
+                            xai_grok_telemetry::events::CompactionTrigger::Manual,
+                            strategy_override,
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{case_name} ({strategy_override:?}) must complete through its selected route: {error}"
+                            )
+                        });
+
+                    if expect_native_attempt {
+                        expected_compact_hits += 1;
+                    }
+                    if !expect_native_history {
+                        expected_responses_hits += 1;
+                    }
+                    assert_eq!(
+                        compact_hits.load(Ordering::SeqCst),
+                        expected_compact_hits,
+                        "{case_name}, override {strategy_override:?}"
+                    );
+                    assert_eq!(
+                        responses_hits.load(Ordering::SeqCst),
+                        expected_responses_hits,
+                        "{case_name}, override {strategy_override:?}"
+                    );
+                    let history = actor.chat_state_handle.get_conversation().await;
+                    assert!(matches!(
+                        history.first(),
+                        Some(ConversationItem::System(system))
+                            if &*system.content == canonical_system
+                    ));
+                    let has_native_metadata = history.iter().any(|item| {
+                        matches!(
+                            item,
+                            ConversationItem::Provider(provider)
+                                if provider.is_native_compaction_metadata()
+                        )
+                    });
+                    let has_encrypted_compaction = history.iter().any(|item| {
+                        matches!(
+                            item,
+                            ConversationItem::Provider(provider)
+                                if provider.is_encrypted_compaction()
+                        )
+                    });
+                    if expect_native_history {
+                        assert!(has_native_metadata, "{case_name}");
+                        assert!(has_encrypted_compaction, "{case_name}");
+                    } else {
+                        assert!(!has_native_metadata, "{case_name}");
+                        assert!(!has_encrypted_compaction, "{case_name}");
+                        assert!(
+                            history
+                                .iter()
+                                .any(|item| item.text_content().contains("Local route summary.")),
+                            "{case_name} did not install the local summary"
+                        );
+                    }
+                }
+
+                let bodies = compact_bodies.lock().unwrap();
+                assert_eq!(bodies.len(), 3);
+                for body in bodies.iter() {
+                    assert_eq!(body["model"], "gpt-default-routing");
+                    assert_eq!(
+                        body.pointer("/reasoning/effort"),
+                        Some(&serde_json::Value::String("high".into()))
+                    );
+                }
+                drop(bodies);
+
+                let bodies = responses_bodies.lock().unwrap();
+                assert_eq!(bodies.len(), 3);
+                assert!(
+                    bodies.iter().any(|body| body
+                        .to_string()
+                        .contains("retain the edge-caserino guidance")),
+                    "guided /compact context did not reach the local summarization request"
+                );
+            })
+            .await;
+    }
+
     /// 401 auto-compact: SUPPRESS_AUTH + reauthable RetryState (abort for /login).
     #[tokio::test(flavor = "current_thread")]
     async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {

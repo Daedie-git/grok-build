@@ -34,31 +34,59 @@ impl CompactionStrategy {
     }
 }
 
-/// Resolve Codex's opt-in policy and the command-level compatibility contract.
+/// A process-environment strategy override after it has been snapshotted.
+///
+/// `Unset` and an explicitly blank value both select the native default, while
+/// an environment value that cannot be decoded as Unicode is invalid and must
+/// fail safe to local compaction rather than masquerading as an absent value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum CompactionStrategyOverride<'a> {
+    Unset,
+    Value(&'a str),
+    InvalidEncoding,
+}
+
+impl<'a> From<Option<&'a str>> for CompactionStrategyOverride<'a> {
+    fn from(value: Option<&'a str>) -> Self {
+        match value {
+            Some(value) => Self::Value(value),
+            None => Self::Unset,
+        }
+    }
+}
+
+/// Resolve Codex's native-by-default policy and the command-level compatibility contract.
 /// `/compact <context>` remains local because the native endpoint has no field
 /// for user-authored summary guidance; silently discarding it is unsafe.
 pub(in super::super) fn select_compaction_strategy(
     capabilities: xai_grok_sampling_types::ProviderCapabilities,
-    override_value: Option<&str>,
+    override_value: CompactionStrategyOverride<'_>,
     user_context_supplied: bool,
 ) -> CompactionStrategy {
     if !capabilities.supports_native_compact() {
         return CompactionStrategy::LocalSummary;
     }
 
-    let strategy = match override_value
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("native" | "native_codex") => CompactionStrategy::NativeCodex,
-        Some("local" | "local_summary") | None | Some("") => CompactionStrategy::LocalSummary,
-        Some(other) => {
+    let strategy = match override_value {
+        CompactionStrategyOverride::Unset => CompactionStrategy::NativeCodex,
+        CompactionStrategyOverride::InvalidEncoding => {
             tracing::warn!(
-                value = other,
-                "unknown GROK_CODEX_COMPACTION_STRATEGY; native compaction requires explicit `native` or `native_codex`, using local summary"
+                "GROK_CODEX_COMPACTION_STRATEGY is not valid Unicode; using local summary"
             );
             CompactionStrategy::LocalSummary
+        }
+        CompactionStrategyOverride::Value(value) => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "native" | "native_codex" | "" => CompactionStrategy::NativeCodex,
+                "local" | "local_summary" => CompactionStrategy::LocalSummary,
+                other => {
+                    tracing::warn!(
+                        value = other,
+                        "unknown GROK_CODEX_COMPACTION_STRATEGY; expected `native`, `native_codex`, `local`, or `local_summary`; using local summary"
+                    );
+                    CompactionStrategy::LocalSummary
+                }
+            }
         }
     };
 
@@ -400,10 +428,11 @@ fn context_overflow(error: &SamplingError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexCompactionInput, CompactionStrategy, NativeCompactionFailureSource,
-        NativeCompactionFallbackReason, NativeCompactionOutcome, TRUNCATED_TOOL_OUTPUT,
-        compatibility_for_sampling_identity, context_overflow, endpoint_unavailable,
-        run_native_compaction, select_compaction_strategy, trim_tool_outputs_to_fit_context_window,
+        CodexCompactionInput, CompactionStrategy, CompactionStrategyOverride,
+        NativeCompactionFailureSource, NativeCompactionFallbackReason, NativeCompactionOutcome,
+        TRUNCATED_TOOL_OUTPUT, compatibility_for_sampling_identity, context_overflow,
+        endpoint_unavailable, run_native_compaction, select_compaction_strategy,
+        trim_tool_outputs_to_fit_context_window,
     };
     use axum::Json;
     use axum::Router;
@@ -417,13 +446,28 @@ mod tests {
         SamplingError, resolve_provider,
     };
 
+    fn protocol_capabilities(
+        provider_id: Option<ProviderId>,
+        api_backend: ApiBackend,
+        base_url: &str,
+    ) -> ProviderCapabilities {
+        resolve_provider(provider_id, api_backend, base_url).capabilities()
+    }
+
     fn provider_capabilities(provider_id: ProviderId) -> ProviderCapabilities {
-        resolve_provider(
+        protocol_capabilities(
             Some(provider_id),
             ApiBackend::Responses,
             "http://127.0.0.1:3210/v1",
         )
-        .capabilities()
+    }
+
+    fn select_strategy(
+        capabilities: ProviderCapabilities,
+        override_value: Option<&str>,
+        user_context_supplied: bool,
+    ) -> CompactionStrategy {
+        select_compaction_strategy(capabilities, override_value.into(), user_context_supplied)
     }
 
     fn api_error(status: StatusCode) -> SamplingError {
@@ -437,33 +481,139 @@ mod tests {
     }
 
     #[test]
-    fn native_requires_an_explicit_valid_opt_in() {
-        for value in [None, Some(""), Some("local"), Some("bogus")] {
+    fn native_is_default_with_explicit_local_opt_out() {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("native"),
+            Some(" native_codex "),
+            Some("\tNaTiVe\r\n"),
+            Some("\nNATIVE_CODEX\t"),
+        ] {
             assert_eq!(
-                select_compaction_strategy(provider_capabilities(ProviderId::Codex), value, false,),
-                CompactionStrategy::LocalSummary
+                select_strategy(provider_capabilities(ProviderId::Codex), value, false),
+                CompactionStrategy::NativeCodex,
+                "override {value:?}"
             );
         }
-        for value in [Some("native"), Some(" native_codex ")] {
+        for value in [
+            Some("local"),
+            Some(" local_summary "),
+            Some("\tLoCaL\r\n"),
+            Some("\nLOCAL_SUMMARY\t"),
+        ] {
             assert_eq!(
-                select_compaction_strategy(provider_capabilities(ProviderId::Codex), value, false,),
-                CompactionStrategy::NativeCodex
+                select_strategy(provider_capabilities(ProviderId::Codex), value, false),
+                CompactionStrategy::LocalSummary,
+                "override {value:?}"
             );
         }
     }
 
     #[test]
-    fn non_codex_and_manual_guidance_remain_local() {
+    fn invalid_strategy_fails_safe_to_local_summary() {
+        for value in ["bogus", "native-codex", "native codex", "true", "nativé"] {
+            assert_eq!(
+                select_strategy(provider_capabilities(ProviderId::Codex), Some(value), false,),
+                CompactionStrategy::LocalSummary,
+                "override {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_environment_encoding_fails_safe_to_local_summary() {
         assert_eq!(
             select_compaction_strategy(
-                provider_capabilities(ProviderId::OpenAiCompatible),
-                Some("native"),
+                provider_capabilities(ProviderId::Codex),
+                CompactionStrategyOverride::InvalidEncoding,
                 false,
             ),
             CompactionStrategy::LocalSummary
         );
+    }
+
+    #[test]
+    fn user_guidance_always_forces_local_compaction() {
+        for value in [
+            None,
+            Some(""),
+            Some("native"),
+            Some("NATIVE_CODEX"),
+            Some("local"),
+            Some("bogus"),
+        ] {
+            assert_eq!(
+                select_strategy(provider_capabilities(ProviderId::Codex), value, true),
+                CompactionStrategy::LocalSummary,
+                "override {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_provider_or_protocol_cannot_force_native_compaction() {
+        let unsupported = [
+            (
+                "OpenAI-compatible Responses",
+                protocol_capabilities(
+                    Some(ProviderId::OpenAiCompatible),
+                    ApiBackend::Responses,
+                    "http://127.0.0.1:3210/v1",
+                ),
+            ),
+            (
+                "Codex Chat Completions",
+                protocol_capabilities(
+                    Some(ProviderId::Codex),
+                    ApiBackend::ChatCompletions,
+                    CODEX_BACKEND_BASE_URL,
+                ),
+            ),
+            (
+                "Codex Messages",
+                protocol_capabilities(
+                    Some(ProviderId::Codex),
+                    ApiBackend::Messages,
+                    CODEX_BACKEND_BASE_URL,
+                ),
+            ),
+            (
+                "explicit non-Codex identity on Codex URL",
+                protocol_capabilities(
+                    Some(ProviderId::OpenAiCompatible),
+                    ApiBackend::Responses,
+                    CODEX_BACKEND_BASE_URL,
+                ),
+            ),
+            (
+                "unidentified custom Responses",
+                protocol_capabilities(None, ApiBackend::Responses, "http://127.0.0.1:3210/v1"),
+            ),
+        ];
+
+        for (protocol, capabilities) in unsupported {
+            for value in [None, Some(""), Some("native"), Some("NATIVE_CODEX")] {
+                assert_eq!(
+                    select_strategy(capabilities, value, false),
+                    CompactionStrategy::LocalSummary,
+                    "{protocol}, override {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_codex_url_inference_uses_native_default_and_honors_local_opt_out() {
+        let capabilities =
+            protocol_capabilities(None, ApiBackend::Responses, CODEX_BACKEND_BASE_URL);
         assert_eq!(
-            select_compaction_strategy(provider_capabilities(ProviderId::Codex), None, true,),
+            select_strategy(capabilities, None, false),
+            CompactionStrategy::NativeCodex
+        );
+        assert_eq!(
+            select_strategy(capabilities, Some("local"), false),
             CompactionStrategy::LocalSummary
         );
     }
@@ -475,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_limited_to_explicit_native_policy() {
+    fn remote_failure_fallback_is_limited_to_endpoint_unavailability_and_context_overflow() {
         for status in [
             StatusCode::NOT_FOUND,
             StatusCode::METHOD_NOT_ALLOWED,

@@ -10,8 +10,8 @@
 use crate::DEFAULT_TOOL_OUTPUT_BYTES;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task_output::{
-    MAX_MULTI_WAIT_IDS, TaskOutputTool, render_waited_results, resolve_tasks_until_any_terminal,
-    wait_any_event_driven,
+    MAX_MULTI_WAIT_IDS, TaskOutputTool, completed_wait_hint, render_waited_results,
+    requested_wait_timeout, resolve_tasks_until_any_terminal, wait_any_event_driven,
 };
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{Terminal, TruncationCfg};
@@ -170,6 +170,7 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
         }
 
         // wait_any: keep legacy event-driven path (not exposed on get_task_output).
+        let requested = requested_wait_timeout(input.timeout_ms);
         let timeout =
             crate::implementations::grok_build::task_output::capped_wait_timeout(input.timeout_ms);
 
@@ -220,12 +221,14 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
                 deadline,
             )
             .await;
+            let wait_hint = completed_wait_hint(deadline, requested, timeout);
             render_waited_results(
                 &input.task_ids,
                 &read_file_name,
                 max_output_bytes,
                 initial.results,
                 &waited,
+                wait_hint,
             )
         } else {
             initial.results

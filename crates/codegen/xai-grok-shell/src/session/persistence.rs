@@ -1529,6 +1529,17 @@ pub struct PersistenceHandle {
     noop: bool,
 }
 
+fn actor_channel() -> (
+    PersistenceHandle,
+    mpsc::UnboundedReceiver<PersistenceMsg>,
+    mpsc::WeakUnboundedSender<PersistenceMsg>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let weak = tx.downgrade();
+    let handle = PersistenceHandle { tx, noop: false };
+    (handle, rx, weak)
+}
+
 #[derive(Debug)]
 pub enum DurableAppendError {
     NotCommitted(io::Error),
@@ -3146,16 +3157,11 @@ pub(crate) async fn new(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&summary, storage_mode, auth_manager)?;
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
-
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -3169,7 +3175,7 @@ pub(crate) async fn new(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    persistence_tx: tx,
+                    persistence_tx: summary_tx,
                 },
             ),
             registry_title_sync,
@@ -3218,15 +3224,10 @@ pub async fn new_with_explicit_dir(
         summary.current_model_id = model_id;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let info_clone = info.clone();
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
-
     tokio::task::spawn(async move {
         let persistence = SessionPersistence {
             info: info_clone,
@@ -3240,7 +3241,7 @@ pub async fn new_with_explicit_dir(
                 crate::session::summary::SummaryConfig {
                     sampling_client,
                     model: session_summary_model,
-                    persistence_tx: tx,
+                    persistence_tx: summary_tx,
                 },
             ),
             registry_title_sync: None,
@@ -3336,22 +3337,18 @@ pub(crate) async fn load(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
-                persistence_tx: tx,
+                persistence_tx: summary_tx,
             },
         );
         if has_title {
@@ -3423,22 +3420,18 @@ pub(crate) async fn load_light(
         workflow_runs: persisted.workflow_runs,
     };
 
-    let (tx, rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+    let (handle, rx, summary_tx) = actor_channel();
 
     let storage: Arc<dyn StorageAdapter> = Arc::from(storage);
     let remote_sync = init_remote_sync(&persisted_info.summary, storage_mode, auth_manager)?;
 
     let has_title = !persisted_info.summary.display_title().is_empty();
-    let handle = PersistenceHandle {
-        tx: tx.clone(),
-        noop: false,
-    };
     tokio::task::spawn(async move {
         let mut summary_gen = crate::session::summary::SummaryGenerator::new(
             crate::session::summary::SummaryConfig {
                 sampling_client,
                 model: session_summary_model,
-                persistence_tx: tx,
+                persistence_tx: summary_tx,
             },
         );
         if has_title {
@@ -5259,6 +5252,27 @@ mod repo_wide_resolution_tests {
         assert_eq!(
             deser.resolution_kind,
             LocalSessionResolutionKind::SameRepoDifferentCwd
+        );
+    }
+}
+
+#[cfg(test)]
+mod actor_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropping_the_session_handle_closes_the_actor_channel() {
+        let (handle, mut rx, summary_tx) = actor_channel();
+
+        drop(handle);
+
+        assert!(
+            summary_tx.upgrade().is_none(),
+            "the generator's sender must not keep the channel open"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "the actor's receive loop must end once the session drops its handle"
         );
     }
 }

@@ -62,6 +62,98 @@ pub(crate) fn capped_wait_timeout(timeout_ms: Option<u64>) -> Duration {
     base.min(max_wait_block())
 }
 
+/// The caller's requested wait before capping, or the default when omitted.
+pub(crate) fn requested_wait_timeout(timeout_ms: Option<u64>) -> Duration {
+    timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitHint {
+    NotRequested,
+    Elapsed {
+        requested: Duration,
+        waited: Duration,
+    },
+    ReturnedEarly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitSubject {
+    Task,
+    Subagent,
+}
+
+impl WaitSubject {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+fn still_running_wait_hint(hint: WaitHint, subject: WaitSubject) -> String {
+    let noun = subject.noun();
+    let lead = match hint {
+        WaitHint::Elapsed { requested, waited } => {
+            let waited_label = format_waited_duration(waited);
+            if requested > waited {
+                let requested_label = format_waited_duration(requested);
+                format!(
+                    "Waited {waited_label}, the per-call maximum, of the {requested_label} you requested; \
+                     the {noun} is still running. You do not need to call this again."
+                )
+            } else {
+                format!("Waited the requested {waited_label}; the {noun} is still running.")
+            }
+        }
+        WaitHint::ReturnedEarly => {
+            format!("Wait returned early because another finished; this {noun} is still running.")
+        }
+        WaitHint::NotRequested => "Use timeout_ms to wait for completion.".to_string(),
+    };
+    format!("{lead} You will be notified automatically when the {noun} completes.")
+}
+
+fn format_waited_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        format!("{}s", millis / 1000)
+    }
+}
+
+fn with_still_running_wait_hint(body: String, hint: WaitHint, subject: WaitSubject) -> String {
+    format!("{body}\n\n{}", still_running_wait_hint(hint, subject))
+}
+
+fn apply_running_wait_hint(
+    mut result: TaskOutputResult,
+    hint: WaitHint,
+    subject: WaitSubject,
+) -> TaskOutputResult {
+    if result.status == "running" || result.status == "initializing" {
+        result.output =
+            with_still_running_wait_hint(std::mem::take(&mut result.output), hint, subject);
+    }
+    result
+}
+
+pub(crate) fn completed_wait_hint(
+    deadline: tokio::time::Instant,
+    requested: Duration,
+    waited: Duration,
+) -> WaitHint {
+    if tokio::time::Instant::now() >= deadline {
+        WaitHint::Elapsed { requested, waited }
+    } else {
+        WaitHint::ReturnedEarly
+    }
+}
+
 fn duration_millis_ceil(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     let rounded = millis + u128::from(duration.subsec_nanos() % 1_000_000 != 0);
@@ -128,7 +220,17 @@ impl TaskOutputTool {
             .map(|v| v.0.clone());
         let is_legacy = crate::versions::is_legacy_contract(contract_version.as_deref());
         let waits = xai_tool_types::task_output_waits(timeout_ms);
-        let deadline = waits.then(|| tokio::time::Instant::now() + capped_wait_timeout(timeout_ms));
+        let requested = requested_wait_timeout(timeout_ms);
+        let timeout = capped_wait_timeout(timeout_ms);
+        let deadline = waits.then(|| tokio::time::Instant::now() + timeout);
+        let wait_hint = if waits {
+            WaitHint::Elapsed {
+                requested,
+                waited: timeout,
+            }
+        } else {
+            WaitHint::NotRequested
+        };
         let (terminal, backend, read_file_name, max_output_bytes) = {
             let resources = resources.lock().await;
             let terminal = resources.require::<Terminal>()?.0.clone();
@@ -186,10 +288,10 @@ impl TaskOutputTool {
             } else {
                 initial
             };
-            return Ok(TaskOutputOutput::Result(snapshot_to_result(
-                snapshot,
-                &read_file_name,
-                max_output_bytes,
+            return Ok(TaskOutputOutput::Result(apply_running_wait_hint(
+                snapshot_to_result(snapshot, &read_file_name, max_output_bytes),
+                wait_hint,
+                WaitSubject::Task,
             )));
         }
 
@@ -215,7 +317,7 @@ impl TaskOutputTool {
             None
         };
         if let Some(snapshot) = subagent_snapshot {
-            return Ok(format_subagent_snapshot(&snapshot));
+            return Ok(format_subagent_snapshot(&snapshot, wait_hint));
         }
 
         // Preserve discoverability when there is still budget, but never start
@@ -243,6 +345,7 @@ impl TaskOutputTool {
         tool_name_for_truncation: &str,
     ) -> Result<TaskOutputOutput, xai_tool_runtime::ToolError> {
         let waits = xai_tool_types::task_output_waits(timeout_ms);
+        let requested = requested_wait_timeout(timeout_ms);
         let timeout = capped_wait_timeout(timeout_ms);
 
         let (terminal, backend, read_file_name, max_output_bytes) = {
@@ -288,12 +391,18 @@ impl TaskOutputTool {
                 deadline.expect("blocking multi-wait has a deadline"),
             )
             .await;
+            let wait_hint = completed_wait_hint(
+                deadline.expect("blocking multi-wait has a deadline"),
+                requested,
+                timeout,
+            );
             render_waited_results(
                 task_ids,
                 &read_file_name,
                 max_output_bytes,
                 initial.results,
                 &waited,
+                wait_hint,
             )
         } else {
             initial.results
@@ -510,7 +619,9 @@ async fn resolve_task(
         && let Some(snapshot) = backend.backend().query(id, false, None).await
     {
         let pending = (!snapshot.status.is_terminal()).then_some(PendingTaskKind::Subagent);
-        if let TaskOutputOutput::Result(result) = format_subagent_snapshot(&snapshot) {
+        if let TaskOutputOutput::Result(result) =
+            format_subagent_snapshot(&snapshot, WaitHint::NotRequested)
+        {
             return ResolvedTask { result, pending };
         }
     }
@@ -536,6 +647,7 @@ pub(crate) fn render_waited_results(
     max_output_bytes: usize,
     initial_results: Vec<TaskOutputResult>,
     waited: &WaitedTaskSnapshots,
+    wait_hint: WaitHint,
 ) -> Vec<TaskOutputResult> {
     debug_assert_eq!(task_ids.len(), initial_results.len());
     task_ids
@@ -543,17 +655,27 @@ pub(crate) fn render_waited_results(
         .zip(initial_results)
         .map(|(id, initial)| {
             if let Some(snapshot) = waited.bash.get(id) {
-                return snapshot_to_result(snapshot.clone(), read_file_name, max_output_bytes);
+                return apply_running_wait_hint(
+                    snapshot_to_result(snapshot.clone(), read_file_name, max_output_bytes),
+                    wait_hint,
+                    WaitSubject::Task,
+                );
             }
             if let Some(snapshot) = waited
                 .subagents
                 .get(id)
                 .filter(|snapshot| snapshot.status.is_terminal())
-                && let TaskOutputOutput::Result(result) = format_subagent_snapshot(snapshot)
+                && let TaskOutputOutput::Result(result) =
+                    format_subagent_snapshot(snapshot, wait_hint)
             {
                 return result;
             }
-            initial
+            let subject = if initial.command.starts_with("[subagent:") {
+                WaitSubject::Subagent
+            } else {
+                WaitSubject::Task
+            };
+            apply_running_wait_hint(initial, wait_hint, subject)
         })
         .collect()
 }
@@ -713,20 +835,20 @@ fn task_not_found_output(
     TaskOutputOutput::TaskNotFound(message)
 }
 
-fn format_subagent_snapshot(snap: &SubagentSnapshot) -> TaskOutputOutput {
+fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> TaskOutputOutput {
     let started = format_epoch_ms_as_rfc3339(snap.started_at_epoch_ms);
     match &snap.status {
         SubagentSnapshotStatus::Initializing => {
             let duration_secs = snap.duration_ms as f64 / 1000.0;
-            let output = format!(
+            let body = format!(
                 "Subagent is initializing (creating worktree, resolving config).\n\
                  Type: {}\n\
                  Description: {}\n\
-                 Elapsed: {duration_secs:.1}s\n\n\
-                 Use timeout_ms to wait for completion.",
+                 Elapsed: {duration_secs:.1}s",
                 snap.subagent_type, snap.description,
             );
-            let raw_output_bytes = output.len();
+            let raw_output_bytes = body.len();
+            let output = with_still_running_wait_hint(body, wait_hint, WaitSubject::Subagent);
             TaskOutputOutput::Result(TaskOutputResult {
                 task_id: snap.subagent_id.clone(),
                 command: format!("[subagent:{}] {}", snap.subagent_type, snap.description),
@@ -758,7 +880,7 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot) -> TaskOutputOutput {
             };
             let tokens_k = tokens_used / 1000;
             let capacity_k = context_window_tokens / 1000;
-            let output = format!(
+            let body = format!(
                 "Subagent is still running.\n\
                  Type: {}\n\
                  Description: {}\n\
@@ -766,13 +888,13 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot) -> TaskOutputOutput {
                  Progress: turn {turn_count}, {tool_call_count} tool calls, \
                  {tokens_k}K/{capacity_k}K tokens ({context_usage_pct}% context)\n\
                  Tools used: {tools_str}\n\
-                 Errors: {error_count}\n\n\
-                 Use timeout_ms to wait for completion.",
+                 Errors: {error_count}",
                 snap.subagent_type,
                 snap.description,
                 snap.duration_ms as f64 / 1000.0,
             );
-            let raw_output_bytes = output.len();
+            let raw_output_bytes = body.len();
+            let output = with_still_running_wait_hint(body, wait_hint, WaitSubject::Subagent);
             TaskOutputOutput::Result(TaskOutputResult {
                 task_id: snap.subagent_id.clone(),
                 command: format!("[subagent:{}] {}", snap.subagent_type, snap.description),
@@ -1197,6 +1319,34 @@ mod tests {
         assert_eq!(capped_wait_timeout(Some(36_000_000)), MAX_WAIT_BLOCK);
         // Exactly at the cap (10m) -> unchanged.
         assert_eq!(capped_wait_timeout(Some(600_000)), MAX_WAIT_BLOCK);
+    }
+
+    #[test]
+    fn still_running_wait_hint_reports_omitted_and_clamped_waits() {
+        assert_eq!(
+            still_running_wait_hint(WaitHint::NotRequested, WaitSubject::Task),
+            "Use timeout_ms to wait for completion. You will be notified automatically when the task completes."
+        );
+
+        let clamped = WaitHint::Elapsed {
+            requested: Duration::from_secs(2_400),
+            waited: Duration::from_secs(600),
+        };
+        assert_eq!(
+            still_running_wait_hint(clamped, WaitSubject::Subagent),
+            "Waited 600s, the per-call maximum, of the 2400s you requested; \
+             the subagent is still running. You do not need to call this again. \
+             You will be notified automatically when the subagent completes."
+        );
+    }
+
+    #[test]
+    fn still_running_wait_hint_reports_early_return_honestly() {
+        assert_eq!(
+            still_running_wait_hint(WaitHint::ReturnedEarly, WaitSubject::Task),
+            "Wait returned early because another finished; this task is still running. \
+             You will be notified automatically when the task completes."
+        );
     }
 
     #[test]
@@ -1887,7 +2037,7 @@ mod tests {
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 8_500,
         };
-        let result = format_subagent_snapshot(&snap);
+        let result = format_subagent_snapshot(&snap, WaitHint::NotRequested);
         match result {
             TaskOutputOutput::Result(r) => {
                 assert_eq!(r.task_id, "sub-init");
@@ -1937,7 +2087,7 @@ mod tests {
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 12_500,
         };
-        let result = format_subagent_snapshot(&snap);
+        let result = format_subagent_snapshot(&snap, WaitHint::NotRequested);
         match result {
             TaskOutputOutput::Result(r) => {
                 assert_eq!(r.task_id, "sub-abc");
@@ -2001,7 +2151,7 @@ mod tests {
             started_at_epoch_ms: 1_700_000_000_000,
             duration_ms: 500,
         };
-        let result = format_subagent_snapshot(&snap);
+        let result = format_subagent_snapshot(&snap, WaitHint::NotRequested);
         match result {
             TaskOutputOutput::Result(r) => {
                 assert!(
@@ -2460,7 +2610,8 @@ mod tests {
             tools_used: vec!["read_file".to_owned()],
             error_count: 0,
         };
-        let TaskOutputOutput::Result(initial_result) = format_subagent_snapshot(&initial_snapshot)
+        let TaskOutputOutput::Result(initial_result) =
+            format_subagent_snapshot(&initial_snapshot, WaitHint::NotRequested)
         else {
             panic!("running snapshot must format as a result");
         };
@@ -2486,6 +2637,7 @@ mod tests {
             DEFAULT_TOOL_OUTPUT_BYTES,
             vec![initial_result],
             &waited,
+            WaitHint::NotRequested,
         );
         assert!(
             rendered[0].output.contains("turn 7"),

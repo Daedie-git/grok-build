@@ -21,12 +21,14 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
 
     let mut items: Vec<ConversationItem> = Vec::with_capacity(response.output.len() + 1);
     let mut content = String::new();
+    let mut response_item_id = None;
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut backend_tool_count: usize = 0;
 
     for item in response.output {
         match item {
             rs::OutputItem::Message(msg) => {
+                response_item_id = Some(msg.id.clone());
                 for content_part in msg.content {
                     if let rs::OutputMessageContent::OutputText(text_content) = content_part {
                         if !content.is_empty() {
@@ -85,6 +87,7 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
     tracing::info!(model_id = %model_id, ?model_fingerprint, ?reasoning_effort, "response_to_conversation_items setting model metadata on AssistantItem");
     items.push(ConversationItem::Assistant(AssistantItem {
         content: Arc::<str>::from(content),
+        response_item_id,
         tool_calls,
         model_id: Some(model_id),
         model_fingerprint,
@@ -288,6 +291,10 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
                 }
             }]
         }
+        ConversationItem::Provider(provider) => provider
+            .as_encrypted_compaction()
+            .map(|item| vec![rs::InputItem::Item(rs::Item::Compaction(item.clone()))])
+            .unwrap_or_default(),
     }
 }
 

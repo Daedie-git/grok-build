@@ -60,6 +60,11 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
                         ConversationItem::Reasoning(_) | ConversationItem::BackendToolCall(_) => {
                             j += 1;
                         }
+                        ConversationItem::Provider(provider)
+                            if provider.is_response_output_metadata() =>
+                        {
+                            j += 1;
+                        }
                         _ => break,
                     }
                 }

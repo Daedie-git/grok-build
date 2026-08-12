@@ -49,6 +49,13 @@ fn sampling_non_api_variants_classify_correctly() {
             code: None,
         }
     )));
+    assert!(is_det(&classify_sampling_error(
+        SamplingError::StreamError {
+            error_type: "unknown".into(),
+            message: "The prompt is too long for this model's context window.".into(),
+            code: None,
+        }
+    )));
 }
 
 #[test]

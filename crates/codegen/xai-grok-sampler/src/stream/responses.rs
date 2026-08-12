@@ -14,13 +14,33 @@ use futures_util::StreamExt;
 use futures_util::stream::{BoxStream, Stream};
 
 use xai_grok_sampling_types::{
-    ConversationItem, ConversationResponse, ResponseModelMetadata, SamplingError, StopReason,
-    TokenUsage, rs,
+    ConversationItem, ConversationResponse, ResponseModelMetadata, ResponsesStreamAccumulator,
+    SamplingError, StopReason, TokenUsage, rs, structured_stream_error_status,
 };
 
 use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
+
+struct BackendToolCompletion {
+    call_id: String,
+    name: &'static str,
+    result: Option<serde_json::Value>,
+}
+
+fn backend_tool_completion(item: &rs::OutputItem) -> Option<BackendToolCompletion> {
+    let (call_id, name) = match item {
+        rs::OutputItem::WebSearchCall(call) => (call.id.clone(), "web_search"),
+        rs::OutputItem::CustomToolCall(call) => (call.id.clone(), "x_search"),
+        rs::OutputItem::CodeInterpreterCall(call) => (call.id.clone(), "code_interpreter"),
+        _ => return None,
+    };
+    Some(BackendToolCompletion {
+        call_id,
+        name,
+        result: serde_json::to_value(item).ok(),
+    })
+}
 
 /// Returns whether a Responses API event reflects real model progress
 /// rather than a liveness-only heartbeat / status transition.
@@ -94,26 +114,52 @@ pub(crate) fn responses_event_may_have_output(event: &rs::ResponseStreamEvent) -
         && responses_event_has_meaningful_content(event)
 }
 
+/// Preserve the provider's structured terminal disposition instead of
+/// collapsing every in-stream failure to HTTP 500. The sampler's retry policy
+/// relies on the status to distinguish permanent request failures from
+/// transient availability failures.
+fn response_event_error(code: Option<&str>, message: String) -> SamplingError {
+    let status = structured_stream_error_status(code.unwrap_or_default(), &message);
+    let error_code = code.map(xai_grok_sampling_types::ApiErrorCode::parse);
+    let message = match code {
+        Some(code) if !code.is_empty() => format!("{code}: {message}"),
+        _ => message,
+    };
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return SamplingError::auth_unknown(message);
+    }
+    SamplingError::Api {
+        status,
+        message,
+        model_metadata: None,
+        retry_after_secs: None,
+        should_retry: None,
+        error_code,
+    }
+}
+
 /// Transform a raw Responses API event stream into a stream of
 /// [`SamplingEvent`]s.
 ///
 /// Yields exactly one terminal event ([`SamplingEvent::Completed`] or
 /// [`SamplingEvent::Failed`]) per request. Server-side `ResponseFailed`
-/// and `ResponseError` events are translated to
-/// `SamplingError::Api { status: 500, .. }` so the actor's retry loop
-/// treats them as retryable.
+/// and `ResponseError` events retain their structured error disposition so
+/// only transient failures enter the actor's retry loop.
 ///
 /// `doom_loop` is the collector returned alongside `raw_stream` by
 /// `SamplingClient::conversation_stream_responses`; any signals the SSE
 /// decoder recorded are drained onto the final `ConversationResponse`.
 /// `None` (check disabled) leaves the response untouched.
-pub fn stream_responses<'a>(
-    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+pub fn stream_responses<'a, E>(
+    raw_stream: BoxStream<'a, Result<E, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
     request_id: RequestId,
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
-) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+) -> impl Stream<Item = SamplingEvent> + Send + 'a
+where
+    E: Into<xai_grok_sampling_types::DecodedResponseStreamEvent> + Send + 'a,
+{
     stream_responses_tracked(
         raw_stream,
         model_metadata,
@@ -124,14 +170,17 @@ pub fn stream_responses<'a>(
     )
 }
 
-pub(crate) fn stream_responses_tracked<'a>(
-    raw_stream: BoxStream<'a, Result<rs::ResponseStreamEvent, SamplingError>>,
+pub(crate) fn stream_responses_tracked<'a, E>(
+    raw_stream: BoxStream<'a, Result<E, SamplingError>>,
     model_metadata: Option<ResponseModelMetadata>,
     request_id: RequestId,
     idle_timeout: Duration,
     doom_loop: Option<crate::doom_loop::DoomLoopSignalCollector>,
     output_observed: Arc<AtomicBool>,
-) -> impl Stream<Item = SamplingEvent> + Send + 'a {
+) -> impl Stream<Item = SamplingEvent> + Send + 'a
+where
+    E: Into<xai_grok_sampling_types::DecodedResponseStreamEvent> + Send + 'a,
+{
     async_stream::stream! {
         use rs::{ResponseStreamEvent, Status};
 
@@ -151,6 +200,7 @@ pub(crate) fn stream_responses_tracked<'a>(
         }
 
         let mut final_response: Option<rs::Response> = None;
+        let mut terminal_output = None;
         let mut chunk_index: u64 = 0;
         let mut message_chunk_count: u64 = 0;
         let mut first_token_emitted = false;
@@ -163,8 +213,13 @@ pub(crate) fn stream_responses_tracked<'a>(
         // look up `output_index` here to find the matching `tool_index`.
         let mut output_to_tool_index: BTreeMap<u32, u32> = BTreeMap::new();
         let mut next_tool_index: u32 = 0;
+        // All Responses backends: text may stream correctly while
+        // `response.completed` ships `output: []`. Rebuild from stream state
+        // so empty-response retries do not fire. Codex metadata/manifests
+        // still require `metadata_origin` on captured items.
+        let mut responses_acc = ResponsesStreamAccumulator::default();
 
-        let mut stream = raw_stream;
+        let mut stream = raw_stream.map(|result| result.map(Into::into)).boxed();
         loop {
             let event_result = match tokio::time::timeout(idle_timeout, stream.next()).await {
                 Ok(Some(event_result)) => event_result,
@@ -181,7 +236,7 @@ pub(crate) fn stream_responses_tracked<'a>(
                 }
             };
 
-            let event = match event_result {
+            let decoded = match event_result {
                 Ok(event) => event,
                 Err(err) => {
                     yield SamplingEvent::Failed {
@@ -189,6 +244,57 @@ pub(crate) fn stream_responses_tracked<'a>(
                         error: SamplingErrorInfo::from(&err),
                     };
                     return;
+                }
+            };
+
+            let event = match decoded {
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(item) => {
+                    output_observed.store(true, Ordering::Relaxed);
+                    if let xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                        rs::OutputItem::FunctionCall(call),
+                    ) = &item.value
+                    {
+                        let tool_index = next_tool_index;
+                        next_tool_index += 1;
+                        output_to_tool_index.insert(item.output_index, tool_index);
+                        yield SamplingEvent::ToolCallDelta {
+                            request_id: request_id.clone(),
+                            tool_index,
+                            id: Some(call.call_id.clone()),
+                            name: Some(call.name.clone()),
+                            arguments_delta: None,
+                        };
+                    }
+                    responses_acc.note_output_item_added(item);
+                    last_content_chunk_at = Instant::now();
+                    continue;
+                }
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(item) => {
+                    output_observed.store(true, Ordering::Relaxed);
+                    if let xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                        output_item,
+                    ) = &item.value
+                        && let Some(completion) = backend_tool_completion(output_item)
+                    {
+                        yield SamplingEvent::BackendToolCallCompleted {
+                            request_id: request_id.clone(),
+                            call_id: completion.call_id,
+                            name: completion.name.to_string(),
+                            result: completion.result,
+                        };
+                    }
+                    responses_acc.note_captured_output_item_done(item);
+                    last_content_chunk_at = Instant::now();
+                    continue;
+                }
+                xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+                    event,
+                    terminal_output: captured,
+                } => {
+                    if captured.is_some() {
+                        terminal_output = captured;
+                    }
+                    event
                 }
             };
 
@@ -221,8 +327,11 @@ pub(crate) fn stream_responses_tracked<'a>(
 
             match event {
                 ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
+                    let output_index = text_delta_event.output_index;
+                    let item_id = text_delta_event.item_id;
                     let delta = text_delta_event.delta;
                     if !delta.is_empty() {
+                        responses_acc.note_indexed_text_delta(output_index, &item_id, &delta);
                         if !first_token_emitted {
                             first_token_emitted = true;
                             yield SamplingEvent::FirstToken {
@@ -238,6 +347,16 @@ pub(crate) fn stream_responses_tracked<'a>(
                             text: delta,
                             chunk_index,
                         };
+                    }
+                }
+
+                ResponseStreamEvent::ResponseOutputTextDone(text_done) => {
+                    if !text_done.text.is_empty() {
+                        responses_acc.note_indexed_text_done(
+                            text_done.output_index,
+                            &text_done.item_id,
+                            &text_done.text,
+                        );
                     }
                 }
 
@@ -283,6 +402,16 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // Start of a Responses FunctionCall — emit initial id+name
                 // and remember the output_index → tool_index mapping.
                 ResponseStreamEvent::ResponseOutputItemAdded(added_event) => {
+                    responses_acc.note_output_item_added(
+                        xai_grok_sampling_types::CapturedResponseOutputItem {
+                            output_index: added_event.output_index,
+                            value: xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(
+                                added_event.item.clone(),
+                            ),
+                            internal_chat_message_metadata_passthrough: None,
+                            metadata_origin: None,
+                        },
+                    );
                     if let rs::OutputItem::FunctionCall(fc) = added_event.item {
                         let tool_index = next_tool_index;
                         next_tool_index += 1;
@@ -327,22 +456,17 @@ pub(crate) fn stream_responses_tracked<'a>(
 
                 ResponseStreamEvent::ResponseFailed(failed_event) => {
                     let response = failed_event.response;
-                    let error_message = response
-                        .error
-                        .as_ref()
-                        .map(|e| format!("{}: {}", e.code, e.message))
-                        .unwrap_or_else(|| "Response failed with unknown error".to_string());
-                    let err = SamplingError::Api {
-                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                        message: error_message,
-                        model_metadata: None,
-                        retry_after_secs: None,
-                        should_retry: None,
-                        error_code: response
-                            .error
-                            .as_ref()
-                            .map(|e| xai_grok_sampling_types::ApiErrorCode::parse(&e.code)),
-                    };
+                    let err = response.error.as_ref().map_or_else(
+                        || {
+                            response_event_error(
+                                None,
+                                "Response failed with unknown error".to_string(),
+                            )
+                        },
+                        |error| {
+                            response_event_error(Some(error.code.as_str()), error.message.clone())
+                        },
+                    );
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -351,23 +475,10 @@ pub(crate) fn stream_responses_tracked<'a>(
                 }
 
                 ResponseStreamEvent::ResponseError(error_event) => {
-                    let error_message = format!(
-                        "{}: {}",
-                        error_event.code.as_deref().unwrap_or("error"),
-                        error_event.message
+                    let err = response_event_error(
+                        error_event.code.as_deref(),
+                        error_event.message,
                     );
-                    let err = SamplingError::Api {
-                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                        message: error_message,
-                        model_metadata: None,
-                        retry_after_secs: None,
-                        should_retry: None,
-                        // The wire code, absent when the event carried none.
-                        error_code: error_event
-                            .code
-                            .as_deref()
-                            .map(xai_grok_sampling_types::ApiErrorCode::parse),
-                    };
                     yield SamplingEvent::Failed {
                         request_id: request_id.clone(),
                         error: SamplingErrorInfo::from(&err),
@@ -415,45 +526,19 @@ pub(crate) fn stream_responses_tracked<'a>(
                 // OutputItemDone carries the full result for backend tools.
                 // For WebSearchCall this includes the query and source URLs.
                 // For CustomToolCall this includes x_search results.
+                // Also feeds the shared Responses empty-completed rebuild accumulator.
                 ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
-                    match &done_event.item {
-                        rs::OutputItem::WebSearchCall(ws) => {
-                            let result = serde_json::to_value(ws).ok();
-                            yield SamplingEvent::BackendToolCallCompleted {
-                                request_id: request_id.clone(),
-                                call_id: ws.id.clone(),
-                                name: "web_search".to_string(),
-                                result,
-                            };
-                        }
-                        // X search results arrive as CustomToolCall with
-                        // names like x_keyword_search, x_semantic_search, etc.
-                        // Use "x_search" consistently (matching the Started event);
-                        // the specific sub-type is in the serialized result payload
-                        // and extracted by the pager from raw_output.name.
-                        rs::OutputItem::CustomToolCall(ct) => {
-                            let result = serde_json::to_value(ct).ok();
-                            yield SamplingEvent::BackendToolCallCompleted {
-                                request_id: request_id.clone(),
-                                call_id: ct.id.clone(),
-                                name: "x_search".to_string(),
-                                result,
-                            };
-                        }
-                        // Code interpreter: the full call (code + outputs) rides
-                        // the done item. Surfaced under the shared "code_interpreter"
-                        // name (matching the Started event); the shell renders it via
-                        // the client `tool_use` + `user` `tool_result` split.
-                        rs::OutputItem::CodeInterpreterCall(ci) => {
-                            let result = serde_json::to_value(ci).ok();
-                            yield SamplingEvent::BackendToolCallCompleted {
-                                request_id: request_id.clone(),
-                                call_id: ci.id.clone(),
-                                name: "code_interpreter".to_string(),
-                                result,
-                            };
-                        }
-                        _ => {}
+                    responses_acc.note_output_item_done(
+                        done_event.output_index,
+                        done_event.item.clone(),
+                    );
+                    if let Some(completion) = backend_tool_completion(&done_event.item) {
+                        yield SamplingEvent::BackendToolCallCompleted {
+                            request_id: request_id.clone(),
+                            call_id: completion.call_id,
+                            name: completion.name.to_string(),
+                            result: completion.result,
+                        };
                     }
                 }
 
@@ -542,11 +627,40 @@ pub(crate) fn stream_responses_tracked<'a>(
 
         let status = response.status.clone();
 
-        // Convert to ConversationItem(s); patch in accumulated reasoning
-        // text as a fallback when the final response lacks `content` /
-        // `summary` (the streaming deltas may have arrived out of band).
-        // Splice policy lives in `inject_streaming_reasoning_fallback`.
-        let mut items = xai_grok_sampling_types::response_to_conversation_items(response);
+        // Convert through the raw-aware ordered output list. Terminal output
+        // wins when present; otherwise output_item.done (including metadata
+        // observed only on added) rebuilds an empty completed response.
+        let typed_terminal_fallback = terminal_output.or_else(|| {
+            (!response.output.is_empty()).then(|| {
+                response
+                    .output
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(output_index, item)| xai_grok_sampling_types::CapturedResponseOutputItem {
+                        output_index: output_index as u32,
+                        value: xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(item),
+                        internal_chat_message_metadata_passthrough: None,
+                        metadata_origin: None,
+                    })
+                    .collect()
+            })
+        });
+        let captured = responses_acc.terminal_output(typed_terminal_fallback);
+        let mut items = match xai_grok_sampling_types::captured_response_to_conversation_items(
+            response,
+            captured,
+        ) {
+            Ok(items) => items,
+            Err(message) => {
+                let error = SamplingError::serialization_message(message);
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&error),
+                };
+                return;
+            }
+        };
         xai_grok_sampling_types::inject_streaming_reasoning_fallback(&mut items, reasoning_acc);
 
         let has_tool_calls = items.iter().any(|i| match i {
@@ -655,10 +769,10 @@ mod tests {
         build_response(rs_types::Status::Completed)
     }
 
-    fn failed_response_with_error(message: &str) -> rs_types::Response {
+    fn failed_response_with_error(code: &str, message: &str) -> rs_types::Response {
         let mut r = build_response(rs_types::Status::Failed);
         r.error = Some(rs_types::ErrorObject {
-            code: "server_error".into(),
+            code: code.into(),
             message: message.into(),
         });
         r
@@ -741,6 +855,50 @@ mod tests {
         match events.last().unwrap() {
             SamplingEvent::Completed { response, .. } => {
                 assert_eq!(response.stop_reason, Some(StopReason::Stop));
+                // Codex-style empty `response.completed.output` is rebuilt from
+                // streamed text deltas so empty_response retries do not fire.
+                assert_eq!(response.empty_reason(), None);
+                assert_eq!(response.assistant_text(), "hello");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_delta_and_completed_tool_survive_empty_terminal_output() {
+        let text: xai_grok_sampling_types::DecodedResponseStreamEvent =
+            text_delta_event("hello").into();
+        let tool: xai_grok_sampling_types::DecodedResponseStreamEvent =
+            rs::ResponseStreamEvent::ResponseOutputItemDone(
+                rs_types::ResponseOutputItemDoneEvent {
+                    sequence_number: 1,
+                    output_index: 1,
+                    item: rs_types::OutputItem::FunctionCall(rs_types::FunctionToolCall {
+                        arguments: "{}".into(),
+                        call_id: "call_1".into(),
+                        name: "lookup".into(),
+                        id: Some("fc_1".into()),
+                        status: None,
+                    }),
+                },
+            )
+            .into();
+        let completed: xai_grok_sampling_types::DecodedResponseStreamEvent =
+            completed_event().into();
+        let raw = stream::iter(vec![Ok(text), Ok(tool), Ok(completed)]).boxed();
+        let events = collect(stream_responses(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().expect("terminal event") {
+            SamplingEvent::Completed { response, .. } => {
+                assert_eq!(response.assistant_text(), "hello");
+                assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -749,16 +907,16 @@ mod tests {
     #[test]
     fn empty_failed_response_is_not_treated_as_output() {
         let event = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
-            response: failed_response_with_error("boom"),
+            response: failed_response_with_error("server_error", "boom"),
             sequence_number: 0,
         });
         assert!(!responses_event_may_have_output(&event));
     }
 
     #[tokio::test]
-    async fn response_failed_yields_failed_500() {
+    async fn response_failed_server_error_remains_retryable_500() {
         let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
-            response: failed_response_with_error("boom"),
+            response: failed_response_with_error("server_error", "boom"),
             sequence_number: 0,
         });
         let raw = stream::iter(vec![Ok(failed)]).boxed();
@@ -775,6 +933,7 @@ mod tests {
             SamplingEvent::Failed { error, .. } => {
                 assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
                 assert_eq!(error.status_code, Some(500));
+                assert!(error.is_retryable);
                 assert!(error.message.contains("boom"));
                 // The wire code passes through verbatim — dropping it here
                 // would disable strip recovery for coded Responses failures.
@@ -818,6 +977,143 @@ mod tests {
                 );
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_failed_invalid_request_is_non_retryable_400() {
+        let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("invalid_request_error", "bad history"),
+            sequence_number: 0,
+        });
+        let events = collect(stream_responses(
+            stream::iter(vec![Ok(failed)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert_eq!(error.status_code, Some(400));
+                assert!(!error.is_retryable);
+                assert!(error.message.contains("invalid_request_error"));
+                assert!(error.message.contains("bad history"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_failed_authentication_preserves_auth_kind() {
+        let failed = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {
+            response: failed_response_with_error("authentication_error", "expired credentials"),
+            sequence_number: 0,
+        });
+        let events = collect(stream_responses(
+            stream::iter(vec![Ok(failed)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            None,
+        ))
+        .await;
+
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Auth);
+                assert_eq!(error.status_code, None);
+                assert!(!error.is_retryable);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_event_error_preserves_retry_disposition() {
+        for code in ["invalid_request_error", "authentication_error", "403"] {
+            let error = response_event_error(Some(code), "permanent".into());
+            assert!(!error.is_retryable(), "{code} must not be retried");
+        }
+        for code in [
+            "server_error",
+            "service_unavailable_error",
+            "overloaded_error",
+            "503",
+            "521",
+            "522",
+            "523",
+            "524",
+            "529",
+        ] {
+            let error = response_event_error(Some(code), "transient".into());
+            assert!(error.is_retryable(), "{code} must remain retryable");
+        }
+        let wrapped =
+            response_event_error(Some("error"), "invalid_request_error: bad history".into());
+        assert!(!wrapped.is_retryable());
+        assert!(matches!(
+            wrapped,
+            SamplingError::Api {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn response_event_error_preserves_auth_kind_without_promoting_forbidden() {
+        let auth = response_event_error(Some("authentication_error"), "expired credentials".into());
+        let info = SamplingErrorInfo::from(&auth);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Auth);
+        assert_eq!(info.status_code, None);
+
+        let numeric_auth = response_event_error(Some("401"), "expired credentials".into());
+        let info = SamplingErrorInfo::from(&numeric_auth);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Auth);
+        assert_eq!(info.status_code, None);
+
+        let forbidden = response_event_error(Some("permission_error"), "policy denial".into());
+        let info = SamplingErrorInfo::from(&forbidden);
+        assert_eq!(info.kind, crate::events::SamplingErrorKind::Api);
+        assert_eq!(info.status_code, Some(403));
+    }
+
+    #[test]
+    fn response_event_deterministic_image_and_account_codes_do_not_blindly_retry() {
+        for code in [
+            "invalid_image",
+            "invalid_image_format",
+            "invalid_base64_image",
+            "invalid_image_url",
+            "image_too_large",
+            "image_too_small",
+            "image_parse_error",
+            "invalid_image_mode",
+            "image_file_too_large",
+            "unsupported_image_media_type",
+            "empty_image_file",
+        ] {
+            let error = response_event_error(Some(code), "invalid image".into());
+            assert!(!error.is_retryable(), "{code} must not be blindly retried");
+            assert!(
+                error.is_image_processing_error(),
+                "{code} should enter image-strip recovery"
+            );
+        }
+
+        for code in [
+            "image_content_policy_violation",
+            "image_file_not_found",
+            "insufficient_quota",
+            "account_deactivated",
+            "billing_error",
+        ] {
+            let error = response_event_error(Some(code), "permanent failure".into());
+            assert!(!error.is_retryable(), "{code} must not be retried");
         }
     }
 
@@ -970,29 +1266,37 @@ mod tests {
     /// silently dropped from the event stream.
     #[tokio::test]
     async fn code_interpreter_forwards_backend_tool_call() {
-        let in_progress = rs::ResponseStreamEvent::ResponseCodeInterpreterCallInProgress(
-            rs_types::ResponseCodeInterpreterCallInProgressEvent {
-                sequence_number: 0,
-                output_index: 0,
-                item_id: "ci-1".into(),
-            },
-        );
-        let done = rs::ResponseStreamEvent::ResponseOutputItemDone(
-            rs_types::ResponseOutputItemDoneEvent {
-                sequence_number: 1,
-                output_index: 0,
-                item: rs_types::OutputItem::CodeInterpreterCall(
-                    rs_types::CodeInterpreterToolCall {
-                        code: Some("print(1)".into()),
-                        container_id: "cont-1".into(),
-                        id: "ci-1".into(),
-                        outputs: None,
-                        status: rs_types::CodeInterpreterToolCallStatus::Completed,
-                    },
-                ),
-            },
-        );
-        let raw = stream::iter(vec![Ok(in_progress), Ok(done), Ok(completed_event())]).boxed();
+        let in_progress = crate::client::deserialize_response_event_with_metadata(
+            &serde_json::json!({
+                "type": "response.code_interpreter_call.in_progress",
+                "sequence_number": 0,
+                "output_index": 0,
+                "item_id": "ci-1"
+            })
+            .to_string(),
+            false,
+        )
+        .expect("raw code-interpreter progress event must decode");
+        let done = crate::client::deserialize_response_event_with_metadata(
+            &serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "code_interpreter_call",
+                    "id": "ci-1",
+                    "container_id": "cont-1",
+                    "status": "completed",
+                    "code": "print(1)"
+                }
+            })
+            .to_string(),
+            false,
+        )
+        .expect("raw code-interpreter done event must decode");
+        let completed: xai_grok_sampling_types::DecodedResponseStreamEvent =
+            completed_event().into();
+        let raw = stream::iter(vec![Ok(in_progress), Ok(done), Ok(completed)]).boxed();
         let events = collect(stream_responses(
             raw,
             None,
@@ -1010,18 +1314,28 @@ mod tests {
             )),
             "expected a code_interpreter BackendToolCallStarted, got {events:?}"
         );
-        let completed = events.iter().find_map(|e| match e {
-            SamplingEvent::BackendToolCallCompleted {
-                call_id,
-                name,
-                result,
-                ..
-            } if name == "code_interpreter" => Some((call_id.clone(), result.clone())),
-            _ => None,
-        });
-        let (call_id, result) = completed.expect("a code_interpreter BackendToolCallCompleted");
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::BackendToolCallCompleted {
+                    call_id,
+                    name,
+                    result,
+                    ..
+                } if name == "code_interpreter" => Some((call_id.clone(), result.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "completion must be emitted exactly once"
+        );
+        let (call_id, result) = &completed[0];
         assert_eq!(call_id, "ci-1");
-        let result = result.expect("serialized code-interpreter payload");
+        let result = result
+            .as_ref()
+            .expect("serialized code-interpreter payload");
         assert_eq!(result["code"], "print(1)");
     }
 

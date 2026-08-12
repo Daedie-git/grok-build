@@ -2,6 +2,9 @@ use super::*;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_sampling_types::ReasoningEffort;
 use xai_grok_tools::implementations::{grok_build, opencode};
+
+const FINALIZATION_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(super) fn canonical_total_tokens(totals: &xai_chat_state::UsageTotals) -> u64 {
     totals.total_tokens()
 }
@@ -38,7 +41,10 @@ pub(super) async fn record_subagent_usage(
             {
                 return false;
             }
-            ack.await.is_ok()
+            matches!(
+                tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await,
+                Ok(Ok(()))
+            )
         }
     }
 }
@@ -519,7 +525,7 @@ pub(crate) async fn run_shell_child(
         &child_session_info,
         &child_session_dir,
         effective_model_id.0.as_ref(),
-        effective_sampling_config.context_window,
+        &effective_sampling_config,
     )
     .await
     {
@@ -722,6 +728,7 @@ pub(crate) async fn run_shell_child(
     tool_ctx.sampler_retry_only_before_output = task_output_budget.is_some();
     tool_ctx.monitor_event_buffer = Some(MonitorEventBuffer::default());
     tool_ctx.subagent_depth = child_depth;
+    tool_ctx.subagent_compaction_policy = request.runtime_overrides.compaction_policy;
     tool_ctx.lsp = ctx.lsp.clone();
     tool_ctx.process_scope = ctx.process_scope.clone();
     let parent_traceparent = xai_file_utils::trace_context::current_traceparent();
@@ -1421,6 +1428,11 @@ pub(crate) async fn run_shell_child(
                         } else {
                             format!("Session error: {e}")
                         }),
+                        // Preserve any answer committed before the terminal
+                        // failure (including forced post-compaction synthesis)
+                        // instead of replacing usable partial findings with an
+                        // empty failure result.
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,
@@ -1442,6 +1454,7 @@ pub(crate) async fn run_shell_child(
                         } else {
                             "Child session dropped unexpectedly".to_string()
                         }),
+                        output: std::sync::Arc::from(final_text),
                         subagent_id: request.id.clone(),
                         child_session_id: child_session_id.0.to_string(),
                         tool_calls,
@@ -1691,7 +1704,10 @@ pub(crate) async fn run_shell_child(
                 )
                 .is_ok()
             {
-                ack.await.is_ok()
+                matches!(
+                    tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await,
+                    Ok(Ok(()))
+                )
             } else {
                 false
             }
@@ -1711,7 +1727,7 @@ pub(crate) async fn run_shell_child(
                 ))
                 .is_ok()
             {
-                let _ = ack.await;
+                let _ = tokio::time::timeout(FINALIZATION_ACK_TIMEOUT, ack).await;
             }
         }
     }

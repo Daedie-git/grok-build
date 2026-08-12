@@ -52,15 +52,25 @@ async fn add_bundle_fetch_headers(
     alpha_test_key: Option<&str>,
     url: &str,
 ) -> reqwest::RequestBuilder {
-    let resolved_auth = match auth_manager {
-        Some(am) => am.auth().await.ok(),
-        None => None,
+    let trusted_destination = crate::util::is_cli_chat_proxy_url(url);
+    if !trusted_destination {
+        tracing::warn!(%url, "refusing to attach bundle credentials to an untrusted destination");
+    }
+    let resolved_auth = if trusted_destination {
+        match auth_manager {
+            Some(am) => am.auth().await.ok(),
+            None => None,
+        }
+    } else {
+        None
     };
     let mut credentials = crate::util::grok_auth_credentials::GrokAuthCredentials::new(
         resolved_auth.as_ref().map(|auth| auth.key.clone()),
     );
-    credentials.deployment_key = deployment_key.map(str::to_owned);
-    credentials.alpha_test_key = alpha_test_key.map(str::to_owned);
+    if trusted_destination {
+        credentials.deployment_key = deployment_key.map(str::to_owned);
+        credentials.alpha_test_key = alpha_test_key.map(str::to_owned);
+    }
     let mut builder = credentials
         .apply(builder, url)
         .header("x-grok-client-version", xai_grok_version::VERSION);
@@ -867,6 +877,19 @@ pub(crate) fn parse_remote_model_value(
             _ => None,
         })
         .unwrap_or_default();
+    let provider_id = get_string(obj, "providerId")
+        .or_else(|| get_string(obj, "provider_id"))
+        .or_else(|| meta.and_then(|m| get_string(m, "providerId")))
+        .or_else(|| meta.and_then(|m| get_string(m, "provider_id")))
+        .and_then(|value| match value.as_str() {
+            "xai" => Some(xai_grok_sampling_types::ProviderId::Xai),
+            "codex" => Some(xai_grok_sampling_types::ProviderId::Codex),
+            "open_ai_compatible" | "openai_compatible" => {
+                Some(xai_grok_sampling_types::ProviderId::OpenAiCompatible)
+            }
+            "custom" => Some(xai_grok_sampling_types::ProviderId::Custom),
+            _ => None,
+        });
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -881,10 +904,16 @@ pub(crate) fn parse_remote_model_value(
         api_key: get_string(obj, "apiKey").or_else(|| get_string(obj, "api_key")),
         env_key: get_env_keys(obj, "envKey").or_else(|| get_env_keys(obj, "env_key")),
         api_backend,
+        provider_id,
         context_window,
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
             .and_then(|v| u8::try_from(v).ok()),
+        auto_compact_token_limit: get_u64(obj, "autoCompactTokenLimit")
+            .or_else(|| get_u64(obj, "auto_compact_token_limit"))
+            .or_else(|| meta.and_then(|m| get_u64(m, "autoCompactTokenLimit")))
+            .or_else(|| meta.and_then(|m| get_u64(m, "auto_compact_token_limit")))
+            .and_then(std::num::NonZeroU64::new),
         system_prompt_label: get_string(obj, "systemPromptLabel")
             .or_else(|| get_string(obj, "system_prompt_label"))
             .filter(|s| !s.trim().is_empty()),

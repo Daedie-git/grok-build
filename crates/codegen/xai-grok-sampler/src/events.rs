@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use xai_grok_sampling_types::{
     ApiErrorCode, ConversationResponse, EmptyResponseContext, ResponseModelMetadata, SamplingError,
-    SentCredential,
+    SentCredential, structured_stream_error_status,
 };
 
 use crate::metrics::InferenceLatencyStats;
@@ -287,7 +287,21 @@ impl From<&SamplingError> for SamplingErrorInfo {
                 )
             }
             SamplingError::EventStreamError(_) => (SamplingErrorKind::Http, None, None, None),
-            SamplingError::StreamError { .. } => (SamplingErrorKind::Api, None, None, None),
+            SamplingError::StreamError {
+                error_type,
+                message,
+                ..
+            } => {
+                let status = structured_stream_error_status(error_type, message);
+                let kind = if err.is_auth_error() {
+                    SamplingErrorKind::Auth
+                } else if err.is_rate_limited() {
+                    SamplingErrorKind::RateLimited
+                } else {
+                    SamplingErrorKind::Api
+                };
+                (kind, Some(status.as_u16()), None, None)
+            }
             SamplingError::IdleTimeout { .. } => (SamplingErrorKind::IdleTimeout, None, None, None),
             SamplingError::EmptyResponse { .. } => {
                 (SamplingErrorKind::EmptyResponse, None, None, None)
@@ -511,7 +525,7 @@ mod tests {
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);
-        assert_eq!(info.status_code, None);
+        assert_eq!(info.status_code, Some(500));
         assert!(info.is_retryable, "stream errors should be retryable");
     }
 

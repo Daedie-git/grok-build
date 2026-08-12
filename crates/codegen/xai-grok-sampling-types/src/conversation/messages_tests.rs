@@ -218,6 +218,7 @@ fn test_btw_stripped_reasoning_produces_no_thinking_blocks() {
     // Simulate a conversation where the model responded with thinking.
     let with_reasoning = ConversationItem::Assistant(AssistantItem {
         content: "Here is the answer.".into(),
+        response_item_id: None,
         tool_calls: vec![],
         model_id: Some("messages-compatible-model".into()),
         model_fingerprint: None,
@@ -423,6 +424,7 @@ fn test_tool_result_with_images_to_anthropic() {
         ConversationItem::user("Read this"),
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "read_file".to_string(),

@@ -68,3 +68,30 @@ pub fn default_session_summary_model() -> &'static str {
         .as_deref()
         .unwrap_or(&DEFAULTS.default)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_MODELS_JSON;
+
+    #[test]
+    fn retry_budgets_are_explicit_for_codex_and_inherited_for_grok() {
+        let value: serde_json::Value = serde_json::from_str(DEFAULT_MODELS_JSON).unwrap();
+        let models = value["models"].as_array().unwrap();
+        let grok = models
+            .iter()
+            .find(|model| model["id"] == "grok-4.5")
+            .unwrap();
+        assert!(grok.get("max_retries").is_none());
+
+        let codex: Vec<_> = models
+            .iter()
+            .filter(|model| model["provider_id"] == "codex")
+            .collect();
+        assert!(!codex.is_empty());
+        assert!(
+            codex
+                .iter()
+                .all(|model| model["max_retries"].as_u64() == Some(5))
+        );
+    }
+}

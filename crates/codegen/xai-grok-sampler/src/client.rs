@@ -19,16 +19,17 @@ use indexmap::IndexMap;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use xai_grok_sampling_types::error::{
     parse_error_code, try_parse_stream_error, user_facing_api_error_message,
 };
 use xai_grok_sampling_types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ConversationRequest,
-    ConversationResponse, CreateResponseWrapper, DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper,
-    ResponseModelMetadata, Result, SamplingError, SentCredential, build_messages_request,
-    is_check_event, messages, rs,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, CodexCompactRequest,
+    CodexCompactResponse, ConversationRequest, ConversationResponse, CreateResponseWrapper,
+    DOOM_LOOP_CHECK_HEADER, MessagesRequestWrapper, ResponseModelMetadata, Result, SamplingError,
+    SentCredential, TurnRoutingState, build_messages_request,
+    conversation_request_to_codex_compact_request_for_origin, is_check_event, messages, rs,
 };
 
 use crate::config::{AuthScheme, OriginClientInfo, SamplerConfig};
@@ -101,37 +102,192 @@ impl GrokRequestHeaders<'_> {
 /// `ResponseUsage` unchanged so billing telemetry stays correct. When
 /// the API doesn't emit `context_details` (older deployments) `total_tokens`
 /// passes through unchanged.
-fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
-    let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
-        Ok(event) => event,
-        Err(first_err) => {
-            // Try sanitizing: parse as Value, strip unknown tools, retry.
-            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data) {
-                // Strip tools that async_openai's rs::Tool can't deserialize
-                // (e.g., xAI-specific "x_search"). Instead of maintaining a
-                // hardcoded allowlist, try deserializing each tool entry —
-                // if it fails, drop it.
-                if let Some(tools) = value
-                    .pointer_mut("/response/tools")
-                    .and_then(|v| v.as_array_mut())
-                {
-                    tools.retain(|t| serde_json::from_value::<rs::Tool>(t.clone()).is_ok());
-                }
-                if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
-                    apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
-                }
+#[derive(Deserialize)]
+struct RawOutputItemEvent {
+    output_index: u32,
+    item: serde_json::Value,
+}
+
+fn captured_output_item(
+    output_index: u32,
+    mut item: serde_json::Value,
+    preserve_codex_metadata: bool,
+) -> Result<xai_grok_sampling_types::CapturedResponseOutputItem> {
+    let metadata = item
+        .as_object_mut()
+        .and_then(|object| object.remove("internal_chat_message_metadata_passthrough"))
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(SamplingError::Serialization)?;
+    let item_type = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string();
+    let value = if item_type == "function_call_output" {
+        xai_grok_sampling_types::CapturedResponseOutputItemValue::FunctionCallOutput(
+            serde_json::from_value(item).map_err(SamplingError::Serialization)?,
+        )
+    } else {
+        let typed = serde_json::from_value(item).map_err(|error| {
+            if preserve_codex_metadata && metadata.is_some() {
+                SamplingError::serialization_message(format!(
+                    "unsupported metadata-bearing Codex Responses output item `{item_type}`: {error}"
+                ))
+            } else {
+                SamplingError::Serialization(error)
             }
-            tracing::error!(
-                error = %first_err,
-                raw_data = %data,
-                "Failed to deserialize ResponseStreamEvent from stream"
-            );
-            return Err(SamplingError::Serialization(first_err));
-        }
+        })?;
+        xai_grok_sampling_types::CapturedResponseOutputItemValue::Typed(typed)
     };
+    let captured = xai_grok_sampling_types::CapturedResponseOutputItem {
+        output_index,
+        value,
+        internal_chat_message_metadata_passthrough: preserve_codex_metadata
+            .then_some(metadata)
+            .flatten(),
+        metadata_origin: None,
+    };
+    if preserve_codex_metadata
+        && captured
+            .internal_chat_message_metadata_passthrough
+            .is_some()
+        && captured.kind().is_none()
+    {
+        return Err(SamplingError::serialization_message(format!(
+            "unsupported metadata-bearing Codex Responses output item `{item_type}` cannot be replayed exactly"
+        )));
+    }
+    Ok(captured)
+}
+
+fn capture_terminal_output(
+    value: &mut serde_json::Value,
+    preserve_codex_metadata: bool,
+) -> Result<Option<Vec<xai_grok_sampling_types::CapturedResponseOutputItem>>> {
+    let Some(output) = value
+        .pointer_mut("/response/output")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(None);
+    };
+    let mut captured = Vec::with_capacity(output.len());
+    for (output_index, item) in output.iter_mut().enumerate() {
+        let decoded = captured_output_item(
+            u32::try_from(output_index).map_err(|_| {
+                SamplingError::serialization_message("Responses output index exceeds u32")
+            })?,
+            item.clone(),
+            preserve_codex_metadata,
+        )?;
+        if let Some(object) = item.as_object_mut() {
+            object.remove("internal_chat_message_metadata_passthrough");
+        }
+        captured.push(decoded);
+    }
+    // async-openai's response-side union omits function_call_output. The raw
+    // captured list remains authoritative for conversion, while the typed
+    // response retains all other response-level fields.
+    output.retain(|item| {
+        item.get("type").and_then(serde_json::Value::as_str) != Some("function_call_output")
+    });
+    Ok(Some(captured))
+}
+
+pub(crate) fn deserialize_response_event_with_metadata(
+    data: &str,
+    preserve_codex_metadata: bool,
+) -> Result<xai_grok_sampling_types::DecodedResponseStreamEvent> {
+    let mut value =
+        serde_json::from_str::<serde_json::Value>(data).map_err(SamplingError::Serialization)?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.output_item.added") | Some("response.output_item.done") => {
+            let done = value.get("type").and_then(serde_json::Value::as_str)
+                == Some("response.output_item.done");
+            let raw: RawOutputItemEvent =
+                serde_json::from_value(value).map_err(SamplingError::Serialization)?;
+            let item = captured_output_item(raw.output_index, raw.item, preserve_codex_metadata)?;
+            return Ok(if done {
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(item)
+            } else {
+                xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(item)
+            });
+        }
+        _ => {}
+    }
+
+    let terminal_output = capture_terminal_output(&mut value, preserve_codex_metadata)?;
+    // Strip tools that async_openai's rs::Tool can't deserialize (e.g.
+    // xAI-specific `x_search`) without maintaining a hardcoded allowlist.
+    if let Some(tools) = value
+        .pointer_mut("/response/tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        tools.retain(|tool| serde_json::from_value::<rs::Tool>(tool.clone()).is_ok());
+    }
+    let mut event = serde_json::from_value::<rs::ResponseStreamEvent>(value).map_err(|error| {
+        tracing::error!(%error, raw_data = %data, "Failed to deserialize ResponseStreamEvent from stream");
+        SamplingError::Serialization(error)
+    })?;
     apply_terminal_event_overrides(&mut event, data);
-    Ok(event)
+    Ok(xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+        event,
+        terminal_output,
+    })
+}
+
+#[cfg(test)]
+fn deserialize_response_event(data: &str) -> Result<rs::ResponseStreamEvent> {
+    match deserialize_response_event_with_metadata(data, false)? {
+        xai_grok_sampling_types::DecodedResponseStreamEvent::Event { event, .. } => Ok(event),
+        _ => Err(SamplingError::serialization_message(
+            "test helper expected a non-output-item Responses event",
+        )),
+    }
+}
+
+fn deserialize_unary_response(
+    bytes: &[u8],
+    preserve_codex_metadata: bool,
+) -> Result<xai_grok_sampling_types::DecodedResponse> {
+    let mut value =
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(SamplingError::Serialization)?;
+    let output = value
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(|items| {
+            items
+                .iter_mut()
+                .enumerate()
+                .map(|(output_index, item)| {
+                    let captured = captured_output_item(
+                        u32::try_from(output_index).map_err(|_| {
+                            SamplingError::serialization_message(
+                                "Responses output index exceeds u32",
+                            )
+                        })?,
+                        item.clone(),
+                        preserve_codex_metadata,
+                    )?;
+                    if let Some(object) = item.as_object_mut() {
+                        object.remove("internal_chat_message_metadata_passthrough");
+                    }
+                    Ok(captured)
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(items) = value
+        .get_mut("output")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        items.retain(|item| {
+            item.get("type").and_then(serde_json::Value::as_str) != Some("function_call_output")
+        });
+    }
+    let response = serde_json::from_value(value).map_err(SamplingError::Serialization)?;
+    Ok(xai_grok_sampling_types::DecodedResponse { response, output })
 }
 
 /// On terminal Responses API events (`response.completed` /
@@ -330,6 +486,101 @@ fn apply_env_http_headers(
     }
 }
 
+fn apply_config_http_headers(
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+    headers: &mut HeaderMap,
+) -> Result<()> {
+    for (key, value) in extra_headers {
+        let header_name = HeaderName::try_from(key.as_str())
+            .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
+        headers.insert(header_name, header_value);
+    }
+    apply_env_http_headers(env_http_headers, getenv, headers);
+    Ok(())
+}
+
+fn sampling_identity_from_effective_headers(
+    protocol: &xai_grok_sampling_types::ProtocolIdentity,
+    base_url: &str,
+    model: &str,
+    headers: &HeaderMap,
+) -> xai_grok_sampling_types::SamplingIdentity {
+    let chatgpt_account_id = headers
+        .get(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    xai_grok_sampling_types::SamplingIdentity::new_for_protocol(
+        protocol,
+        base_url,
+        model,
+        chatgpt_account_id,
+    )
+}
+
+/// Resolve the runtime sampling identity exactly as the wire client does.
+///
+/// Static headers are installed first and environment-backed headers are then
+/// applied with [`apply_env_http_headers`] semantics. Environment values remain
+/// runtime-only and are represented in the result solely by the account-bound
+/// identity metadata required for safe native-history replay.
+pub fn resolve_runtime_sampling_identity(
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Result<xai_grok_sampling_types::SamplingIdentity> {
+    resolve_runtime_sampling_identity_for_provider(
+        None,
+        api_backend,
+        base_url,
+        model,
+        extra_headers,
+        env_http_headers,
+    )
+}
+
+pub fn resolve_runtime_sampling_identity_for_provider(
+    provider_id: Option<xai_grok_sampling_types::ProviderId>,
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+) -> Result<xai_grok_sampling_types::SamplingIdentity> {
+    resolve_runtime_sampling_identity_with_getenv(
+        provider_id,
+        api_backend,
+        base_url,
+        model,
+        extra_headers,
+        env_http_headers,
+        |var| std::env::var(var).ok(),
+    )
+}
+
+fn resolve_runtime_sampling_identity_with_getenv(
+    provider_id: Option<xai_grok_sampling_types::ProviderId>,
+    api_backend: ApiBackend,
+    base_url: &str,
+    model: &str,
+    extra_headers: &IndexMap<String, String>,
+    env_http_headers: &IndexMap<String, String>,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<xai_grok_sampling_types::SamplingIdentity> {
+    let mut headers = HeaderMap::new();
+    apply_config_http_headers(extra_headers, env_http_headers, getenv, &mut headers)?;
+    let protocol =
+        xai_grok_sampling_types::ProtocolIdentity::resolve(provider_id, api_backend, base_url);
+    Ok(sampling_identity_from_effective_headers(
+        &protocol, base_url, model, &headers,
+    ))
+}
+
 /// HTTP client for sampling. Cheap to clone; carries an `Arc`-backed
 /// `reqwest::Client` and the default headers/request-defaults computed from a
 /// [`SamplerConfig`] at construction time.
@@ -338,6 +589,9 @@ pub struct SamplingClient {
     http: reqwest::Client,
     default_headers: HeaderMap,
     base_url: String,
+    chatgpt_account_id: Option<String>,
+    provider: xai_grok_sampling_types::ResolvedProvider,
+    responses_wire: crate::responses_wire::ResponsesWireAdapter,
     defaults: ClientDefaults,
     /// Optional 401-attribution hook. The shell wires this to emit a
     /// structured event at every UNAUTHORIZED arm so 401s can be
@@ -356,6 +610,8 @@ impl std::fmt::Debug for SamplingClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SamplingClient")
             .field("base_url", &self.base_url)
+            .field("provider", &self.provider)
+            .field("responses_wire", &self.responses_wire)
             .field("defaults", &self.defaults)
             .field(
                 "has_attribution_callback",
@@ -550,6 +806,15 @@ impl SamplingClient {
     /// pre-computes the default request headers. This does not perform
     /// any network I/O.
     pub fn new(config: SamplerConfig) -> Result<Self> {
+        let provider = xai_grok_sampling_types::resolve_provider(
+            config.provider_id,
+            config.api_backend.clone(),
+            &config.base_url,
+        );
+        let responses_wire = crate::responses_wire::ResponsesWireAdapter::new(
+            provider.capabilities().responses_wire_protocol(),
+            provider.capabilities().turn_routing_policy(),
+        );
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         if let Some(ref api_key) = config.api_key {
@@ -582,24 +847,22 @@ impl SamplingClient {
             }
         }
 
-        // Apply all extra headers verbatim. This is the single
-        // injection point for proxy-auth headers and any other URL- or
-        // environment-specific headers the session decides to set.
-        for (key, value) in &config.extra_headers {
-            let header_name = HeaderName::try_from(key.as_str())
-                .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header name"))?;
-            let header_value = HeaderValue::from_str(value)
-                .map_err(|_| SamplingError::InvalidConfiguration("Invalid extra header value"))?;
-            headers.insert(header_name, header_value);
-        }
-
-        // Resolve here, not into `extra_headers`, so an env-sourced secret stays
-        // out of persisted state.
-        apply_env_http_headers(
+        // Apply static headers first, then environment overrides. Resolve the
+        // account identity only after this finalized effective ordering so the
+        // history guard and origin stamps agree with the wire request.
+        apply_config_http_headers(
+            &config.extra_headers,
             &config.env_http_headers,
             |var| std::env::var(var).ok(),
             &mut headers,
-        );
+        )?;
+        let chatgpt_account_id = sampling_identity_from_effective_headers(
+            provider.protocol(),
+            &config.base_url,
+            &config.model,
+            &headers,
+        )
+        .chatgpt_account_id;
 
         // Add x-grok-client-version header for version gating at the proxy.
         if let Some(client_version) = config.client_version.as_ref()
@@ -694,6 +957,9 @@ impl SamplingClient {
             http,
             default_headers: headers,
             base_url: config.base_url,
+            chatgpt_account_id,
+            provider,
+            responses_wire,
             defaults,
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
@@ -705,6 +971,23 @@ impl SamplingClient {
     /// The configured API backend for this client.
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    /// Return the immutable runtime identity snapshot used by this client for
+    /// history guards and provider-origin metadata for `model`.
+    ///
+    /// The account comes from the finalized effective header map captured at
+    /// client construction, including any valid environment-header override.
+    pub fn sampling_identity_for_model(
+        &self,
+        model: &str,
+    ) -> xai_grok_sampling_types::SamplingIdentity {
+        xai_grok_sampling_types::SamplingIdentity::new_for_protocol(
+            self.provider.protocol(),
+            self.base_url.clone(),
+            model,
+            self.chatgpt_account_id.clone(),
+        )
     }
 
     /// POST with default headers, returning the builder coupled to the tail
@@ -1204,6 +1487,152 @@ impl SamplingClient {
         Ok(())
     }
 
+    /// Apply backend-specific rules after generic defaults and immediately
+    /// before wire serialization. Ordering is significant for Codex because
+    /// generic defaults may populate fields that its API rejects.
+    fn normalize_response_for_backend(&self, request: &mut CreateResponseWrapper) {
+        self.responses_wire.normalize_create_response(request);
+    }
+
+    fn apply_responses_sideband(
+        sideband: crate::responses_wire::ResponsesSideband,
+        turn_routing_state: Option<&TurnRoutingState>,
+    ) {
+        if let (Some(state), Some(value)) = (turn_routing_state, sideband.turn_routing_value) {
+            state.capture_first(value);
+        }
+    }
+
+    /// Compact a Codex Responses conversation using the native unary endpoint.
+    ///
+    /// Unlike ordinary `/responses` sampling, this returns provider-authored
+    /// structured replacement history and never enables streaming. The body is
+    /// represented by [`CodexCompactRequest`], whose type cannot express the
+    /// unsupported temperature/top-p/output-token controls.
+    #[tracing::instrument(
+        name = "http.codex_compact_response",
+        skip_all,
+        fields(
+            endpoint = %self.endpoint("responses/compact"),
+            model_id = request.model.as_deref().unwrap_or(""),
+            status_code = tracing::field::Empty,
+            success = tracing::field::Empty,
+            error = tracing::field::Empty,
+        )
+    )]
+    pub async fn conversation_compact_responses(
+        &self,
+        mut request: ConversationRequest,
+    ) -> Result<CodexCompactResponse> {
+        if self.provider.capabilities().native_compaction_kind()
+            != xai_grok_sampling_types::NativeCompactionKind::Codex
+        {
+            return Err(SamplingError::InvalidConfiguration(
+                "native Codex compaction requires a Codex Responses sampling target",
+            ));
+        }
+        self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Responses")?;
+        let tracking = GrokRequestHeaders {
+            conv_id: request.x_grok_conv_id.as_deref().unwrap_or_default(),
+            req_id: request.x_grok_req_id.as_deref().unwrap_or_default(),
+            model_id: request.model.as_deref().unwrap_or_default(),
+            session_id: request.x_grok_session_id.as_deref().unwrap_or_default(),
+            turn_idx: request.x_grok_turn_idx.as_deref(),
+            agent_id: request.x_grok_agent_id.as_deref().unwrap_or_default(),
+            deployment_id: request.x_grok_deployment_id.as_deref(),
+            user_id: request.x_grok_user_id.as_deref(),
+        };
+        let origin = self.response_metadata_origin(request.model.as_deref().unwrap_or_default());
+        let payload: CodexCompactRequest =
+            conversation_request_to_codex_compact_request_for_origin(&request, origin.as_ref())
+                .map_err(SamplingError::serialization_message)?;
+        let mut request_body = serde_json::to_value(&payload).map_err(|error| {
+            tracing::error!(%error, "failed to serialize Codex compact request");
+            SamplingError::Serialization(error)
+        })?;
+        xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        let turn_routing_state = request.turn_routing_state.as_ref();
+        let SentRequest {
+            builder: compact_builder,
+            sent_bearer,
+        } = self.post(self.endpoint("responses/compact"));
+        let compact_builder = tracking.apply(compact_builder);
+        let compact_builder = self
+            .responses_wire
+            .apply_turn_routing(compact_builder, turn_routing_state);
+        let built_request = compact_builder
+            .json(&request_body)
+            .build()
+            .map_err(SamplingError::Http)?;
+        Self::log_request_headers(&built_request, "responses/compact");
+        let response = self.http.execute(built_request).await.map_err(|error| {
+            record_stream_request_failure(&error);
+            error
+        })?;
+        let status = response.status();
+        self.responses_wire
+            .capture_turn_routing(response.headers(), turn_routing_state);
+        let span = tracing::Span::current();
+        span.record("status_code", status.as_u16() as i64);
+        span.record("success", status.is_success());
+        let model_metadata = extract_model_metadata(response.headers());
+        let retry_after_secs = extract_retry_after(response.headers());
+        let should_retry = extract_should_retry(response.headers());
+        let bytes = response.bytes().await?;
+        if !status.is_success() {
+            let message = user_facing_api_error_message(status, bytes.as_ref());
+            span.record("error", message.as_str());
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::ResponsesCompact,
+                    sent_bearer.as_deref(),
+                );
+                return Err(auth_rejected(
+                    format!(
+                        "Unauthorized (401) from {}: {message}",
+                        self.endpoint("responses/compact")
+                    ),
+                    sent_bearer.as_deref(),
+                ));
+            }
+            return Err(SamplingError::Api {
+                status,
+                message,
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
+            });
+        }
+        serde_json::from_slice::<CodexCompactResponse>(&bytes).map_err(|error| {
+            tracing::error!(
+                %error,
+                body_preview = %Self::body_preview(bytes.as_ref()),
+                "failed to deserialize Codex compact replacement history"
+            );
+            let unsupported = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("output")?.as_array().cloned())
+                .and_then(|items| {
+                    items.into_iter().find_map(|item| {
+                        let kind = item.get("type")?.as_str()?;
+                        (!matches!(kind, "message" | "reasoning" | "compaction" | "compaction_summary"))
+                            .then(|| kind.to_string())
+                    })
+                });
+            if let Some(kind) = unsupported {
+                SamplingError::serialization_message(format!(
+                    "unsupported Codex compact output variant `{kind}`; replacement history was not installed"
+                ))
+            } else {
+                SamplingError::serialization_message(format!(
+                    "unsupported or malformed Codex compact output fields; replacement history was not installed: {error}"
+                ))
+            }
+        })
+    }
+
     /// Create a response using the Responses API (non-streaming).
     ///
     /// This uses the Responses API format which provides a simpler interface
@@ -1211,8 +1640,9 @@ impl SamplingClient {
     pub async fn create_response(
         &self,
         mut request: CreateResponseWrapper,
-    ) -> Result<rs::Response> {
+    ) -> Result<xai_grok_sampling_types::DecodedResponse> {
         self.apply_response_defaults(&mut request)?;
+        self.normalize_response_for_backend(&mut request);
 
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
@@ -1246,11 +1676,26 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        xai_grok_sampling_types::patch_response_message_metadata(
+            &mut request_body,
+            &request.response_message_metadata,
+        )
+        .map_err(SamplingError::serialization_message)?;
+        xai_grok_sampling_types::patch_response_item_metadata_passthrough(
+            &mut request_body,
+            &request.response_item_metadata_passthrough,
+        )
+        .map_err(SamplingError::serialization_message)?;
+        let turn_routing_state = request.turn_routing_state.as_ref();
         let SentRequest {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder).json(&request_body);
+        let http_request = grok_headers.apply(builder);
+        let http_request = self
+            .responses_wire
+            .apply_turn_routing(http_request, turn_routing_state)
+            .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -1258,6 +1703,8 @@ impl SamplingClient {
         })?;
 
         let status = response.status();
+        self.responses_wire
+            .capture_turn_routing(response.headers(), turn_routing_state);
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
         let should_retry = extract_should_retry(response.headers());
@@ -1295,16 +1742,17 @@ impl SamplingClient {
             });
         }
 
-        let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
+        let mut decoded = deserialize_unary_response(
+            &bytes,
+            self.responses_wire.preserves_response_metadata(),
+        )
+        .map_err(|error| {
             let raw_body = String::from_utf8_lossy(&bytes);
-            tracing::error!(
-                error = %e,
-                raw_body = %raw_body,
-                "Failed to deserialize rs::Response"
-            );
-            SamplingError::Serialization(e)
+            tracing::error!(%error, raw_body = %raw_body, "Failed to deserialize Responses response");
+            error
         })?;
-        Ok(response_obj)
+        decoded.set_metadata_origin(request.response_metadata_origin.as_ref());
+        Ok(decoded)
     }
 
     /// Create a streaming response using the Responses API.
@@ -1338,11 +1786,12 @@ impl SamplingClient {
         &self,
         mut request: CreateResponseWrapper,
     ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        BoxStream<'static, Result<xai_grok_sampling_types::DecodedResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
         self.apply_response_defaults(&mut request)?;
+        self.normalize_response_for_backend(&mut request);
 
         // Enable streaming
         request.inner.stream = Some(true);
@@ -1390,18 +1839,31 @@ impl SamplingClient {
         }
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        xai_grok_sampling_types::patch_response_message_metadata(
+            &mut request_body,
+            &request.response_message_metadata,
+        )
+        .map_err(SamplingError::serialization_message)?;
+        xai_grok_sampling_types::patch_response_item_metadata_passthrough(
+            &mut request_body,
+            &request.response_item_metadata_passthrough,
+        )
+        .map_err(SamplingError::serialization_message)?;
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
             .defaults
             .doom_loop_recovery
             .map(crate::doom_loop::DoomLoopSignalCollector::new);
+        let turn_routing_state = request.turn_routing_state.as_ref();
         let SentRequest {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let mut http_request = grok_headers
-            .apply(builder)
+        let http_request = grok_headers.apply(builder);
+        let mut http_request = self
+            .responses_wire
+            .apply_turn_routing(http_request, turn_routing_state)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(policy) = self.defaults.doom_loop_recovery {
             http_request =
@@ -1428,6 +1890,8 @@ impl SamplingClient {
         })?;
 
         let status = response.status();
+        self.responses_wire
+            .capture_turn_routing(response.headers(), turn_routing_state);
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
@@ -1490,6 +1954,10 @@ impl SamplingClient {
         let event_stream = byte_stream.eventsource();
 
         let doom_loop_for_stream = doom_loop.clone();
+        let preserve_codex_metadata = self.responses_wire.preserves_response_metadata();
+        let responses_wire = self.responses_wire;
+        let turn_routing_state_for_stream = turn_routing_state.cloned();
+        let response_metadata_origin = request.response_metadata_origin.clone();
 
         // The scan item is an `Option`: `Some(None)` skips an absorbed
         // doom-loop event without terminating the stream (`filter_map`
@@ -1499,43 +1967,69 @@ impl SamplingClient {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
-                let item = match event_res {
-                    Ok(event) => {
-                        let data = &event.data;
-                        if data == "[DONE]" {
-                            return std::future::ready(None);
-                        }
+                let item =
+                    match event_res {
+                        Ok(event) => {
+                            let data = &event.data;
+                            if data == "[DONE]" {
+                                return std::future::ready(None);
+                            }
 
-                        tracing::info!(
-                            target: crate::sampling_log::TARGET,
-                            event = "sse_chunk",
-                            backend = "responses",
-                            data = %data,
-                        );
-
-                        // Intercept the non-standard doom-loop event before
-                        // typed deserialization; async-openai's event enum
-                        // does not know it and would fail to parse it. With
-                        // the check disabled, the shared name-or-payload-type
-                        // predicate guards against a server emitting it
-                        // despite no opt-in (rollout skew), named or not.
-                        let swallow = match &doom_loop_for_stream {
-                            Some(collector) => collector.absorb(&event.event, data),
-                            None => is_check_event(&event.event, data),
-                        };
-                        if swallow {
-                            Some(None)
-                        } else if let Some(stream_error) = try_parse_stream_error(data) {
-                            Some(Some(Err(stream_error)))
-                        } else {
-                            Some(Some(deserialize_response_event(data)))
+                            // Give the resolved provider wire adapter first refusal
+                            // before async-openai's closed standard event enum.
+                            let swallow_doom_loop = match &doom_loop_for_stream {
+                                Some(collector) => collector.absorb(&event.event, data),
+                                None => is_check_event(&event.event, data),
+                            };
+                            if swallow_doom_loop {
+                                Some(None)
+                            } else {
+                                match responses_wire.decode_sideband(data) {
+                                    Ok(Some(sideband)) => {
+                                        Self::apply_responses_sideband(
+                                            sideband,
+                                            turn_routing_state_for_stream.as_ref(),
+                                        );
+                                        tracing::debug!(
+                                            target: crate::sampling_log::TARGET,
+                                            event = "sse_sideband",
+                                            backend = "responses",
+                                            "Consumed provider Responses sideband"
+                                        );
+                                        Some(None)
+                                    }
+                                    Err(error) => Some(Some(Err(error))),
+                                    Ok(None) => {
+                                        tracing::info!(
+                                            target: crate::sampling_log::TARGET,
+                                            event = "sse_chunk",
+                                            backend = "responses",
+                                            data = %data,
+                                        );
+                                        if let Some(stream_error) = try_parse_stream_error(data) {
+                                            Some(Some(Err(stream_error)))
+                                        } else {
+                                            Some(Some(
+                                                deserialize_response_event_with_metadata(
+                                                    data,
+                                                    preserve_codex_metadata,
+                                                )
+                                                .map(|event| {
+                                                    event.with_metadata_origin(
+                                                        response_metadata_origin.as_ref(),
+                                                    )
+                                                }),
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Err(e) => {
-                        *had_transport_error = true;
-                        Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
-                    }
-                };
+                        Err(e) => {
+                            *had_transport_error = true;
+                            Some(Some(Err(SamplingError::EventStreamError(e.to_string()))))
+                        }
+                    };
                 std::future::ready(item)
             })
             .filter_map(std::future::ready)
@@ -1881,6 +2375,57 @@ impl SamplingClient {
         Ok(())
     }
 
+    fn response_metadata_origin(
+        &self,
+        model: &str,
+    ) -> Option<xai_grok_sampling_types::ResponseMetadataOrigin> {
+        let identity = self.sampling_identity_for_model(model);
+        xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            &identity.base_url,
+            &identity.model,
+            identity.chatgpt_account_id,
+        )
+    }
+
+    fn reject_incompatible_native_history(
+        &self,
+        request: &ConversationRequest,
+        api: &'static str,
+    ) -> Result<()> {
+        let api_backend = match api {
+            "Responses" => xai_grok_sampling_types::ApiBackend::Responses,
+            "Messages" => xai_grok_sampling_types::ApiBackend::Messages,
+            _ => xai_grok_sampling_types::ApiBackend::ChatCompletions,
+        };
+        let model = request.model.as_deref().unwrap_or_default();
+        let identity = if api_backend == self.defaults.api_backend {
+            self.sampling_identity_for_model(model)
+        } else {
+            xai_grok_sampling_types::SamplingIdentity::new(
+                api_backend,
+                self.base_url.clone(),
+                model,
+                self.chatgpt_account_id.clone(),
+            )
+        };
+        match xai_grok_sampling_types::validate_history_for_sampling_identity(
+            &request.items,
+            &identity,
+        ) {
+            Ok(()) => Ok(()),
+            Err(xai_grok_sampling_types::SamplingIdentityHistoryError::MalformedNativeHistory(
+                _,
+            )) => Err(SamplingError::InvalidConfiguration(
+                "native Codex compaction history has missing or malformed durable identity metadata; history was not modified",
+            )),
+            Err(
+                xai_grok_sampling_types::SamplingIdentityHistoryError::IncompatibleNativeHistory,
+            ) => Err(SamplingError::InvalidConfiguration(
+                "this session contains identity-bound native Codex compaction history; backend, API, model, and ChatGPT account must exactly match the compaction origin (history was not modified)",
+            )),
+        }
+    }
+
     /// Send a conversation request using the Chat Completions API (streaming).
     ///
     /// Converts the `ConversationRequest` to `ChatCompletionRequest` internally.
@@ -1893,6 +2438,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Chat Completions")?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -1911,6 +2457,7 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<ChatCompletionResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Chat Completions")?;
 
         let trace = request.trace.take();
         let mut chat_request: ChatCompletionRequest = request.into();
@@ -1932,11 +2479,12 @@ impl SamplingClient {
         &self,
         mut request: ConversationRequest,
     ) -> Result<(
-        BoxStream<'static, Result<rs::ResponseStreamEvent>>,
+        BoxStream<'static, Result<xai_grok_sampling_types::DecodedResponseStreamEvent>>,
         Option<ResponseModelMetadata>,
         Option<crate::doom_loop::DoomLoopSignalCollector>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Responses")?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -1945,19 +2493,16 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        // Collect xAI-specific tools that can't be expressed via rs::Tool
-        // (e.g., x_search). These are injected as raw JSON after serialization.
-        let extra_tools = xai_grok_sampling_types::extra_tool_entries(&request.hosted_tools);
-
-        let responses_request: rs::CreateResponse = (&request).into();
-
-        let mut wrapper = CreateResponseWrapper::new(responses_request);
+        let origin = self.response_metadata_origin(request.model.as_deref().unwrap_or_default());
+        let mut wrapper = self
+            .responses_wire
+            .prepare_create_response(&request, origin)?;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
-        wrapper.extra_tool_entries = extra_tools;
+        wrapper.turn_routing_state = request.turn_routing_state.clone();
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -1972,8 +2517,9 @@ impl SamplingClient {
     pub async fn conversation_responses(
         &self,
         mut request: ConversationRequest,
-    ) -> Result<rs::Response> {
+    ) -> Result<xai_grok_sampling_types::DecodedResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Responses")?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -1982,14 +2528,16 @@ impl SamplingClient {
         let x_grok_turn_idx = request.x_grok_turn_idx.clone();
         let x_grok_agent_id = request.x_grok_agent_id.clone();
 
-        let responses_request: rs::CreateResponse = (&request).into();
-
-        let mut wrapper = CreateResponseWrapper::new(responses_request);
+        let origin = self.response_metadata_origin(request.model.as_deref().unwrap_or_default());
+        let mut wrapper = self
+            .responses_wire
+            .prepare_create_response(&request, origin)?;
         wrapper.x_grok_conv_id = x_grok_conv_id;
         wrapper.x_grok_req_id = x_grok_req_id;
         wrapper.x_grok_session_id = x_grok_session_id;
         wrapper.x_grok_turn_idx = x_grok_turn_idx;
         wrapper.x_grok_agent_id = x_grok_agent_id;
+        wrapper.turn_routing_state = request.turn_routing_state.clone();
 
         if let Some(trace) = trace {
             wrapper.trace = Some(trace);
@@ -2009,6 +2557,7 @@ impl SamplingClient {
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Messages")?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -2041,6 +2590,7 @@ impl SamplingClient {
         mut request: ConversationRequest,
     ) -> Result<messages::MessagesResponse> {
         self.apply_conversation_defaults(&mut request)?;
+        self.reject_incompatible_native_history(&request, "Messages")?;
 
         let trace = request.trace.take();
         let x_grok_conv_id = request.x_grok_conv_id.clone();
@@ -2121,6 +2671,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use xai_grok_sampling_types::ApiErrorCode;
+    use xai_grok_sampling_types::ConversationItem;
     use xai_grok_sampling_types::types::ChatRequestMessage;
 
     #[test]
@@ -2181,6 +2732,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            provider_id: None,
             auth_scheme: AuthScheme::Bearer,
             extra_headers: IndexMap::new(),
             extra_response_includes: Vec::new(),
@@ -2204,6 +2756,324 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+        }
+    }
+
+    #[test]
+    fn native_history_is_only_compatible_with_codex_responses() {
+        let mut compatibility = xai_grok_sampling_types::NativeCompactionCompatibility::codex(
+            "gpt-test",
+            Some("acct-test".into()),
+        );
+        compatibility.replacement_segment_items = 1;
+        compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+            input_index: 0,
+            kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+            item_id: Some("cmp_test".into()),
+            internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
+        }];
+        let request = ConversationRequest {
+            items: vec![
+                xai_grok_sampling_types::ConversationItem::native_compaction_metadata(
+                    compatibility,
+                ),
+                xai_grok_sampling_types::ConversationItem::encrypted_compaction(
+                    rs::CompactionSummaryItemParam {
+                        id: Some("cmp_test".into()),
+                        encrypted_content: "opaque".into(),
+                    },
+                ),
+            ],
+            model: Some("gpt-test".into()),
+            ..Default::default()
+        };
+        let ordinary = SamplingClient::new(minimal_config()).expect("client");
+        for api in ["Chat Completions", "Messages", "Responses"] {
+            let error = ordinary
+                .reject_incompatible_native_history(&request, api)
+                .expect_err("ordinary backends must reject opaque history");
+            assert!(error.to_string().contains("identity-bound native Codex"));
+        }
+
+        let mut config = minimal_config();
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string();
+        config.model = "gpt-test".into();
+        config.api_backend = ApiBackend::Responses;
+        config.extra_headers.insert(
+            xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+            "acct-test".into(),
+        );
+        let wrong_account = {
+            let mut wrong = config.clone();
+            wrong.extra_headers.insert(
+                xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+                "acct-other".into(),
+            );
+            SamplingClient::new(wrong).expect("wrong-account Codex client")
+        };
+        let codex = SamplingClient::new(config).expect("Codex client");
+        codex
+            .reject_incompatible_native_history(&request, "Responses")
+            .expect("Codex Responses replay remains lossless");
+        let mut wrong_model_request = request.clone();
+        wrong_model_request.model = Some("gpt-other".into());
+        assert!(
+            codex
+                .reject_incompatible_native_history(&wrong_model_request, "Responses")
+                .is_err(),
+            "opaque history must remain pinned to its exact model"
+        );
+        assert!(
+            wrong_account
+                .reject_incompatible_native_history(&request, "Responses")
+                .is_err(),
+            "opaque history must remain pinned to its exact account"
+        );
+        assert!(
+            codex
+                .reject_incompatible_native_history(&request, "Messages")
+                .is_err()
+        );
+        assert!(
+            matches!(
+                request.items[1],
+                xai_grok_sampling_types::ConversationItem::Provider(ref provider)
+                    if provider.is_encrypted_compaction()
+            ),
+            "guard must not mutate history"
+        );
+    }
+
+    #[test]
+    fn turn_routing_state_is_first_value_wins_and_replayed() {
+        const TURN_HEADER: &str = "x-codex-turn-state";
+        let adapter = crate::responses_wire::ResponsesWireAdapter::new(
+            xai_grok_sampling_types::ResponsesWireProtocol::Codex,
+            xai_grok_sampling_types::TurnRoutingPolicy::FirstValueWinsHeader(TURN_HEADER),
+        );
+        let state = TurnRoutingState::fresh();
+        let mut first = HeaderMap::new();
+        first.insert(TURN_HEADER, HeaderValue::from_static("turn-one"));
+        adapter.capture_turn_routing(&first, Some(&state));
+        let mut later = HeaderMap::new();
+        later.insert(TURN_HEADER, HeaderValue::from_static("turn-two"));
+        adapter.capture_turn_routing(&later, Some(&state));
+        SamplingClient::apply_responses_sideband(
+            crate::responses_wire::ResponsesSideband {
+                turn_routing_value: Some("turn-three".into()),
+            },
+            Some(&state),
+        );
+        assert_eq!(state.value(), Some("turn-one"));
+
+        let stream_only = TurnRoutingState::fresh();
+        SamplingClient::apply_responses_sideband(
+            crate::responses_wire::ResponsesSideband {
+                turn_routing_value: Some("stream-state".into()),
+            },
+            Some(&stream_only),
+        );
+        assert_eq!(stream_only.value(), Some("stream-state"));
+
+        let request = adapter
+            .apply_turn_routing(
+                reqwest::Client::new().post("https://example.test/responses"),
+                Some(&state),
+            )
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(TURN_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("turn-one")
+        );
+        assert!(TurnRoutingState::default().value().is_none());
+    }
+
+    #[test]
+    fn backend_capability_gates_turn_routing_send_and_capture() {
+        const TURN_HEADER: &str = "x-codex-turn-state";
+        let mut supported_config = minimal_config();
+        supported_config.api_backend = ApiBackend::Responses;
+        supported_config.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+        supported_config.base_url = "http://127.0.0.1:3210/v1".into();
+        let supported = SamplingClient::new(supported_config).unwrap();
+        let mut unsupported_config = minimal_config();
+        unsupported_config.api_backend = ApiBackend::Responses;
+        unsupported_config.provider_id =
+            Some(xai_grok_sampling_types::ProviderId::OpenAiCompatible);
+        unsupported_config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+        let unsupported = SamplingClient::new(unsupported_config).unwrap();
+        assert_eq!(
+            supported.responses_wire,
+            crate::responses_wire::ResponsesWireAdapter::new(
+                xai_grok_sampling_types::ResponsesWireProtocol::Codex,
+                xai_grok_sampling_types::TurnRoutingPolicy::FirstValueWinsHeader(TURN_HEADER),
+            )
+        );
+        assert_eq!(
+            unsupported.responses_wire,
+            crate::responses_wire::ResponsesWireAdapter::new(
+                xai_grok_sampling_types::ResponsesWireProtocol::Standard,
+                xai_grok_sampling_types::TurnRoutingPolicy::None,
+            )
+        );
+
+        let populated = TurnRoutingState::fresh();
+        assert!(populated.capture_first("client-state".to_string()));
+        let supported_request = supported
+            .responses_wire
+            .apply_turn_routing(
+                reqwest::Client::new().post("https://example.test/responses"),
+                Some(&populated),
+            )
+            .build()
+            .unwrap();
+        let unsupported_request = unsupported
+            .responses_wire
+            .apply_turn_routing(
+                reqwest::Client::new().post("https://example.test/responses"),
+                Some(&populated),
+            )
+            .build()
+            .unwrap();
+        assert!(supported_request.headers().contains_key(TURN_HEADER));
+        assert!(!unsupported_request.headers().contains_key(TURN_HEADER));
+
+        let fresh = TurnRoutingState::fresh();
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(TURN_HEADER, HeaderValue::from_static("server-state"));
+        unsupported
+            .responses_wire
+            .capture_turn_routing(&response_headers, Some(&fresh));
+        assert!(fresh.value().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_proxy_consumes_metadata_sideband_and_captures_routing() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async {
+                (
+                    [(reqwest::header::CONTENT_TYPE.as_str(), "text/event-stream")],
+                    concat!(
+                        "data: {\"type\":\"response.metadata\",\"headers\":{\"x-codex-turn-state\":\"stream-state\"}}\n\n",
+                        "data: [DONE]\n\n"
+                    ),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+        config.base_url = format!("http://{address}/v1");
+        let client = SamplingClient::new(config).unwrap();
+        let routing = TurnRoutingState::fresh();
+        let (stream, _, _) = client
+            .conversation_stream_responses(ConversationRequest {
+                items: vec![ConversationItem::user("hello")],
+                model: Some("test-model".into()),
+                turn_routing_state: Some(routing.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let events = stream.collect::<Vec<_>>().await;
+
+        assert!(events.is_empty(), "sideband must not become model output");
+        assert_eq!(routing.value(), Some("stream-state"));
+    }
+
+    #[tokio::test]
+    async fn native_compact_rejects_non_codex_resolved_provider_before_http() {
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.provider_id = Some(xai_grok_sampling_types::ProviderId::Custom);
+        config.base_url = "http://127.0.0.1:9/v1".into();
+        let client = SamplingClient::new(config).unwrap();
+        let error = client
+            .conversation_compact_responses(ConversationRequest::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SamplingError::InvalidConfiguration(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_custom_provider_overrides_codex_url_and_preserves_standard_controls() {
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.provider_id = Some(xai_grok_sampling_types::ProviderId::Custom);
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+        config.temperature = Some(0.6);
+        config.top_p = Some(0.9);
+        config.max_completion_tokens = Some(2048);
+        let client = SamplingClient::new(config).expect("Responses client");
+        assert_eq!(
+            client.responses_wire,
+            crate::responses_wire::ResponsesWireAdapter::new(
+                xai_grok_sampling_types::ResponsesWireProtocol::Standard,
+                xai_grok_sampling_types::TurnRoutingPolicy::None,
+            )
+        );
+        let created: rs::CreateResponse = (&ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("hello")],
+            ..Default::default()
+        })
+            .into();
+        let mut wrapper = CreateResponseWrapper::new(created);
+
+        client.apply_response_defaults(&mut wrapper).unwrap();
+        client.normalize_response_for_backend(&mut wrapper);
+
+        assert_eq!(wrapper.inner.temperature, Some(0.6));
+        assert_eq!(wrapper.inner.top_p, Some(0.9));
+        assert_eq!(wrapper.inner.max_output_tokens, Some(2048));
+    }
+
+    #[test]
+    fn codex_wire_normalization_runs_after_response_defaults() {
+        let mut config = minimal_config();
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string();
+        config.api_backend = ApiBackend::Responses;
+        config.temperature = Some(0.8);
+        config.top_p = Some(0.9);
+        config.max_completion_tokens = Some(4096);
+        let client = SamplingClient::new(config).expect("client");
+        let created: rs::CreateResponse = (&ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("summarize")],
+            model: Some("gpt-5.6-sol".into()),
+            ..Default::default()
+        })
+            .into();
+        let mut wrapper = CreateResponseWrapper::new(created);
+
+        client.apply_response_defaults(&mut wrapper).unwrap();
+        assert!(
+            wrapper.inner.temperature.is_some(),
+            "generic defaults must populate first"
+        );
+        assert!(wrapper.inner.top_p.is_some());
+        assert!(wrapper.inner.max_output_tokens.is_some());
+        client.normalize_response_for_backend(&mut wrapper);
+
+        let wire = serde_json::to_value(&wrapper.inner).expect("serialize exact wire body");
+        for field in ["temperature", "top_p", "max_output_tokens"] {
+            assert!(
+                wire.get(field).is_none() || wire[field].is_null(),
+                "last-mile Codex body must omit {field}: {wire:#}"
+            );
         }
     }
 
@@ -2513,6 +3383,74 @@ mod tests {
         assert_eq!(headers.get("x-override").unwrap(), "from-env");
         // An invalid header name is skipped rather than panicking.
         assert!(headers.get("x invalid").is_none());
+    }
+
+    #[test]
+    fn runtime_account_identity_matches_effective_header_ordering() {
+        let account_header = xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string();
+        let resolve = |extra_headers: &IndexMap<String, String>,
+                       env_http_headers: &IndexMap<String, String>,
+                       value: Option<&str>| {
+            resolve_runtime_sampling_identity_with_getenv(
+                None,
+                ApiBackend::Responses,
+                xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+                "gpt-account-test",
+                extra_headers,
+                env_http_headers,
+                |_| value.map(str::to_owned),
+            )
+            .unwrap()
+            .chatgpt_account_id
+        };
+
+        let mut static_headers = IndexMap::new();
+        static_headers.insert(account_header.clone(), "acct-static".into());
+        assert_eq!(
+            resolve(&static_headers, &IndexMap::new(), None).as_deref(),
+            Some("acct-static")
+        );
+
+        let mut env_headers = IndexMap::new();
+        env_headers.insert("chatgpt-account-id".into(), "ACCOUNT_ENV".into());
+        assert_eq!(
+            resolve(&IndexMap::new(), &env_headers, Some(" acct-env ")).as_deref(),
+            Some("acct-env")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("acct-override")).as_deref(),
+            Some("acct-override")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("   ")).as_deref(),
+            Some("acct-static")
+        );
+        assert_eq!(
+            resolve(&static_headers, &env_headers, Some("bad\nvalue")).as_deref(),
+            Some("acct-static")
+        );
+    }
+
+    #[test]
+    fn runtime_identity_helper_agrees_with_sampling_client() {
+        let mut config = minimal_config();
+        config.api_backend = ApiBackend::Responses;
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+        config.model = "gpt-account-test".into();
+        config.extra_headers.insert(
+            xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+            "acct-static".into(),
+        );
+        let identity = resolve_runtime_sampling_identity(
+            config.api_backend.clone(),
+            &config.base_url,
+            &config.model,
+            &config.extra_headers,
+            &config.env_http_headers,
+        )
+        .unwrap();
+        let client = SamplingClient::new(config).unwrap();
+        assert_eq!(identity.chatgpt_account_id, client.chatgpt_account_id);
     }
 
     #[test]
@@ -3145,6 +4083,706 @@ mod tests {
         };
         let usage = e.response.usage.expect("usage present");
         assert_eq!(usage.total_tokens, 6_714);
+    }
+
+    #[test]
+    fn raw_output_item_events_capture_distinct_codex_metadata_before_typed_decode() {
+        use xai_grok_sampling_types::{
+            CapturedResponseOutputItemValue, DecodedResponseStreamEvent, ResponseOutputItemKind,
+        };
+
+        let cases = [
+            (
+                ResponseOutputItemKind::Message,
+                "turn-message",
+                serde_json::json!({
+                    "type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed", "content": [{"type": "output_text", "text": "ok", "annotations": []}]
+                }),
+            ),
+            (
+                ResponseOutputItemKind::Reasoning,
+                "turn-reasoning",
+                serde_json::json!({
+                    "type": "reasoning", "id": "rs_1", "summary": [],
+                    "encrypted_content": "cipher"
+                }),
+            ),
+            (
+                ResponseOutputItemKind::FunctionCall,
+                "turn-call",
+                serde_json::json!({
+                    "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "read_file", "arguments": "{}"
+                }),
+            ),
+            (
+                ResponseOutputItemKind::FunctionCallOutput,
+                "turn-output",
+                serde_json::json!({
+                    "type": "function_call_output", "id": "fco_1", "call_id": "call_1",
+                    "output": "contents"
+                }),
+            ),
+        ];
+
+        for (output_index, (kind, turn_id, mut item)) in cases.into_iter().enumerate() {
+            item["internal_chat_message_metadata_passthrough"] =
+                serde_json::json!({"turn_id": turn_id});
+            for event_type in ["response.output_item.added", "response.output_item.done"] {
+                let raw = serde_json::json!({
+                    "type": event_type,
+                    "sequence_number": output_index,
+                    "output_index": output_index,
+                    "item": item,
+                });
+                let decoded = deserialize_response_event_with_metadata(&raw.to_string(), true)
+                    .expect("raw item must decode");
+                let captured = match decoded {
+                    DecodedResponseStreamEvent::OutputItemAdded(item)
+                    | DecodedResponseStreamEvent::OutputItemDone(item) => item,
+                    other => panic!("expected raw output item, got {other:?}"),
+                };
+                assert_eq!(captured.kind(), Some(kind));
+                assert_eq!(
+                    captured
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|metadata| metadata.turn_id.as_deref()),
+                    Some(turn_id)
+                );
+                if kind == ResponseOutputItemKind::FunctionCallOutput {
+                    assert!(matches!(
+                        captured.value,
+                        CapturedResponseOutputItemValue::FunctionCallOutput(_)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unary_raw_output_metadata_survives_durable_conversion() {
+        let body = serde_json::json!({
+            "id": "resp_1", "object": "response", "created_at": 0,
+            "model": "gpt-codex", "status": "completed",
+            "output": [{
+                "type": "message", "id": "msg_unary", "role": "assistant",
+                "status": "completed", "content": [{"type": "output_text", "text": "hello", "annotations": []}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-unary"}
+            }]
+        });
+        let mut decoded = deserialize_unary_response(body.to_string().as_bytes(), true).unwrap();
+        let origin = xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            "gpt-codex",
+            None,
+        )
+        .unwrap();
+        decoded.set_metadata_origin(Some(&origin));
+        let durable = decoded.into_conversation_items().unwrap();
+        assert!(matches!(
+            &durable[0],
+            ConversationItem::Provider(provider)
+                if provider.as_response_output_metadata().is_some_and(|metadata| {
+                    metadata.items[0]
+                        .internal_chat_message_metadata_passthrough
+                        .as_ref()
+                        .and_then(|value| value.turn_id.as_deref())
+                        == Some("turn-unary")
+                        && metadata.items[0].item_id.as_deref() == Some("msg_unary")
+                })
+        ));
+        assert!(matches!(&durable[1], ConversationItem::Assistant(_)));
+    }
+
+    #[test]
+    fn raw_streaming_empty_completed_output_replays_exact_interleaving_after_cold_load() {
+        let origin = xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            "gpt-codex",
+            None,
+        )
+        .unwrap();
+        let output = [
+            serde_json::json!({
+                "type": "reasoning", "id": "rs-s0", "summary": [],
+                "encrypted_content": "cipher-s0", "status": "completed",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-s0"}
+            }),
+            serde_json::json!({
+                "type": "function_call", "id": "fc-s1", "call_id": "call-s1",
+                "name": "read_file", "arguments": "{}",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-s1"}
+            }),
+            serde_json::json!({
+                "type": "reasoning", "id": "rs-s2", "summary": [],
+                "encrypted_content": "cipher-s2", "status": "completed",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-s2"}
+            }),
+            serde_json::json!({
+                "type": "function_call", "id": "fc-s3", "call_id": "call-s3",
+                "name": "grep", "arguments": "{}",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-s3"}
+            }),
+            serde_json::json!({
+                "type": "message", "id": "msg-s4", "role": "assistant",
+                "status": "completed", "content": [
+                    {"type": "output_text", "text": "streamed", "annotations": []}
+                ], "internal_chat_message_metadata_passthrough": {"turn_id": "turn-s4"}
+            }),
+        ];
+        let mut accumulator = xai_grok_sampling_types::ResponsesStreamAccumulator::default();
+        for (output_index, item) in output.into_iter().enumerate() {
+            let raw = serde_json::json!({
+                "type": "response.output_item.done",
+                "sequence_number": output_index,
+                "output_index": output_index,
+                "item": item,
+            });
+            let decoded = deserialize_response_event_with_metadata(&raw.to_string(), true)
+                .unwrap()
+                .with_metadata_origin(Some(&origin));
+            let xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(item) = decoded
+            else {
+                panic!("raw output item event")
+            };
+            accumulator.note_captured_output_item_done(item);
+        }
+        let completed = serde_json::json!({
+            "type": "response.completed", "sequence_number": 99,
+            "response": {
+                "id": "resp-stream-order", "object": "response", "created_at": 0,
+                "model": "gpt-codex", "status": "completed", "output": []
+            }
+        });
+        let decoded = deserialize_response_event_with_metadata(&completed.to_string(), true)
+            .unwrap()
+            .with_metadata_origin(Some(&origin));
+        let xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+            event: rs::ResponseStreamEvent::ResponseCompleted(completed),
+            terminal_output,
+        } = decoded
+        else {
+            panic!("raw completed event")
+        };
+        let captured = accumulator.terminal_output(terminal_output);
+        let items = xai_grok_sampling_types::captured_response_to_conversation_items(
+            completed.response,
+            captured,
+        )
+        .unwrap();
+        let items: Vec<ConversationItem> =
+            serde_json::from_slice(&serde_json::to_vec(&items).unwrap()).unwrap();
+        let request = xai_grok_sampling_types::ConversationRequest {
+            items,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let mut wire = serde_json::to_value(
+            xai_grok_sampling_types::conversation_request_to_codex_create_response(&request),
+        )
+        .unwrap();
+        xai_grok_sampling_types::patch_response_message_metadata(
+            &mut wire,
+            &xai_grok_sampling_types::response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
+        let metadata = xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
+            &request,
+            Some(&origin),
+        )
+        .unwrap();
+        xai_grok_sampling_types::patch_response_item_metadata_passthrough(&mut wire, &metadata)
+            .unwrap();
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| (
+                    item["type"].as_str().unwrap(),
+                    item.get("id").and_then(serde_json::Value::as_str),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("reasoning", Some("rs-s0")),
+                ("function_call", Some("fc-s1")),
+                ("reasoning", Some("rs-s2")),
+                ("function_call", Some("fc-s3")),
+                ("message", Some("msg-s4")),
+            ]
+        );
+        assert_eq!(input[1]["call_id"], "call-s1");
+        assert_eq!(input[3]["call_id"], "call-s3");
+        for (index, turn_id) in ["turn-s0", "turn-s1", "turn-s2", "turn-s3", "turn-s4"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                input[index]["internal_chat_message_metadata_passthrough"]["turn_id"],
+                turn_id
+            );
+        }
+    }
+
+    #[test]
+    fn unary_interleaved_output_replays_in_exact_provider_order() {
+        let body = serde_json::json!({
+            "id": "resp-unary-order", "object": "response", "created_at": 0,
+            "model": "gpt-codex", "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs-u0", "summary": [],
+                 "encrypted_content": "cipher-u0", "status": "completed"},
+                {"type": "function_call", "id": "fc-u1", "call_id": "call-u1",
+                 "name": "read_file", "arguments": "{}"},
+                {"type": "reasoning", "id": "rs-u2", "summary": [],
+                 "encrypted_content": "cipher-u2", "status": "completed"},
+                {"type": "function_call", "id": "fc-u3", "call_id": "call-u3",
+                 "name": "grep", "arguments": "{}"},
+                {"type": "message", "id": "msg-u4", "role": "assistant",
+                 "status": "completed", "content": [
+                    {"type": "output_text", "text": "unary", "annotations": []}
+                 ]}
+            ]
+        });
+        let mut decoded = deserialize_unary_response(body.to_string().as_bytes(), true).unwrap();
+        let origin = xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            "gpt-codex",
+            None,
+        )
+        .unwrap();
+        decoded.set_metadata_origin(Some(&origin));
+        let items: Vec<ConversationItem> = serde_json::from_slice(
+            &serde_json::to_vec(&decoded.into_conversation_items().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let request = xai_grok_sampling_types::ConversationRequest {
+            items,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let mut wire = serde_json::to_value(
+            xai_grok_sampling_types::conversation_request_to_codex_create_response(&request),
+        )
+        .unwrap();
+        xai_grok_sampling_types::patch_response_message_metadata(
+            &mut wire,
+            &xai_grok_sampling_types::response_message_metadata(&request).unwrap(),
+        )
+        .unwrap();
+        let metadata = xai_grok_sampling_types::response_item_metadata_passthrough_for_origin(
+            &request,
+            Some(&origin),
+        )
+        .unwrap();
+        xai_grok_sampling_types::patch_response_item_metadata_passthrough(&mut wire, &metadata)
+            .unwrap();
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| (
+                    item["type"].as_str().unwrap(),
+                    item.get("id").and_then(serde_json::Value::as_str),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("reasoning", Some("rs-u0")),
+                ("function_call", Some("fc-u1")),
+                ("reasoning", Some("rs-u2")),
+                ("function_call", Some("fc-u3")),
+                ("message", Some("msg-u4")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn production_compact_request_restores_interleaved_response_order() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/v1/responses/compact",
+            axum::routing::post(move |request: axum::extract::Request| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    *sink.lock().unwrap() =
+                        Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                    axum::Json(serde_json::json!({"output": []}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let body = serde_json::json!({
+            "id": "resp-compact-order", "object": "response", "created_at": 0,
+            "model": "gpt-codex", "status": "completed",
+            "output": [
+                {"type": "reasoning", "id": "rs-c0", "summary": [],
+                 "encrypted_content": "cipher-c0", "status": "completed",
+                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-c0"}},
+                {"type": "function_call", "id": "fc-c1", "call_id": "call-c1",
+                 "name": "read_file", "arguments": "{}",
+                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-c1"}},
+                {"type": "reasoning", "id": "rs-c2", "summary": [],
+                 "encrypted_content": "cipher-c2", "status": "completed",
+                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-c2"}},
+                {"type": "function_call", "id": "fc-c3", "call_id": "call-c3",
+                 "name": "grep", "arguments": "{}",
+                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-c3"}},
+                {"type": "message", "id": "msg-c4", "role": "assistant",
+                 "status": "completed", "content": [
+                    {"type": "output_text", "text": "compact", "annotations": []}
+                 ], "internal_chat_message_metadata_passthrough": {"turn_id": "turn-c4"}}
+            ]
+        });
+        let mut decoded = deserialize_unary_response(body.to_string().as_bytes(), true).unwrap();
+        let origin = xai_grok_sampling_types::ResponseMetadataOrigin::codex(
+            xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+            "gpt-codex",
+            None,
+        )
+        .unwrap();
+        decoded.set_metadata_origin(Some(&origin));
+        let items: Vec<ConversationItem> = serde_json::from_slice(
+            &serde_json::to_vec(&decoded.into_conversation_items().unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        let config = SamplerConfig {
+            api_key: Some("test-token".into()),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-codex".into(),
+            api_backend: ApiBackend::Responses,
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Codex),
+            ..SamplerConfig::default()
+        };
+        let client = SamplingClient::new(config).unwrap();
+        client
+            .conversation_compact_responses(xai_grok_sampling_types::ConversationRequest {
+                items,
+                model: Some("gpt-codex".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let body = captured.lock().unwrap().take().unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(
+            input
+                .iter()
+                .map(|item| (
+                    item["type"].as_str().unwrap(),
+                    item.get("id").and_then(serde_json::Value::as_str),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("reasoning", Some("rs-c0")),
+                ("function_call", Some("fc-c1")),
+                ("reasoning", Some("rs-c2")),
+                ("function_call", Some("fc-c3")),
+                ("message", Some("msg-c4")),
+            ]
+        );
+        assert_eq!(input[1]["call_id"], "call-c1");
+        assert_eq!(input[3]["call_id"], "call-c3");
+        for (index, turn_id) in ["turn-c0", "turn-c1", "turn-c2", "turn-c3", "turn-c4"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                input[index]["internal_chat_message_metadata_passthrough"]["turn_id"],
+                turn_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_http_bodies_preserve_reloaded_native_user_replay_fields_on_both_endpoints() {
+        let ordinary_body = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let compact_body = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ordinary_sink = std::sync::Arc::clone(&ordinary_body);
+        let compact_sink = std::sync::Arc::clone(&compact_body);
+        let app = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |request: axum::extract::Request| {
+                    let sink = std::sync::Arc::clone(&ordinary_sink);
+                    async move {
+                        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        *sink.lock().unwrap() =
+                            Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                        axum::Json(serde_json::json!({
+                            "id": "resp-http", "object": "response", "created_at": 0,
+                            "model": "gpt-codex", "status": "completed", "output": []
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                axum::routing::post(move |request: axum::extract::Request| {
+                    let sink = std::sync::Arc::clone(&compact_sink);
+                    async move {
+                        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        *sink.lock().unwrap() =
+                            Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                        axum::Json(serde_json::json!({"output": []}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let compact_response: xai_grok_sampling_types::CodexCompactResponse =
+            serde_json::from_value(serde_json::json!({
+                "output": [
+                    {
+                        "type": "message", "id": "msg-http-a", "role": "user",
+                        "status": null, "phase": "commentary",
+                        "content": [{"type": "input_text", "text": "first retained"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-a"}
+                    },
+                    {
+                        "type": "reasoning", "id": "rs-http", "summary": [],
+                        "encrypted_content": "reasoning-http", "status": "completed",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-rs"}
+                    },
+                    {
+                        "type": "message", "id": "msg-http-b", "role": "user",
+                        "status": "completed", "phase": null,
+                        "content": [{"type": "input_text", "text": "second retained"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-b"}
+                    },
+                    {
+                        "type": "compaction", "id": "cmp-http",
+                        "encrypted_content": "compaction-http",
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-http-cmp"}
+                    }
+                ]
+            }))
+            .unwrap();
+        let converted = xai_grok_sampling_types::codex_compact_output_to_conversation(
+            compact_response.output,
+            xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-codex", None),
+        )
+        .unwrap();
+        let mut reloaded: Vec<ConversationItem> = serde_json::from_slice(
+            &serde_json::to_vec(&converted).expect("persist converted native history"),
+        )
+        .expect("cold reload converted native history");
+        reloaded.push(ConversationItem::user("ordinary local successor"));
+        let request = ConversationRequest {
+            items: reloaded,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+
+        let config = SamplerConfig {
+            api_key: Some("test-token".into()),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-codex".into(),
+            api_backend: ApiBackend::Responses,
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Codex),
+            ..SamplerConfig::default()
+        };
+        let client = SamplingClient::new(config).unwrap();
+        client
+            .conversation_responses(request.clone())
+            .await
+            .unwrap();
+        client
+            .conversation_compact_responses(request)
+            .await
+            .unwrap();
+
+        let ordinary = ordinary_body.lock().unwrap().take().unwrap();
+        let compact = compact_body.lock().unwrap().take().unwrap();
+        for (endpoint, body) in [("/responses", ordinary), ("/responses/compact", compact)] {
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input.len(), 5, "{endpoint}: {body:#}");
+            assert_eq!(input[0]["id"], "msg-http-a");
+            assert!(input[0].get("status").unwrap().is_null());
+            assert_eq!(input[0]["phase"], "commentary");
+            assert_eq!(input[1]["id"], "rs-http");
+            assert_eq!(input[2]["id"], "msg-http-b");
+            assert_eq!(input[2]["status"], "completed");
+            assert!(input[2].get("phase").unwrap().is_null());
+            assert_eq!(input[3]["id"], "cmp-http");
+            assert_eq!(input[4]["role"], "user");
+            assert!(input[4].get("status").is_none());
+            assert!(input[4].get("phase").is_none());
+            assert_eq!(
+                input[..4]
+                    .iter()
+                    .map(
+                        |item| item["internal_chat_message_metadata_passthrough"]["turn_id"]
+                            .as_str()
+                            .unwrap()
+                    )
+                    .collect::<Vec<_>>(),
+                [
+                    "turn-http-a",
+                    "turn-http-rs",
+                    "turn-http-b",
+                    "turn-http-cmp"
+                ],
+                "{endpoint} must preserve native item ordering and ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_native_user_bindings_are_rejected_before_either_http_request() {
+        let request_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&request_count);
+        let handler = move || {
+            let count = std::sync::Arc::clone(&count);
+            async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(serde_json::json!({"output": []}))
+            }
+        };
+        let app = axum::Router::new()
+            .route("/v1/responses", axum::routing::post(handler.clone()))
+            .route("/v1/responses/compact", axum::routing::post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let compact_response: xai_grok_sampling_types::CodexCompactResponse =
+            serde_json::from_value(serde_json::json!({
+                "output": [
+                    {
+                        "type": "message", "id": "msg-corrupt-a", "role": "user",
+                        "status": null,
+                        "content": [{"type": "input_text", "text": "a"}]
+                    },
+                    {
+                        "type": "message", "id": "msg-corrupt-b", "role": "user",
+                        "phase": "commentary",
+                        "content": [{"type": "input_text", "text": "b"}]
+                    },
+                    {"type": "compaction", "id": "cmp-corrupt", "encrypted_content": "opaque"}
+                ]
+            }))
+            .unwrap();
+        let valid = xai_grok_sampling_types::codex_compact_output_to_conversation(
+            compact_response.output,
+            xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-codex", None),
+        )
+        .unwrap();
+        let mut corruptions = Vec::new();
+
+        let mut removed = valid.clone();
+        let ConversationItem::User(user) = &mut removed[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = None;
+        corruptions.push(("removed", removed));
+
+        let mut mutated = valid.clone();
+        let ConversationItem::User(user) = &mut mutated[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = Some(xai_grok_sampling_types::UserMessageProviderMetadata::codex(
+            xai_grok_sampling_types::ProviderReplayField::Value(rs::OutputStatus::Completed),
+            xai_grok_sampling_types::ProviderReplayField::Missing,
+        ));
+        corruptions.push(("mutated", mutated));
+
+        let mut swapped = valid;
+        let first = match &swapped[0] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let second = match &swapped[1] {
+            ConversationItem::User(user) => user.provider_metadata.clone(),
+            _ => unreachable!(),
+        };
+        let ConversationItem::User(user) = &mut swapped[0] else {
+            unreachable!()
+        };
+        user.provider_metadata = second;
+        let ConversationItem::User(user) = &mut swapped[1] else {
+            unreachable!()
+        };
+        user.provider_metadata = first;
+        corruptions.push(("swapped", swapped));
+
+        let config = SamplerConfig {
+            api_key: Some("test-token".into()),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-codex".into(),
+            api_backend: ApiBackend::Responses,
+            provider_id: Some(xai_grok_sampling_types::ProviderId::Codex),
+            ..SamplerConfig::default()
+        };
+        let client = SamplingClient::new(config).unwrap();
+        for (name, items) in corruptions {
+            let request = ConversationRequest {
+                items,
+                model: Some("gpt-codex".into()),
+                ..Default::default()
+            };
+            for error in [
+                client
+                    .conversation_responses(request.clone())
+                    .await
+                    .unwrap_err(),
+                client
+                    .conversation_compact_responses(request.clone())
+                    .await
+                    .unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SamplingError::InvalidConfiguration(_)),
+                    "{name}: {error}"
+                );
+            }
+        }
+        assert_eq!(
+            request_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "all corruption variants must fail before transport"
+        );
+    }
+
+    #[test]
+    fn unsupported_metadata_variant_fails_closed_only_for_codex() {
+        let raw = serde_json::json!({
+            "type": "response.output_item.done", "sequence_number": 1, "output_index": 0,
+            "item": {
+                "type": "image_generation_call", "id": "ig_1", "status": "completed",
+                "result": "image", "internal_chat_message_metadata_passthrough": {"turn_id": "turn-image"}
+            }
+        })
+        .to_string();
+        let error = deserialize_response_event_with_metadata(&raw, true).unwrap_err();
+        assert!(error.to_string().contains("cannot be replayed exactly"));
+        let non_codex = deserialize_response_event_with_metadata(&raw, false).unwrap();
+        let xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(item) = non_codex
+        else {
+            panic!("expected decoded non-Codex output item")
+        };
+        assert!(item.internal_chat_message_metadata_passthrough.is_none());
     }
 
     #[test]

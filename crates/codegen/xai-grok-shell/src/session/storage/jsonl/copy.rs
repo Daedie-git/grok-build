@@ -195,6 +195,15 @@ impl<'a> UpdateLineWriter<'a> {
             && let crate::extensions::notification::SessionUpdate::CompactionCheckpoint(info) =
                 &notification.update
         {
+            let expected = format!("compaction_checkpoints/{}.json", info.checkpoint_id);
+            if info.checkpoint_file != expected {
+                tracing::warn!(
+                    checkpoint_file = %info.checkpoint_file,
+                    checkpoint_id = %info.checkpoint_id,
+                    "skipping compaction checkpoint update with an unexpected path during copy"
+                );
+                return Ok(());
+            }
             self.copied
                 .checkpoint_files
                 .insert(info.checkpoint_file.clone());
@@ -292,10 +301,10 @@ impl JsonlStorageAdapter {
         let target_dir = self.create_session_dir_owner_only(target_info)?;
 
         let source_summary = self.read_summary_sync(source_info)?;
-        let chat_format_version = source_summary.chat_format_version;
-
-        let mut chat_to_copy: Vec<ConversationItem> =
-            self.read_chat_history_sync(self.chat_file(source_info), chat_format_version)?;
+        let mut chat_to_copy = match options.source_chat_history.clone() {
+            Some(snapshot) => snapshot,
+            None => self.load_authoritative_chat_history_for_copy(source_info)?,
+        };
 
         if let Some(target_idx) = options.target_prompt_index {
             // +1: the cut keeps the target prompt inclusive.

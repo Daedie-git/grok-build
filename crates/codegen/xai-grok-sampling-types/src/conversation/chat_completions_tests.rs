@@ -218,6 +218,7 @@ fn test_assistant_with_content_and_tool_calls() {
     // Assistant can have both text content and tool calls
     let assistant = AssistantItem {
         content: "Let me help you with that.".into(),
+        response_item_id: None,
         tool_calls: vec![ToolCall {
             id: "call_1".into(),
             name: "read_file".to_string(),

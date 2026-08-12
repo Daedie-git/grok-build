@@ -75,6 +75,7 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         // Completed turn with thinking
         ConversationItem::Assistant(AssistantItem {
             content: "I'll look at the code.".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
             model_fingerprint: None,
@@ -83,6 +84,7 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         // Completed tool pair
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "read_file".to_string(),
@@ -95,6 +97,7 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         ConversationItem::tool_result("call_1", "fn main() {}"),
         ConversationItem::Assistant(AssistantItem {
             content: "I see the issue.".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("messages-compatible-model".into()),
             model_fingerprint: None,
@@ -103,6 +106,7 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
         // Mid-turn: orphaned tool_use (no result yet)
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_2".into(),
                 name: "search_replace".to_string(),
@@ -118,6 +122,7 @@ pub(super) fn btw_mid_turn_conversation() -> Vec<ConversationItem> {
 pub(super) fn assistant_with_calls(calls: &[(&str, &str)]) -> ConversationItem {
     ConversationItem::Assistant(AssistantItem {
         content: String::new().into(),
+        response_item_id: None,
         tool_calls: calls
             .iter()
             .map(|(id, name)| ToolCall {

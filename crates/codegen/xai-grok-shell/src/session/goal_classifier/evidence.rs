@@ -1132,6 +1132,7 @@ mod tests {
     fn assistant(text: &str) -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: text.into(),
+            response_item_id: None,
             tool_calls: Vec::new(),
             model_id: None,
             model_fingerprint: None,
@@ -1142,6 +1143,7 @@ mod tests {
     fn assistant_tool_call_only() -> ConversationItem {
         ConversationItem::Assistant(AssistantItem {
             content: "".into(),
+            response_item_id: None,
             tool_calls: vec![xai_grok_sampling_types::ToolCall {
                 id: "call_1".into(),
                 name: "read_file".to_string(),
@@ -1156,6 +1158,7 @@ mod tests {
     fn user(text: &str) -> ConversationItem {
         ConversationItem::User(UserItem {
             content: vec![xai_grok_sampling_types::ContentPart::Text { text: text.into() }],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         })

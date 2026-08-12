@@ -31,7 +31,7 @@ use std::sync::Arc;
 use xai_grok_session_events::EventWriter;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    SubagentCompactionPolicy, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 
 // Constants
@@ -199,6 +199,7 @@ impl ChannelSpawner {
             runtime_overrides: SubagentRuntimeOverrides {
                 model,
                 harness_agent_type,
+                compaction_policy: SubagentCompactionPolicy::FinalizeAfterOneCompaction,
                 ..Default::default()
             },
             run_in_background: false,

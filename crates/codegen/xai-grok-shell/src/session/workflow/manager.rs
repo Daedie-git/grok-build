@@ -1495,6 +1495,10 @@ mod tests {
         );
         assert!(req.resume_from.is_none());
         assert_eq!(req.runtime_overrides.output_token_budget, None);
+        assert_eq!(
+            req.runtime_overrides.compaction_policy,
+            xai_grok_tools::implementations::grok_build::task::types::SubagentCompactionPolicy::FinalizeAfterOneCompaction,
+        );
         let first_id = req.id.clone();
         let _ = req.result_tx.send(SubagentResult {
             success: true,

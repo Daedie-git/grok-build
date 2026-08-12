@@ -2300,10 +2300,11 @@ async fn agent_rebuild_republishes_the_configured_cutoff() {
             };
             let mut seeded = xai_grok_agent::AgentDefinition::default_grok_build();
             seeded.tool_overrides = Some(seed.clone());
-            actor
-                .handle_rebuild_agent_for_definition(seeded)
+            let prepared = actor
+                .prepare_agent_rebuild(seeded)
                 .await
-                .expect("zero-turn rebuild should succeed");
+                .expect("zero-turn rebuild should prepare");
+            actor.install_prepared_agent_rebuild(prepared).await;
             assert_eq!(
                 actor
                     .resolved_tool_overrides
@@ -2314,12 +2315,11 @@ async fn agent_rebuild_republishes_the_configured_cutoff() {
             );
 
             // Rebuilding to a seedless definition must clear the cell; a stale bound is a divergence.
-            actor
-                .handle_rebuild_agent_for_definition(
-                    xai_grok_agent::AgentDefinition::default_grok_build(),
-                )
+            let prepared = actor
+                .prepare_agent_rebuild(xai_grok_agent::AgentDefinition::default_grok_build())
                 .await
-                .expect("second rebuild should succeed");
+                .expect("second rebuild should prepare");
+            actor.install_prepared_agent_rebuild(prepared).await;
             assert!(
                 actor.resolved_tool_overrides.load().is_none(),
                 "rebuild to a seedless definition must not leave a stale cutoff",

@@ -1,4 +1,4 @@
-use super::support::create_test_actor;
+use super::support::{create_test_actor, successful_rewind_persistence};
 
 use crate::extensions::notification::{
     CompactionCheckpointFile, CompactionCheckpointInfo, SessionNotification as XaiNotification,
@@ -101,7 +101,7 @@ async fn rewind_pre_compaction_with_cancelled_turns_truncates_context_gb2961() {
 
 async fn run_rewind_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()
@@ -176,7 +176,7 @@ async fn files_only_rewind_is_exempt_from_chat_state_bound() {
 
 async fn run_files_only_bound_scenario() {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -246,7 +246,7 @@ async fn run_file_counts_scenario() {
     use std::path::Path;
 
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let cwd = Path::new("/tmp");
@@ -283,7 +283,7 @@ async fn rewind_before_compaction_clears_stale_compaction_marker() {
 async fn run_clears_marker_scenario() {
     use xai_grok_sampling_types::CompactionsRemaining;
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()
@@ -372,7 +372,7 @@ async fn run_forked_rewind_scenario() {
     use crate::session::storage::{JsonlStorageAdapter, StorageAdapter};
 
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let mut actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let unique = std::time::SystemTime::now()

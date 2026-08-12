@@ -14,7 +14,7 @@ use std::sync::Arc;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_sampler::{AuthScheme, SamplerConfig};
 use xai_grok_sampling_types::{
-    CompactionAtTokens, CompactionsRemaining, REASONING_EFFORT_META_KEY,
+    CompactionAtTokens, CompactionsRemaining, ProviderId, REASONING_EFFORT_META_KEY,
     REASONING_EFFORTS_META_KEY, ReasoningEffort, ReasoningEffortOption,
     reasoning_effort_meta_value, reasoning_efforts_meta_value,
 };
@@ -3495,8 +3495,26 @@ pub(crate) fn resolve_model_list(
     if let Some(mut prefetched) = prefetched {
         tracing::debug!(count = prefetched.len(), "loaded prefetched models");
         let default_cw = DEFAULT_CONTEXT_WINDOW;
-        for (key, entry) in prefetched.iter_mut() {
-            let donor = resolved.get(key);
+        // The xAI catalog is authoritative for xAI-hosted models, but it does
+        // not know about locally authenticated provider catalogs such as the
+        // ChatGPT Codex subscription. Retain only those provider-owned
+        // built-ins; stale xAI defaults must still be pruned by a refresh.
+        let local_provider_defaults = resolved
+            .iter()
+            .filter(|(_, entry)| {
+                xai_grok_sampling_types::resolve_provider(
+                    entry.info.provider_id,
+                    entry.info.api_backend.clone(),
+                    &entry.info.base_url,
+                )
+                .capabilities()
+                .uses_chatgpt_auth()
+            })
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect::<IndexMap<_, _>>();
+        let mut refreshed = IndexMap::new();
+        for (key, mut entry) in prefetched.drain(..) {
+            let donor = resolved.get(&key);
             if let Some(donor) = donor {
                 if entry.info.context_window.get() == default_cw
                     && donor.info.context_window.get() != default_cw
@@ -3517,12 +3535,28 @@ pub(crate) fn resolve_model_list(
                 if entry.info.api_backend == ApiBackend::default() {
                     entry.info.api_backend.clone_from(&donor.info.api_backend);
                 }
-            }
-            if resolved.contains_key(key) {
+                // Preserve per-model compact threshold from built-ins when remote
+                // omits it (e.g. Codex models keep effective_context_window_percent).
+                if entry.info.auto_compact_threshold_percent.is_none()
+                    && donor.info.auto_compact_threshold_percent.is_some()
+                {
+                    entry.info.auto_compact_threshold_percent =
+                        donor.info.auto_compact_threshold_percent;
+                }
+                if entry.info.auto_compact_token_limit.is_none() {
+                    entry.info.auto_compact_token_limit = donor.info.auto_compact_token_limit;
+                }
+                if entry.info.max_retries.is_none() {
+                    entry.info.max_retries = donor.info.max_retries;
+                }
                 tracing::debug!(model_key = %key, "prefetched model overriding default");
             }
+            refreshed.insert(key, entry);
         }
-        resolved = prefetched;
+        for (key, entry) in local_provider_defaults {
+            refreshed.entry(key).or_insert(entry);
+        }
+        resolved = refreshed;
     }
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
@@ -3738,9 +3772,11 @@ struct DefaultModelJson {
     top_p: Option<f32>,
     max_completion_tokens: Option<u32>,
     api_backend: ApiBackend,
+    provider_id: Option<ProviderId>,
     #[serde(default = "default_agent_type")]
     agent_type: String,
     inference_idle_timeout_secs: Option<u64>,
+    max_retries: Option<u32>,
     hidden: bool,
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
@@ -3761,7 +3797,12 @@ struct DefaultModelJson {
     #[serde(default)]
     auto_compact_threshold_percent: Option<u8>,
     #[serde(default)]
+    auto_compact_token_limit: Option<NonZeroU64>,
+    #[serde(default)]
     system_prompt_label: Option<String>,
+    /// Optional inference base URL override (e.g. Codex backend).
+    #[serde(default)]
+    base_url: Option<String>,
 }
 fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryConfig> {
     let root: serde_json::Value = serde_json::from_str(crate::models::DEFAULT_MODELS_JSON)
@@ -3788,24 +3829,41 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
             let context_window = m
                 .context_window
                 .unwrap_or_else(|| NonZeroU64::new(200_000).expect("200000 is non-zero"));
+            let base_url = m
+                .base_url
+                .clone()
+                .unwrap_or_else(|| endpoints.resolve_inference_base_url());
+            let provider = xai_grok_sampling_types::resolve_provider(
+                m.provider_id,
+                m.api_backend.clone(),
+                &base_url,
+            );
+            let clear_xai_api_base_url = provider.capabilities().clears_xai_api_base_url();
+            let api_base_url = if clear_xai_api_base_url {
+                None
+            } else {
+                Some(endpoints.xai_api_base_url.clone())
+            };
             let config = ModelEntryConfig {
                 id: m.id,
                 model: m.model,
-                base_url: endpoints.resolve_inference_base_url(),
-                api_base_url: Some(endpoints.xai_api_base_url.clone()),
+                base_url,
+                api_base_url,
                 name: m.name,
                 description: m.description,
                 context_window,
                 auto_compact_threshold_percent: m.auto_compact_threshold_percent,
+                auto_compact_token_limit: m.auto_compact_token_limit,
                 system_prompt_label: m.system_prompt_label,
                 temperature: m.temperature,
                 top_p: m.top_p,
                 max_completion_tokens: m.max_completion_tokens,
                 api_backend: m.api_backend,
+                provider_id: m.provider_id,
                 auth_scheme: None,
                 agent_type: m.agent_type,
                 inference_idle_timeout_secs: m.inference_idle_timeout_secs,
-                max_retries: None,
+                max_retries: m.max_retries,
                 api_key: None,
                 env_key: None,
                 extra_headers: IndexMap::new(),
@@ -3819,7 +3877,11 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compactions_remaining: m.compactions_remaining,
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
-                stream_tool_calls: None,
+                stream_tool_calls: if clear_xai_api_base_url {
+                    Some(false)
+                } else {
+                    None
+                },
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
             (key, config)
@@ -3861,6 +3923,8 @@ pub struct ModelEntryConfig {
     #[serde(default)]
     pub api_backend: ApiBackend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -3886,6 +3950,10 @@ pub struct ModelEntryConfig {
     /// > remote per-model (this field) > remote global > 85.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Absolute provider safety limit for automatic compaction. Codex clamps
+    /// this to at most 90% of `context_window`; non-Codex models ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<NonZeroU64>,
     /// Per-model system-prompt identity label (not UI `name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_label: Option<String>,
@@ -3980,6 +4048,7 @@ pub struct ConfigModelOverride {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: Option<ApiBackend>,
+    pub provider_id: Option<ProviderId>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
@@ -4046,6 +4115,9 @@ impl ConfigModelOverride {
         }
         if let Some(ref v) = self.api_backend {
             entry.info.api_backend = v.clone();
+        }
+        if let Some(provider_id) = self.provider_id {
+            entry.info.provider_id = Some(provider_id);
         }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
@@ -4145,6 +4217,8 @@ pub struct ModelInfo {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     pub auth_scheme: AuthScheme,
     pub extra_headers: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -4155,6 +4229,10 @@ pub struct ModelInfo {
     /// Per-model auto-compact threshold (0-100). `None` defers to the
     /// global / default tiers in `resolve_auto_compact_threshold_percent`.
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Absolute provider auto-compaction safety limit. Enforced only for the
+    /// resolved Codex backend; other providers retain percentage semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<NonZeroU64>,
     /// Per-model system-prompt identity (not UI picker `name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_label: Option<String>,
@@ -4214,12 +4292,14 @@ impl ModelInfo {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
             use_concise: false,
             agent_type: default_agent_type(),
@@ -4251,12 +4331,14 @@ impl ModelInfo {
             temperature: entry.temperature,
             top_p: entry.top_p,
             api_backend: entry.api_backend.clone(),
+            provider_id: entry.provider_id,
             auth_scheme: entry.auth_scheme.unwrap_or_default(),
             extra_headers: entry.extra_headers.clone(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: entry.context_window,
             auto_compact_threshold_percent: entry.auto_compact_threshold_percent,
+            auto_compact_token_limit: entry.auto_compact_token_limit,
             system_prompt_label: entry.system_prompt_label.clone(),
             use_concise: entry.use_concise,
             agent_type: entry.agent_type.clone(),
@@ -4741,11 +4823,14 @@ pub struct Features {
     pub mcp_recursive_config_watch: Option<bool>,
 }
 /// Resolved credentials for a model session.
-pub(crate) struct ResolvedCredentials {
+#[derive(Clone, Debug)]
+pub struct ResolvedCredentials {
     pub api_key: Option<String>,
     pub base_url: String,
     pub auth_type: xai_chat_state::AuthType,
     pub auth_scheme: AuthScheme,
+    /// Extra headers (e.g. `ChatGPT-Account-ID` for Codex).
+    pub extra_headers: IndexMap<String, String>,
 }
 /// First usable BYOK credential: a non-empty (trimmed) api_key, else the first
 /// set, non-empty env_key value. Single source of truth for has_own_credentials,
@@ -4759,13 +4844,19 @@ pub(crate) fn first_own_credential(
         .map(str::to_owned)
         .or_else(|| env_key.and_then(EnvKeys::resolve_value))
 }
-/// Priority: model api_key/env_key > cached auth-provider token > session
-/// token > XAI_API_KEY.
-pub(crate) fn resolve_credentials(
-    model: &ModelEntry,
-    session_key: Option<&str>,
-) -> ResolvedCredentials {
+/// Priority: model api_key/env_key > cached auth-provider token >
+/// Codex ChatGPT auth (only at the canonical Codex destination) > session
+/// token > XAI_API_KEY. Explicit Codex proxies must configure their own
+/// credential; first-party ChatGPT and Grok session credentials are never
+/// discovered for them automatically.
+pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> ResolvedCredentials {
     let info = model.info();
+    let provider = xai_grok_sampling_types::resolve_provider(
+        info.provider_id,
+        info.api_backend.clone(),
+        &info.base_url,
+    );
+    let mut extra_headers = IndexMap::new();
     let (api_key, base_url, auth_type) = if let Some(key) = model.own_credential() {
         (
             Some(key),
@@ -4776,6 +4867,59 @@ pub(crate) fn resolve_credentials(
         debug_assert!(model.effective_auth_provider().is_some());
         (
             provider.cached_token(),
+            info.base_url.clone(),
+            xai_chat_state::AuthType::ApiKey,
+        )
+    } else if provider.capabilities().uses_chatgpt_auth() {
+        if !xai_grok_sampling_types::is_codex_backend_url(&info.base_url) {
+            tracing::warn!(
+                model = %info.model,
+                base_url = %info.base_url,
+                "explicit Codex proxy has no configured credential; refusing to attach first-party session credentials"
+            );
+            (
+                None,
+                info.base_url.clone(),
+                xai_chat_state::AuthType::ApiKey,
+            )
+        } else {
+            match crate::auth::load_codex_credentials(&crate::auth::codex_auth_path()) {
+                Ok(creds) => {
+                    if let Some(aid) = creds.account_id {
+                        extra_headers.insert(
+                            xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                            aid,
+                        );
+                    }
+                    (
+                        Some(creds.access_token),
+                        info.base_url.clone(),
+                        xai_chat_state::AuthType::ApiKey,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %info.model,
+                        error = %e,
+                        "Codex model selected but ChatGPT credentials are unavailable; \
+                         run `grok login --codex` or `codex login`"
+                    );
+                    (
+                        None,
+                        info.base_url.clone(),
+                        xai_chat_state::AuthType::ApiKey,
+                    )
+                }
+            }
+        }
+    } else if xai_grok_sampling_types::is_codex_backend_url(&info.base_url) {
+        tracing::warn!(
+            model = %info.model,
+            provider_id = ?info.provider_id,
+            "non-Codex provider targets the Codex backend; refusing to attach first-party session credentials"
+        );
+        (
+            None,
             info.base_url.clone(),
             xai_chat_state::AuthType::ApiKey,
         )
@@ -4819,6 +4963,7 @@ pub(crate) fn resolve_credentials(
         base_url,
         auth_type,
         auth_scheme,
+        extra_headers,
     }
 }
 /// `disable_api_key_auth` at the credential seam: swap a first-party xAI API
@@ -4926,6 +5071,21 @@ fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
         ModelLookup::Loaded(Some(e)) if e.has_own_credentials() => ModelByok::Byok,
+        // Codex catalog entries have no static api_key/env_key; credentials
+        // come from ~/.codex/auth.json at resolve time. Still treat them as
+        // BYOK so the session OIDC bearer resolver cannot overwrite ChatGPT
+        // tokens on chatgpt.com/backend-api/codex.
+        ModelLookup::Loaded(Some(e))
+            if xai_grok_sampling_types::resolve_provider(
+                e.info.provider_id,
+                e.info.api_backend.clone(),
+                &e.info.base_url,
+            )
+            .capabilities()
+            .uses_chatgpt_auth() =>
+        {
+            ModelByok::Byok
+        }
         ModelLookup::Loaded(_) => ModelByok::NotByok,
     }
 }
@@ -5007,12 +5167,14 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 temperature: None,
                 top_p: None,
                 api_backend: ApiBackend::Responses,
+                provider_id: Some(ProviderId::Xai),
                 auth_scheme: Default::default(),
                 extra_headers: IndexMap::new(),
                 query_params: IndexMap::new(),
                 env_http_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
                 auto_compact_threshold_percent: None,
+                auto_compact_token_limit: None,
                 system_prompt_label: None,
                 use_concise: false,
                 agent_type: default_agent_type(),
@@ -5147,6 +5309,9 @@ pub(crate) fn sampling_config_for_model(
     let temperature = info.temperature;
     let top_p = info.top_p;
     let mut extra_headers = info.extra_headers.clone();
+    for (k, v) in credentials.extra_headers {
+        extra_headers.entry(k).or_insert(v);
+    }
     inject_url_derived_headers(
         &mut extra_headers,
         alpha_test_key.as_deref(),
@@ -5158,6 +5323,18 @@ pub(crate) fn sampling_config_for_model(
         &api_backend,
         &credentials.base_url,
     );
+    let provider = xai_grok_sampling_types::resolve_provider(
+        info.provider_id,
+        api_backend.clone(),
+        &info.base_url,
+    );
+    let compaction_at_tokens = if provider.capabilities().enforces_auto_compact_safety() {
+        info.auto_compact_token_limit
+            .map(|limit| CompactionAtTokens::Fixed(limit.get()))
+            .or(info.compaction_at_tokens)
+    } else {
+        info.compaction_at_tokens
+    };
     SamplerConfig {
         api_key: credentials.api_key,
         model: model_name,
@@ -5166,6 +5343,7 @@ pub(crate) fn sampling_config_for_model(
         temperature,
         top_p,
         api_backend,
+        provider_id: provider.provider_id(),
         auth_scheme: credentials.auth_scheme,
         extra_headers,
         extra_response_includes,
@@ -5186,7 +5364,7 @@ pub(crate) fn sampling_config_for_model(
         bearer_resolver: None,
         supports_backend_search: info.supports_backend_search,
         compactions_remaining: info.compactions_remaining,
-        compaction_at_tokens: info.compaction_at_tokens,
+        compaction_at_tokens,
         doom_loop_recovery: None,
         header_injector: None,
     }
@@ -5242,12 +5420,14 @@ fn resolve_hidden_default_web_search_sampling_config(
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::Responses,
+            provider_id: Some(ProviderId::Xai),
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
             use_concise: false,
             agent_type: default_agent_type(),
@@ -5346,6 +5526,29 @@ pub(crate) fn to_acp_model_info(
                     "agentType".to_string(),
                     serde_json::Value::String(info.agent_type.clone()),
                 );
+                let provider = xai_grok_sampling_types::resolve_provider(
+                    info.provider_id,
+                    info.api_backend.clone(),
+                    &info.base_url,
+                );
+                if let Some(provider_id) = provider.provider_id() {
+                    let provider_id = match provider_id {
+                        ProviderId::Xai => "xai",
+                        ProviderId::Codex => "codex",
+                        ProviderId::OpenAiCompatible => "open_ai_compatible",
+                        ProviderId::Custom => "custom",
+                    };
+                    map.insert(
+                        "providerId".to_string(),
+                        serde_json::Value::String(provider_id.to_string()),
+                    );
+                }
+                if provider.provider_id() == Some(ProviderId::Codex) {
+                    map.insert(
+                        "providerKind".to_string(),
+                        serde_json::Value::String("codex".to_string()),
+                    );
+                }
                 if info.supports_reasoning_effort {
                     map.insert(
                         "supportsReasoningEffort".to_string(),
@@ -5381,7 +5584,7 @@ pub(crate) fn to_acp_model_info(
 /// Error code for model switch rejection due to agent type mismatch.
 pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGENT";
 /// Error code for model switch failure during the zero-turn full harness
-/// rebuild path. Emitted when `RebuildAgentForDefinition` fails (definition
+/// rebuild path. Emitted when candidate harness preparation fails (definition
 /// could not be resolved at handler time, `AgentBuilder::build()` errored,
 /// or a turn started racing the rebuild).
 pub const MODEL_SWITCH_REBUILD_FAILED: &str = "MODEL_SWITCH_REBUILD_FAILED";

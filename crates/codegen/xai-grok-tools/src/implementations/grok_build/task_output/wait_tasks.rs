@@ -10,7 +10,8 @@
 use crate::DEFAULT_TOOL_OUTPUT_BYTES;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task_output::{
-    MAX_MULTI_WAIT_IDS, TaskOutputTool, WaitHint, resolve_tasks, wait_any_event_driven,
+    MAX_MULTI_WAIT_IDS, TaskOutputTool, completed_wait_hint, render_waited_results,
+    requested_wait_timeout, resolve_tasks_until_any_terminal, wait_any_event_driven,
 };
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{Terminal, TruncationCfg};
@@ -169,10 +170,7 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
         }
 
         // wait_any: keep legacy event-driven path (not exposed on get_task_output).
-        let requested = input
-            .timeout_ms
-            .map(std::time::Duration::from_millis)
-            .unwrap_or(super::DEFAULT_WAIT_TIMEOUT);
+        let requested = requested_wait_timeout(input.timeout_ms);
         let timeout = crate::implementations::grok_build::task_output::capped_wait_timeout(
             input.timeout_ms,
             crate::implementations::grok_build::task_output::max_wait_block(),
@@ -198,40 +196,42 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
             (terminal, backend, rfn, mob)
         };
 
-        let initial = resolve_tasks(
+        let deadline = tokio::time::Instant::now() + timeout;
+        let initial = resolve_tasks_until_any_terminal(
             &input.task_ids,
             &terminal,
             &backend,
             &read_file_name,
             max_output_bytes,
-            WaitHint::NotRequested,
+            deadline,
         )
         .await;
 
         let has_pending =
             !initial.pending_bash_ids.is_empty() || !initial.pending_subagent_ids.is_empty();
+        let already_completed = initial
+            .results
+            .iter()
+            .any(|result| super::is_terminal_status(&result.status));
 
-        let results = if has_pending {
-            let deadline = tokio::time::Instant::now() + timeout;
-            let wait_hint = wait_any_event_driven(
+        let results = if has_pending && !already_completed {
+            let waited = wait_any_event_driven(
                 &terminal,
                 &backend,
                 &initial.pending_bash_ids,
                 &initial.pending_subagent_ids,
                 deadline,
             )
-            .await
-            .hint(requested, timeout);
-            resolve_tasks(
+            .await;
+            let wait_hint = completed_wait_hint(deadline, requested, timeout);
+            render_waited_results(
                 &input.task_ids,
-                &terminal,
-                &backend,
                 &read_file_name,
                 max_output_bytes,
+                initial.results,
+                &waited,
                 wait_hint,
             )
-            .await
-            .results
         } else {
             initial.results
         };

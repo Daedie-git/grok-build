@@ -39,6 +39,7 @@ async fn create_test_actor(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -54,6 +55,7 @@ async fn create_test_actor(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -119,12 +121,15 @@ async fn create_test_actor(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
@@ -307,6 +312,63 @@ async fn test_check_auto_compact_needed_uses_state() {
         })
         .await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn codex_safety_gate_triggers_at_cli_limit_despite_suppression() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(244_800, 272_000, 99, gateway_tx, persistence_tx).await;
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.compaction_at_tokens.set(Some(
+                xai_grok_sampling_types::CompactionAtTokens::Fixed(244_800),
+            ));
+            actor.compaction.auto_compact_suppressed.store(
+                crate::session::compaction_config::SUPPRESS_STICKY,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            let info = actor
+                .check_codex_auto_compact_needed()
+                .await
+                .expect("Codex hard gate must ignore generic suppression");
+            assert_eq!(info.tokens_used, 244_800);
+            assert_eq!(info.context_window, 272_000);
+            assert_eq!(info.percentage, 90);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn codex_safety_gate_stays_inactive_below_cli_limit() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(244_799, 272_000, 90, gateway_tx, persistence_tx).await;
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor.compaction_at_tokens.set(Some(
+                xai_grok_sampling_types::CompactionAtTokens::Fixed(244_800),
+            ));
+            assert!(actor.check_codex_auto_compact_needed().await.is_none());
+        })
+        .await;
+}
+
 /// Test that overriding context_window on the sampling config changes
 /// auto-compact behavior. This validates the A/B fork fix: forked sessions
 /// must use the new model's context window, not the source session's.
@@ -488,6 +550,7 @@ async fn create_test_actor_with_memory(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -503,6 +566,7 @@ async fn create_test_actor_with_memory(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -569,12 +633,15 @@ async fn create_test_actor_with_memory(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
@@ -1266,6 +1333,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
+                consumed_completion_tombstones: VecDeque::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
@@ -1281,6 +1349,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -1364,12 +1433,15 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+                    bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
                     tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
+                    reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {

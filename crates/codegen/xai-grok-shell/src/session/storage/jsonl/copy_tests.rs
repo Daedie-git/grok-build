@@ -40,6 +40,8 @@ fn fork_rewind_marker(session_id: &str, target_prompt_index: usize) -> SessionUp
         session_id: acp::SessionId::new(session_id),
         update: XaiSessionUpdateType::RewindMarker {
             target_prompt_index,
+            transaction_id: None,
+            rewound_history_json: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
         meta: None,
@@ -50,6 +52,107 @@ fn chat_user(text: &str, prompt_index: usize) -> ConversationItem {
     let mut item = ConversationItem::user(text);
     item.set_prompt_index(prompt_index);
     item
+}
+
+#[tokio::test]
+async fn copy_uses_supplied_authoritative_chat_snapshot() {
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("snapshot-source"),
+        cwd: "/source".to_string(),
+    };
+    let target = Info {
+        id: acp::SessionId::new("snapshot-target"),
+        cwd: "/source".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source, &[ConversationItem::system("stale cache")])
+        .await
+        .unwrap();
+
+    let authoritative = vec![
+        ConversationItem::system("authoritative system"),
+        ConversationItem::user("kept prompt"),
+        ConversationItem::assistant("kept answer"),
+    ];
+    adapter
+        .copy_session_data(
+            &source,
+            &target,
+            CopySessionOptions {
+                source_chat_history: Some(authoritative.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let copied = adapter.load_session(&target).await.unwrap().chat_history;
+    assert_eq!(
+        serde_json::to_value(copied).unwrap(),
+        serde_json::to_value(authoritative).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn copy_uses_committed_rewind_instead_of_stale_chat_cache() {
+    use crate::extensions::notification::{
+        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("rewind-copy-source"),
+        cwd: "/source".to_string(),
+    };
+    let target = Info {
+        id: acp::SessionId::new("rewind-copy-target"),
+        cwd: "/source".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source, &[ConversationItem::system("stale cache")])
+        .await
+        .unwrap();
+
+    let rewound = vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept prompt"),
+        ConversationItem::assistant("kept answer"),
+    ];
+    let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+        session_id: source.id.clone(),
+        update: XaiSessionUpdate::RewindMarker {
+            target_prompt_index: 1,
+            transaction_id: Some("rewind-copy".into()),
+            rewound_history_json: Some(serde_json::to_string(&rewound).unwrap()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        },
+        meta: None,
+    }));
+    adapter
+        .append_update_durable_commit_aware(&source, &marker)
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(&source, &target, CopySessionOptions::default())
+        .await
+        .unwrap();
+    let copied = adapter.load_session(&target).await.unwrap().chat_history;
+    assert_eq!(
+        serde_json::to_value(copied).unwrap(),
+        serde_json::to_value(rewound).unwrap()
+    );
 }
 
 /// Fork truncation targets the live branch (dead-branch runs from a
@@ -699,16 +802,11 @@ async fn checkpoint_record_with_non_checkpoint_path_is_not_copied() {
         .unwrap();
 
     assert_eq!(result.compaction_checkpoints_copied, 0);
-    // The target updates must keep the transformed record (session id
-    // rewritten to the fork), not the source file's raw bytes.
+    assert_eq!(result.updates_copied, 0);
+    // A forged path would make the target unloadable and could address an
+    // unrelated target file, so the record itself must not survive the copy.
     let loaded = adapter.load_session(&target_info).await.unwrap();
-    assert_eq!(loaded.updates.len(), 1);
-    match &loaded.updates[0] {
-        SessionUpdate::Xai(notification) => {
-            assert_eq!(notification.session_id.0.as_ref(), "ckpt-dst");
-        }
-        other => panic!("Expected Xai update, got {other:?}"),
-    }
+    assert!(loaded.updates.is_empty());
 }
 
 #[cfg(unix)]

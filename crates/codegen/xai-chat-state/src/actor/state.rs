@@ -94,6 +94,10 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
             let enc_bytes = r.encrypted_content.as_deref().map(str::len).unwrap_or(0);
             ((text_bytes + enc_bytes) as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
+        ConversationItem::Provider(provider) => provider
+            .as_encrypted_compaction()
+            .map(|item| xai_token_estimation::estimate_tokens(&item.encrypted_content))
+            .unwrap_or(0),
     }
 }
 
@@ -180,6 +184,9 @@ pub(crate) struct ChatState {
     /// Cleared on `TakeTurnMessages` (consumed), `BeginTurnCapture` (new turn),
     /// and `TruncateToPromptIndex` (rewind abandons the turn).
     pub(super) turn_capture: Option<TurnCaptureState>,
+    /// Process-local routing state. Replaced by `BeginTurnRoutingScope` before
+    /// every prompt turn and never serialized into conversation history.
+    pub turn_routing_state: xai_grok_sampling_types::TurnRoutingState,
     /// Accumulator for the in-progress harness-subagent trace phase (the goal
     /// planner at `setup_goal`, or one verifier skeptic panel). Synthetic
     /// `task` pairs recorded via `AppendHarnessTraceItems` land here;
@@ -262,6 +269,7 @@ impl ChatState {
             prompt_usage: None,
             session_usage: UsageLedger::default(),
             turn_capture: None,
+            turn_routing_state: xai_grok_sampling_types::TurnRoutingState::fresh(),
             harness_trace_buffer: Vec::new(),
             harness_trace_turns: Vec::new(),
         }
@@ -291,6 +299,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

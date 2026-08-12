@@ -41,6 +41,8 @@ fn rewind_marker(target: usize) -> SessionUpdate {
         session_id: acp::SessionId::new("s1"),
         update: XaiSessionUpdate::RewindMarker {
             target_prompt_index: target,
+            transaction_id: None,
+            rewound_history_json: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
         },
         meta: None,

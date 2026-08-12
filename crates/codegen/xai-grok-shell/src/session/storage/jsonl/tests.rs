@@ -694,6 +694,8 @@ async fn test_subagent_spawned_resumed_roundtrip() {
     }
 }
 #[tokio::test]
+
+
 async fn test_load_prompts_only() {
     let temp_dir = TempDir::new().unwrap();
     let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
@@ -867,6 +869,8 @@ async fn test_load_prompts_only_applies_rewind_truncation() {
         session_id: info.id.clone(),
         update: XaiSessionUpdate::RewindMarker {
             target_prompt_index: 1,
+            transaction_id: None,
+            rewound_history_json: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
         },
         meta: None,
@@ -1126,6 +1130,8 @@ async fn summary_provenance_defaults_to_none() {
     assert!(loaded.summary.fork_parent_prompt_id.is_none());
 }
 #[tokio::test]
+
+
 async fn init_session_stamps_configured_profile_on_new_session() {
     let tmp = TempDir::new().unwrap();
     let adapter = JsonlStorageAdapter::with_root(tmp.path().to_path_buf());
@@ -1140,6 +1146,8 @@ async fn init_session_stamps_configured_profile_on_new_session() {
     let on_disk = adapter.read_summary_sync(&info).unwrap();
     assert_eq!(on_disk.sandbox_profile, expected);
 }
+
+
 /// Create a minimal on-disk session directory with a summary.json.
 /// Returns the path to the session directory.
 fn write_test_summary(
@@ -1726,6 +1734,7 @@ fn read_chat_history_upgrades_raw_output_parallel_tco_reasoning() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
         })
         .collect();
@@ -1787,6 +1796,7 @@ fn read_chat_history_handles_hybrid_legacy_and_post_pr_lines() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
         })
         .collect();
@@ -1862,11 +1872,38 @@ fn read_chat_history_is_idempotent_on_post_pr_sessions() {
             ConversationItem::Assistant(_) => "assistant",
             ConversationItem::ToolResult(_) => "tool_result",
             ConversationItem::BackendToolCall(_) => "backend_tool_call",
+            ConversationItem::Provider(_) => "provider",
             ConversationItem::Reasoning(_) => "reasoning",
         })
         .collect();
     assert_eq!(kinds, vec!["system", "user", "reasoning", "assistant"]);
 }
+
+/// Provider-authored compaction rows are durable opaque history. The JSONL
+/// loader must preserve both item identity and ciphertext for resume/rewind.
+#[test]
+fn read_chat_history_preserves_native_compaction_item() {
+    let items = load_lines(&[
+        r#"{"type":"system","content":"sys"}"#,
+        r#"{"type":"user","content":[{"type":"text","text":"q"}],"response_item_id":"msg_persisted"}"#,
+        r#"{"type":"compaction","id":"cmp_persisted","encrypted_content":"opaque-native-context"}"#,
+    ]);
+    assert_eq!(items.len(), 3);
+    assert!(matches!(
+        &items[1],
+        ConversationItem::User(user)
+            if user.response_item_id.as_deref() == Some("msg_persisted")
+    ));
+    let ConversationItem::Provider(provider) = &items[2] else {
+        panic!("expected persisted compaction item, got {:?}", items[2])
+    };
+    let item = provider
+        .as_encrypted_compaction()
+        .expect("encrypted native compaction payload");
+    assert_eq!(item.id.as_deref(), Some("cmp_persisted"));
+    assert_eq!(item.encrypted_content, "opaque-native-context");
+}
+
 /// Set up a session dir with a raw `chat_history.jsonl` and return
 /// (adapter, chat path, loaded items).
 fn load_raw_chat(
@@ -2259,6 +2296,7 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),

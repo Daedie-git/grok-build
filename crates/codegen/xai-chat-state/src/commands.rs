@@ -10,7 +10,7 @@ use xai_grok_sampling_types::{
 
 use crate::types::{
     AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    TurnCapture,
+    SamplingState, SamplingTransitionResult, TurnCapture,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -121,6 +121,14 @@ pub enum ChatStateCommand {
     /// Update the sampling config (e.g., model switch).
     UpdateSamplingConfig { config: SamplingConfig },
 
+    /// Authoritatively transition conversation history, complete sampling
+    /// config, and credentials as one serialized actor operation.
+    TransitionSamplingState {
+        target: xai_grok_sampling_types::ResolvedSamplingTarget,
+        credentials: Credentials,
+        reply: oneshot::Sender<SamplingTransitionResult>,
+    },
+
     /// Track that the agent edited a file path.
     RecordAgentEditedPath { path: String },
 
@@ -192,8 +200,26 @@ pub enum ChatStateCommand {
     /// Restore from a snapshot.
     RestoreSnapshot(Box<ChatStateSnapshot>),
 
+    /// Start a fresh process-local routing scope for one prompt turn.
+    BeginTurnRoutingScope,
+
     /// Start capturing turn messages. Clears any previous buffer.
     BeginTurnCapture,
+
+    /// Install history that an external persistence transaction already wrote.
+    /// This must not emit another `ReplaceHistory` persistence record.
+    InstallPersistedCompaction {
+        items: Vec<ConversationItem>,
+        reply: oneshot::Sender<()>,
+    },
+
+    /// Install a complete rewind snapshot after its durable marker committed.
+    /// This preserves all non-history snapshot fields and must not emit a
+    /// duplicate persistence replacement.
+    InstallPersistedRewind {
+        snapshot: Box<ChatStateSnapshot>,
+        reply: oneshot::Sender<()>,
+    },
 
     /// Append synthetic `task` pairs for a harness-spawned subagent (goal
     /// planner / verifier skeptic) to the in-progress harness trace phase.
@@ -232,6 +258,11 @@ pub enum ChatStateCommand {
     /// Get current prompt index.
     GetPromptIndex { reply: oneshot::Sender<usize> },
 
+    /// Clone the process-local routing state for the active turn.
+    GetTurnRoutingState {
+        reply: oneshot::Sender<xai_grok_sampling_types::TurnRoutingState>,
+    },
+
     /// Get the prompt index at which the last compaction occurred.
     /// `Some` means the context currently holds a compaction summary.
     GetLastCompactionPromptIndex {
@@ -264,6 +295,11 @@ pub enum ChatStateCommand {
     /// Get sampling config.
     GetSamplingConfig {
         reply: oneshot::Sender<SamplingConfig>,
+    },
+
+    /// Atomically get sampling config and credentials from one actor turn.
+    GetSamplingState {
+        reply: oneshot::Sender<SamplingState>,
     },
 
     /// Get the set of agent-edited file paths.
@@ -417,6 +453,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),

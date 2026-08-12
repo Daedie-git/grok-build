@@ -95,6 +95,49 @@ pub(crate) async fn write_bytes_atomic_async(path: &Path, bytes: Vec<u8>) -> io:
     result
 }
 
+/// Atomically publish bytes only after the staged file is durable, then sync
+/// the containing directory so a subsequently committed update marker never
+/// references a checkpoint lost by a crash.
+pub(crate) async fn write_bytes_atomic_durable_async(
+    path: &Path,
+    bytes: Vec<u8>,
+) -> io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "atomic path has no parent")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = temp_sibling(&path);
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&bytes)?;
+            sync_file_durable(&file)?;
+            drop(file);
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            {
+                std::fs::File::open(parent)?.sync_all()?;
+                if let Some(grandparent) = parent.parent() {
+                    std::fs::File::open(grandparent)?.sync_all()?;
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 /// Serialize `items` to newline-delimited JSON bytes.
 fn to_jsonl_bytes<T: serde::Serialize>(items: &[T]) -> io::Result<Vec<u8>> {
     let mut content = Vec::new();
@@ -162,18 +205,19 @@ pub(crate) mod chat_rebuild {
                 Err(_) => continue,
             };
 
-            for item in reducer.process(&update) {
-                if let Ok(line) = serde_json::to_string(&item) {
-                    let _ = writer.write_all(line.as_bytes());
-                    let _ = writer.write_all(b"\n");
-                }
-            }
-
-            // CompactionCheckpoint: truncate file and reset
+            let emitted = reducer.process(&update);
+            // Timeline replacement markers reset the cache before their
+            // authoritative replacement is emitted.
             if reducer.should_truncate() {
                 reducer.clear_truncate_flag();
                 let _ = writer.seek(std::io::SeekFrom::Start(0));
                 let _ = writer.get_mut().set_len(0);
+            }
+            for item in emitted {
+                if let Ok(line) = serde_json::to_string(&item) {
+                    let _ = writer.write_all(line.as_bytes());
+                    let _ = writer.write_all(b"\n");
+                }
             }
         }
 
@@ -196,12 +240,146 @@ pub(crate) mod chat_rebuild {
         Ok(reducer.count())
     }
 
+    /// Derive the source history when a committed authoritative compaction or
+    /// rewind marker is newer than the derived cache. This is read-only and is
+    /// used by fork/copy so a child cannot resurrect a pre-transaction cache.
+    pub(crate) fn derive_authoritative_history(
+        dir: &Path,
+    ) -> io::Result<Option<Vec<ConversationItem>>> {
+        use crate::extensions::notification::{
+            FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+            MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+        };
+
+        let updates_path = dir.join(UPDATES_FILE);
+        let Some(iter) = UpdatesIterator::open(&updates_path)? else {
+            return Ok(None);
+        };
+        let mut history: Option<Vec<ConversationItem>> = None;
+        let mut reducer = ChatReducer::new();
+
+        for result in iter {
+            let update = match result {
+                Ok(update) => update,
+                Err(error) => {
+                    tracing::warn!(%error, path = %updates_path.display(), "skipping malformed update while deriving authoritative history");
+                    continue;
+                }
+            };
+            if let SessionUpdate::Xai(notification) = &update {
+                use crate::extensions::notification::SessionUpdate as XaiUpdate;
+                match &notification.update {
+                    XaiUpdate::CompactionCheckpoint(marker) => {
+                        reducer.reset();
+                        let expected =
+                            format!("compaction_checkpoints/{}.json", marker.checkpoint_id);
+                        if marker.checkpoint_file != expected {
+                            // Legacy/non-authoritative records with unusable
+                            // references cannot provide an exact replacement;
+                            // retain the ordinary cache fallback.
+                            history = None;
+                            continue;
+                        }
+                        let Ok(bytes) = std::fs::read(dir.join(&expected)) else {
+                            history = None;
+                            continue;
+                        };
+                        let Ok(checkpoint) = serde_json::from_slice::<
+                            crate::extensions::notification::CompactionCheckpointFile,
+                        >(&bytes) else {
+                            history = None;
+                            continue;
+                        };
+                        if checkpoint.schema_version
+                            > MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unsupported compaction checkpoint schema version",
+                            ));
+                        }
+                        if checkpoint.checkpoint_id != marker.checkpoint_id
+                            || checkpoint.prompt_index_at_compaction
+                                != marker.prompt_index_at_compaction
+                            || checkpoint.schema_version != marker.schema_version
+                            || checkpoint.created_at != marker.created_at
+                        {
+                            history = None;
+                            continue;
+                        }
+                        // Native schema-v1 checkpoints already bind an exact
+                        // replacement. Local schema-v1 checkpoints may predate a
+                        // fork-prefix transform, while schema-v2 checkpoints
+                        // contain the exact finalized replacement for either kind.
+                        history = match xai_grok_sampling_types::native_compaction_compatibility(
+                            &checkpoint.compacted_history,
+                        ) {
+                            Ok(Some(_)) => Some(checkpoint.compacted_history),
+                            Ok(None)
+                                if checkpoint.schema_version
+                                    >= FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION =>
+                            {
+                                Some(checkpoint.compacted_history)
+                            }
+                            Ok(None) => None,
+                            Err(error) => {
+                                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                            }
+                        };
+                        continue;
+                    }
+                    XaiUpdate::RewindMarker {
+                        target_prompt_index,
+                        transaction_id,
+                        rewound_history_json,
+                        ..
+                    } => {
+                        reducer.reset();
+                        if transaction_id.is_some() {
+                            let json = rewound_history_json.as_deref().ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "committed rewind marker is missing its history snapshot",
+                                )
+                            })?;
+                            history = Some(serde_json::from_str(json).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?);
+                        } else if let Some(items) = &mut history {
+                            // Legacy markers remain readable. Once an exact
+                            // native/rewind base exists, apply their timeline cut
+                            // rather than falling back to a stale cache.
+                            let keep = crate::sampling::conversation_truncate_for_prompt(
+                                items,
+                                *target_prompt_index,
+                            );
+                            items.truncate(keep);
+                        } else {
+                            history = None;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(items) = &mut history {
+                items.extend(reducer.process(&update));
+            }
+        }
+        if let Some(items) = &mut history {
+            items.extend(reducer.flush());
+        }
+        Ok(history)
+    }
+
     /// Reduces ACP session updates into conversation items.
     ///
     /// Turn boundaries: User→Agent flushes user, Agent→User flushes agent,
     /// tool completion flushes agent before emitting result.
     struct ChatReducer {
         user_parts: Vec<ContentPart>,
+        user_prompt_index: Option<usize>,
         agent_text: String,
         agent_tool_calls: Vec<ToolCall>,
 
@@ -218,6 +396,7 @@ pub(crate) mod chat_rebuild {
         fn new() -> Self {
             Self {
                 user_parts: Vec::new(),
+                user_prompt_index: None,
                 agent_text: String::new(),
                 agent_tool_calls: Vec::new(),
                 in_user_turn: false,
@@ -258,6 +437,20 @@ pub(crate) mod chat_rebuild {
                     self.needs_truncate = true;
                     Vec::new()
                 }
+                XaiUpdate::RewindMarker {
+                    rewound_history_json: Some(rewound_history_json),
+                    ..
+                } => {
+                    let Ok(rewound_history) =
+                        serde_json::from_str::<Vec<ConversationItem>>(rewound_history_json)
+                    else {
+                        return Vec::new();
+                    };
+                    self.reset();
+                    self.needs_truncate = true;
+                    self.item_count = rewound_history.len();
+                    rewound_history
+                }
                 _ => Vec::new(), // DiffReview, MemoryFlush, etc. not needed
             }
         }
@@ -271,6 +464,15 @@ pub(crate) mod chat_rebuild {
             if !self.in_user_turn {
                 out.extend(self.flush_agent());
                 self.in_user_turn = true;
+            }
+
+            if self.user_prompt_index.is_none() {
+                self.user_prompt_index = chunk
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("promptIndex"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|index| index as usize);
             }
 
             match &chunk.content {
@@ -395,7 +597,10 @@ pub(crate) mod chat_rebuild {
             if self.user_parts.is_empty() {
                 return None;
             }
-            let item = ConversationItem::user_with_parts(std::mem::take(&mut self.user_parts));
+            let mut item = ConversationItem::user_with_parts(std::mem::take(&mut self.user_parts));
+            if let ConversationItem::User(user) = &mut item {
+                user.prompt_index = self.user_prompt_index.take();
+            }
             self.item_count += 1;
             Some(item)
         }
@@ -406,6 +611,7 @@ pub(crate) mod chat_rebuild {
             }
             let item = ConversationItem::Assistant(AssistantItem {
                 content: std::sync::Arc::<str>::from(std::mem::take(&mut self.agent_text)),
+                response_item_id: None,
                 tool_calls: std::mem::take(&mut self.agent_tool_calls),
                 model_id: None,
                 model_fingerprint: None,
@@ -425,6 +631,7 @@ pub(crate) mod chat_rebuild {
 
         fn reset(&mut self) {
             self.user_parts.clear();
+            self.user_prompt_index = None;
             self.agent_text.clear();
             self.agent_tool_calls.clear();
             self.tool_args.clear();
@@ -778,6 +985,10 @@ pub struct CopySessionOptions {
     /// `false` — these can be large and most copy paths don't need them. Forks
     /// enable it so the child retains the parent's pre-compaction history.
     pub copy_compaction_segments: bool,
+    /// Exact authoritative source snapshot already inspected by a fork caller.
+    /// When present, copy uses this snapshot instead of re-reading the derived
+    /// chat cache, so native-history policy and copied bytes cannot diverge.
+    pub source_chat_history: Option<Vec<ConversationItem>>,
     /// When true, apply fork-safety filtering to copied chat history:
     /// - Strip synthetic user messages (doom loop warnings, compaction metadata)
     /// - Truncate at the last complete turn boundary
@@ -815,6 +1026,7 @@ impl Default for CopySessionOptions {
             copy_tool_state: true,
             copy_announcement_state: true,
             copy_compaction_segments: false,
+            source_chat_history: None,
             fork_filter: false,
             inherited_prefix_len: None,
             strip_reasoning: false,
@@ -963,6 +1175,23 @@ pub enum AppendCwdSwitchError {
         acknowledgement: xai_chat_state::StrictAppendAck,
         source: io::Error,
     },
+}
+
+/// Commit-aware result for replacing the derived chat-history cache.
+#[derive(Debug)]
+pub enum ReplaceChatHistoryError {
+    /// The atomic cache file replacement did not land.
+    NotCommitted(io::Error),
+    /// The cache file landed, but summary bookkeeping failed afterward.
+    Committed(io::Error),
+}
+
+impl ReplaceChatHistoryError {
+    pub fn into_io_error(self) -> io::Error {
+        match self {
+            Self::NotCommitted(error) | Self::Committed(error) => error,
+        }
+    }
 }
 
 impl AppendUpdateError {
@@ -1191,6 +1420,18 @@ pub trait StorageAdapter: Send + Sync {
     /// Required, not defaulted: a new adapter must choose its
     /// recoverability story explicitly.
     async fn backup_chat_history_before_strip(&self, info: &Info) -> io::Result<()>;
+
+    /// Replace chat history while preserving whether the atomic cache file
+    /// committed before later bookkeeping failed.
+    async fn replace_chat_history_commit_aware(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+    ) -> Result<(), ReplaceChatHistoryError> {
+        self.replace_chat_history(info, messages)
+            .await
+            .map_err(ReplaceChatHistoryError::NotCommitted)
+    }
 
     /// Copy session data from source to target, transforming session IDs
     /// The `options` parameter allows setting parent session tracking and model overrides.
@@ -2435,6 +2676,8 @@ mod tests {
                 session_id: acp::SessionId::new("s"),
                 update: crate::extensions::notification::SessionUpdate::RewindMarker {
                     target_prompt_index: 2,
+                    transaction_id: None,
+                    rewound_history_json: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                 },
                 meta: None,

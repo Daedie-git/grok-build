@@ -4600,7 +4600,11 @@ impl AppView {
                                 .session_picker_pending_delete
                                 .is_some(),
                             chat_mode: self.chat_mode,
-                            credit_balance: self.credit_balance.as_ref(),
+                            credit_balance: if self.models.current_model_is_codex() {
+                                None
+                            } else {
+                                self.credit_balance.as_ref()
+                            },
                             auto_topup: self.auto_topup.as_ref(),
                             usage_visible: self.usage_visible,
                             is_api_key_auth: self.is_api_key_auth,

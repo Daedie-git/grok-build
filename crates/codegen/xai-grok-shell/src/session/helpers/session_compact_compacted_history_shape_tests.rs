@@ -45,6 +45,7 @@ async fn test_compacted_history_raw_strings() {
         ConversationItem::assistant("Let me look at the file."),
         ConversationItem::Assistant(AssistantItem {
             content: "I'll read the file now.".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "read_file".into(),
@@ -57,6 +58,7 @@ async fn test_compacted_history_raw_strings() {
         ConversationItem::tool_result("tc1", "fn login() { /* buggy code */ }"),
         ConversationItem::Assistant(AssistantItem {
             content: "Found the bug, applying fix.".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc2".into(),
                 name: "search_replace".into(),
@@ -224,6 +226,7 @@ async fn grok_build_compaction_drops_working_tail_regression_206460() {
         ),
         ConversationItem::Assistant(AssistantItem {
             content: "reading the file".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "read_file".into(),

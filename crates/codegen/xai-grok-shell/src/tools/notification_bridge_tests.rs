@@ -10,6 +10,20 @@ async fn handle_notification_with_admission(
     offsets: &mut HashMap<String, usize>,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
     accepted: bool,
+) -> crate::session::commands::TaskWakeFallback {
+    handle_notification_with_admission_trace_start(config, notification, offsets, cmd_rx, accepted)
+        .await
+        .1
+}
+async fn handle_notification_with_admission_trace_start(
+    config: &NotificationBridgeConfig,
+    notification: ToolNotification,
+    offsets: &mut HashMap<String, usize>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    accepted: bool,
+) -> (
+    Option<crate::session::commands::PromotionTraceStartSender>,
+    crate::session::commands::TaskWakeFallback,
 ) {
     let notification = handle_notification(config, notification, offsets);
     tokio::pin!(notification);
@@ -21,10 +35,15 @@ async fn handle_notification_with_admission(
     let SessionCommand::Prompt { admission, .. } = &mut command else {
         panic!("expected task-wake prompt");
     };
-    admission
+    let admission = admission
         .take()
-        .expect("expected task-wake admission request")
-        .respond_to
+        .expect("expected task-wake admission request");
+    let crate::session::commands::TaskWakeAdmission {
+        respond_to,
+        mut fallback,
+    } = admission;
+    let promotion_trace_start = fallback.promotion_trace_start.take();
+    respond_to
         .send(accepted)
         .expect("notification must still be awaiting admission");
     config
@@ -32,6 +51,10 @@ async fn handle_notification_with_admission(
         .send(command)
         .expect("test command receiver must remain open");
     notification.await;
+    (
+        accepted.then_some(promotion_trace_start).flatten(),
+        fallback,
+    )
 }
 
 fn make_test_config() -> (
@@ -133,8 +156,9 @@ async fn bash_task_completed_injects_bash_task_completed_source() {
     let notification = ToolNotification::TaskCompleted(snapshot);
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(&config, notification, &mut offsets, &mut cmd_rx, true)
-        .await;
+    let _fallback =
+        handle_notification_with_admission(&config, notification, &mut offsets, &mut cmd_rx, true)
+            .await;
 
     let command = cmd_rx.try_recv().expect("expected Prompt");
     match command {
@@ -251,7 +275,7 @@ async fn bash_task_completed_auto_wakes_and_reserves_without_goal_loop() {
     let snapshot = make_task_snapshot("bg-normal", TaskKind::Bash);
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,
@@ -304,7 +328,7 @@ async fn task_completed_notification_stamps_will_wake() {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(trace_tx);
     let mut offsets = HashMap::new();
-    handle_notification_with_admission(
+    let (promotion_trace_start, _fallback) = handle_notification_with_admission_trace_start(
         &config,
         ToolNotification::TaskCompleted(make_task_snapshot("bg-wake", TaskKind::Bash)),
         &mut offsets,
@@ -316,20 +340,30 @@ async fn task_completed_notification_stamps_will_wake() {
         cmd_rx.recv().await,
         Some(SessionCommand::Prompt { .. })
     ));
-    match cmd_rx.recv().await {
-        Some(SessionCommand::CopyFile { respond_to }) => drop(respond_to),
-        _ => panic!("trace copy must follow accepted prompt admission"),
-    }
+    assert!(matches!(
+        cmd_rx.recv().await,
+        Some(SessionCommand::DispatchNotificationHook { .. })
+    ));
     assert_eq!(
         task_completed_will_wake(&mut gateway_rx),
         Some(true),
         "an auto-woken completion must stamp will_wake: true"
     );
     assert!(
-        trace_rx.try_recv().is_ok(),
-        "accepted admission must request a synthetic-turn trace"
+        trace_rx.try_recv().is_err(),
+        "admission alone must not request a synthetic-turn trace"
     );
-
+    let (_before_copy_tx, before_session_copy_rx) = tokio::sync::oneshot::channel();
+    promotion_trace_start
+        .expect("traced wake must carry a promotion handoff")
+        .send(before_session_copy_rx)
+        .expect("simulate actor promotion");
+    let trace = tokio::time::timeout(std::time::Duration::from_secs(1), trace_rx.recv())
+        .await
+        .expect("trace request timeout")
+        .expect("trace request");
+    assert_eq!(trace.prompt_id, "task-completed-bg-wake");
+    assert_eq!(trace.session_id.0.as_ref(), "test-session");
     let (config, mut gateway_rx, mut persistence_rx, mut cmd_rx) = make_test_config_full();
     let (trace_tx, mut trace_rx) = mpsc::unbounded_channel();
     *config
@@ -337,7 +371,7 @@ async fn task_completed_notification_stamps_will_wake() {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(trace_tx);
     let mut offsets = HashMap::new();
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(make_task_snapshot("bg-declined", TaskKind::Bash)),
         &mut offsets,
@@ -398,10 +432,11 @@ async fn stalled_admission_is_bounded_and_task_completion_still_emits() {
     );
     tokio::pin!(notification);
 
-    tokio::select! {
+    let pending_command = tokio::select! {
         _ = &mut notification => panic!("admission should still be waiting"),
-        command = cmd_rx.recv() => assert!(matches!(command, Some(SessionCommand::Prompt { .. }))),
-    }
+        command = cmd_rx.recv() => command.expect("expected task-wake prompt"),
+    };
+    assert!(matches!(pending_command, SessionCommand::Prompt { .. }));
     tokio::time::advance(TASK_WAKE_ADMISSION_TIMEOUT + std::time::Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
     notification.await;
@@ -566,7 +601,7 @@ async fn monitor_task_completed_auto_wakes_with_monitor_ended_message() {
     snapshot.exit_code = Some(0);
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,
@@ -632,7 +667,7 @@ async fn declined_quiet_monitor_wake_queues_canonical_deferred_completion() {
         .expect("slot is fresh in this test fixture");
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(make_task_snapshot("mon-declined", TaskKind::Monitor)),
         &mut offsets,
@@ -749,7 +784,7 @@ async fn ui_killed_monitor_auto_wakes_and_tells_model_not_to_restart() {
     snapshot.display_command = Some("[monitor] watch deploy".into());
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,
@@ -1400,7 +1435,7 @@ async fn ui_killed_task_auto_wakes_and_tells_model_not_to_restart() {
     snapshot.kill_result_delivered = false;
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,
@@ -1439,7 +1474,7 @@ async fn ui_killed_task_gate_armed_defers_to_fallback() {
     snapshot.kill_result_delivered = false;
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,
@@ -1532,8 +1567,9 @@ async fn bash_completion_uses_single_task_id_clone() {
     let notification = ToolNotification::TaskCompleted(snapshot);
     let mut offsets = HashMap::new();
 
-    handle_notification_with_admission(&config, notification, &mut offsets, &mut cmd_rx, true)
-        .await;
+    let _fallback =
+        handle_notification_with_admission(&config, notification, &mut offsets, &mut cmd_rx, true)
+            .await;
 
     let cmd = cmd_rx.try_recv().unwrap();
     if let SessionCommand::Prompt { prompt_id, .. } = cmd {
@@ -1804,7 +1840,7 @@ async fn bash_completion_renders_disk_pointer_footer_in_both_branches() {
         .expect("fresh slot");
     let snapshot = make_large_bash_snapshot("bg-disk-1", output_file.clone());
     let mut offsets = HashMap::new();
-    handle_notification_with_admission(
+    let _fallback = handle_notification_with_admission(
         &config_auto,
         ToolNotification::TaskCompleted(snapshot),
         &mut offsets,

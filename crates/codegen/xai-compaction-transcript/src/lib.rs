@@ -67,8 +67,9 @@ fn role_label(item: &ConversationItem) -> &'static str {
         ConversationItem::User(_) => "Human",
         ConversationItem::Assistant(_) => "Assistant",
         ConversationItem::ToolResult(_) => "Function",
-        ConversationItem::BackendToolCall(_) => "Assistant",
-        ConversationItem::Reasoning(_) => "Assistant",
+        ConversationItem::BackendToolCall(_)
+        | ConversationItem::Provider(_)
+        | ConversationItem::Reasoning(_) => "Assistant",
     }
 }
 
@@ -771,6 +772,7 @@ mod tests {
             user("Fix the bug"),
             ConversationItem::Assistant(AssistantItem {
                 content: "Done".into(),
+                response_item_id: None,
                 tool_calls: vec![
                     tc("read_file", r#"{"target_file":"src/a.py"}"#),
                     tc("read_file", r#"{"target_file":"src/b.py"}"#),

@@ -839,6 +839,25 @@ pub(super) fn default_actions(
             ),
         },
         ActionDef {
+            id: ActionId::CycleEffort,
+            label: "effort",
+            description: "Cycle reasoning effort",
+            // Ctrl+R = Reasoning. Shift+letter is treated as text in the prompt
+            // (is_text_input_key), so bare Shift+R never reaches AgentScreen.
+            // Prompt leaves Ctrl+R unbound; scrollback uses Ctrl+R only when the
+            // opt-in mouse-reporting toggle is enabled (ScrollbackFocused wins).
+            default_key: key!('r', CONTROL),
+            alt_keys: vec![],
+            category: Category::Session,
+            context: When::AgentScreen,
+            hint_priority: Some(12),
+            hint_key_display: Some("Ctrl+R"),
+            requires_confirmation: false,
+            long_help: Some(
+                "Steps the session's reasoning effort upward through the levels the current model offers (low → medium → high → xhigh, then wrap to low).\nNo-op with a toast when the model has no effort menu.\nSame wire path as `/effort <level>`; use that command to jump to a specific level.\nBound to Ctrl+R (mnemonic: Reasoning). On scrollback, Ctrl+R may instead toggle mouse reporting if that opt-in is enabled.",
+            ),
+        },
+        ActionDef {
             id: ActionId::OpenSettings,
             label: "settings",
             description: "Open the settings modal",

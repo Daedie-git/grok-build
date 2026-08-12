@@ -396,6 +396,25 @@ async fn fetch_subagent_bundle_uses_deployment_key_without_user_headers() {
     server.abort();
 }
 #[tokio::test(flavor = "current_thread")]
+async fn bundle_headers_omit_credentials_for_untrusted_destination() {
+    let auth_manager = test_auth_manager();
+    let request = add_bundle_fetch_headers(
+        reqwest::Client::new().get("https://untrusted.example/subagents/bundle"),
+        Some(&auth_manager),
+        Some("deploy-key"),
+        Some("alpha-key"),
+        "https://untrusted.example/subagents/bundle",
+    )
+    .await
+    .build()
+    .unwrap();
+
+    for header in ["authorization", "x-xai-token-auth", "x-userid", "x-email"] {
+        assert!(request.headers().get(header).is_none(), "leaked {header}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fetch_subagent_bundle_http_failure() {
     let (proxy_base_url, _seen_headers, server) = start_bundle_server(
         axum::http::StatusCode::UNAUTHORIZED,
@@ -518,7 +537,8 @@ fn parse_reads_meta_fallback_fields() {
         "_meta": {
             "model": "meta-model-id",
             "contextWindow": 131072,
-            "agentType": "concise"
+            "agentType": "concise",
+            "providerId": "codex"
         }
     });
     let result = parse_remote_model_value(&value, "https://default.url").unwrap();
@@ -528,7 +548,35 @@ fn parse_reads_meta_fallback_fields() {
         std::num::NonZeroU64::new(131072).unwrap()
     );
     assert_eq!(result.agent_type, "concise");
+    assert_eq!(
+        result.provider_id,
+        Some(xai_grok_sampling_types::ProviderId::Codex)
+    );
 }
+#[test]
+fn parse_remote_model_value_reads_codex_auto_compact_limit() {
+    for value in [
+        serde_json::json!({
+            "model": "codex-model",
+            "context_window": 272_000,
+            "autoCompactTokenLimit": 244_800,
+        }),
+        serde_json::json!({
+            "model": "codex-model",
+            "context_window": 272_000,
+            "_meta": { "auto_compact_token_limit": 244_800 },
+        }),
+    ] {
+        let result = parse_remote_model_value(&value, "https://default.url").unwrap();
+        assert_eq!(
+            result
+                .auto_compact_token_limit
+                .map(std::num::NonZeroU64::get),
+            Some(244_800)
+        );
+    }
+}
+
 #[test]
 fn parse_remote_model_value_no_laziness_detector_block_yields_default() {
     let value = serde_json::json!({

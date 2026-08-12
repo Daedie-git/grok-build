@@ -143,10 +143,6 @@ impl SessionActor {
             (trace_gcs_config, artifact_tracker)
         };
 
-        if let crate::session::PromptOrigin::SubagentCompleted { subagent_id } = &origin {
-            self.mark_completions_reported(&[subagent_id]).await;
-        }
-
         // For synthetic prompts, derive trace config from the template
         // captured during the first real user prompt.
         let (trace_gcs_config, artifact_tracker) =
@@ -178,6 +174,20 @@ impl SessionActor {
 
         let mut state = self.state.lock().await;
 
+        // An explicit task-output/kill result may have committed after actor
+        // admission but before this queue insertion. The commit records its
+        // tombstone under this same lock, so either this insertion wins and is
+        // swept there, or the late wake is rejected here.
+        if task_wake_fallback.is_some()
+            && origin
+                .completion_id()
+                .is_some_and(|id| state.has_consumed_completion(id))
+        {
+            drop(state);
+            Self::respond_removed_prompt(respond_to);
+            return false;
+        }
+
         // User prompts have priority over queued synthetic auto-wake prompts;
         // the guarded sweep exempts the running turn's own slot (see
         // `State::sweep_pending_inputs`). Gate deliberately keyed on
@@ -190,18 +200,13 @@ impl SessionActor {
             });
             if preempt_armed {
                 let dropped = state.sweep_pending_inputs(|i| i.origin.is_synthetic());
-                if let Some(reservations) = &self.tool_context.task_completion_reservations {
-                    for task_id in dropped
-                        .iter()
-                        .filter_map(|item| item.origin.completion_id())
-                    {
-                        reservations.release(task_id);
+                for mut item in dropped {
+                    if let Some(fallback) = item.task_wake_fallback.take() {
+                        self.push_task_wake_fallback(&mut state, fallback);
                     }
+                    Self::respond_removed_prompt(item.respond_to);
                 }
-                tracing::info!(
-                    dropped_count = dropped.len(),
-                    "auto-wake: dropping pending synthetic prompts (user prompt has priority)"
-                );
+                tracing::info!("auto-wake: parking pending synthetic prompts behind user prompt");
             }
         }
 

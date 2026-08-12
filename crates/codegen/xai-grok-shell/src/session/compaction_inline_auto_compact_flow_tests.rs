@@ -1,6 +1,10 @@
 use super::super::support::*;
 use super::super::*;
-use super::{AutoCompactTriggerInfo, SuppressReason};
+use super::{
+    AutoCompactFailureDisposition, AutoCompactTriggerInfo, AutoCompactTriggerKind,
+    BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_NONE, CompactionCommitKind,
+    CompactionStrategyOverride, SuppressReason,
+};
 use crate::session::acp_session::McpReminderMode;
 use crate::terminal::AsyncTerminalRunner;
 use crate::terminal::runner::{TerminalError, TerminalRunRequest, TerminalRunResult};
@@ -42,6 +46,7 @@ async fn create_test_actor(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -59,6 +64,7 @@ async fn create_test_actor(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -120,12 +126,15 @@ async fn create_test_actor(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
@@ -258,6 +267,119 @@ async fn create_test_actor(
         trace_config_template: std::cell::RefCell::new(None),
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn closed_persistence_channel_prevents_native_live_install() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            drop(persistence_rx);
+            let actor = create_test_actor(10, 100_000, 85, gateway_tx, persistence_tx).await;
+            actor
+                .chat_state_handle
+                .replace_conversation(vec![ConversationItem::system("original")]);
+            let replacement = vec![ConversationItem::system("replacement")];
+            let error = actor
+                .persist_compaction_install(
+                    &replacement,
+                    0,
+                    None,
+                    None,
+                    CompactionCommitKind::NativeCodex,
+                )
+                .await
+                .expect_err("closed persistence must fail before live replacement");
+            assert!(format!("{error:?}").contains("original history remains live"));
+            let live = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].text_content(), "original");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn closed_persistence_channel_prevents_local_live_install() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            drop(persistence_rx);
+            let actor = create_test_actor(10, 100_000, 85, gateway_tx, persistence_tx).await;
+            actor
+                .chat_state_handle
+                .replace_conversation(vec![ConversationItem::system("original")]);
+            let replacement = vec![ConversationItem::system("replacement")];
+            let error = actor
+                .persist_compaction_install(
+                    &replacement,
+                    0,
+                    None,
+                    None,
+                    CompactionCommitKind::LocalSummary,
+                )
+                .await
+                .expect_err("closed persistence must fail before live replacement");
+            assert!(format!("{error:?}").contains("original history remains live"));
+            let live = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].text_content(), "original");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_compaction_not_committed_leaves_live_history_untouched() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) =
+                mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, mut persistence_rx) =
+                mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(10, 100_000, 85, gateway_tx, persistence_tx).await;
+            actor
+                .chat_state_handle
+                .replace_conversation(vec![ConversationItem::system("original")]);
+            let replacement = vec![ConversationItem::system("replacement")];
+            let persist = actor.persist_compaction_install(
+                &replacement,
+                0,
+                None,
+                None,
+                CompactionCommitKind::LocalSummary,
+            );
+            tokio::pin!(persist);
+            let message = tokio::select! {
+                message = persistence_rx.recv() => message.expect("expected compaction transaction"),
+                result = &mut persist => panic!("persist completed before ack: {result:?}"),
+            };
+            let PersistenceMsg::InstallCompactionAndAck { respond_to, .. } = message else {
+                panic!("expected InstallCompactionAndAck, got {message:?}");
+            };
+            respond_to
+                .send(crate::session::persistence::TimelineTransactionOutcome::NotCommitted(
+                    std::io::Error::other("injected marker failure"),
+                ))
+                .unwrap();
+            let error = persist
+                .await
+                .expect_err("NotCommitted must fail closed");
+            assert!(
+                format!("{error:?}").contains("original history remains live"),
+                "unexpected error: {error:?}"
+            );
+            let live = actor.chat_state_handle.get_conversation().await;
+            assert_eq!(live.len(), 1);
+            assert_eq!(live[0].text_content(), "original");
+        })
+        .await;
+}
+
 /// Test check_auto_compact_needed uses state values.
 #[tokio::test(flavor = "current_thread")]
 async fn test_check_auto_compact_needed_uses_state() {
@@ -266,7 +388,7 @@ async fn test_check_auto_compact_needed_uses_state() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(90_000, 100_000, 85, gateway_tx, persistence_tx).await;
             let result = actor.check_auto_compact_needed().await;
             assert!(result.is_some(), "Should trigger at 90%");
@@ -286,7 +408,7 @@ async fn test_context_window_override_affects_auto_compact() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(86_000, 100_000, 85, gateway_tx, persistence_tx).await;
             let result = actor.check_auto_compact_needed().await;
             assert!(result.is_some(), "Should trigger at 86% of 100K window");
@@ -312,7 +434,7 @@ async fn test_context_window_override_to_smaller_triggers_compact() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(86_000, 200_000, 85, gateway_tx, persistence_tx).await;
             let result = actor.check_auto_compact_needed().await;
             assert!(result.is_none(), "Should NOT trigger at 43% of 200K window");
@@ -340,7 +462,7 @@ async fn suppression_gates_and_reset_is_reason_scoped() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await;
             let err = api_error_with_context_window(200_000);
             assert!(actor.check_auto_compact_needed().await.is_some());
@@ -405,6 +527,49 @@ async fn suppression_gates_and_reset_is_reason_scoped() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn transient_auto_compact_failure_uses_expiring_cooldown() {
+    use crate::session::compaction_config::AUTO_COMPACT_RETRY_READY;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor = create_test_actor(1_000, 200_000, 85, gateway_tx, persistence_tx).await;
+
+            actor.record_auto_compact_retry_gate(AutoCompactFailureDisposition::Cooldown);
+            let retry_at = actor
+                .compaction
+                .auto_compact_retry_not_before_ms
+                .load(Relaxed);
+            assert!(retry_at > SessionActor::current_epoch_ms());
+            assert!(
+                SessionActor::acp_error_message(
+                    &actor
+                        .auto_compact_retry_gate_error()
+                        .expect("cooldown active")
+                )
+                .contains("cooling down")
+            );
+
+            actor
+                .compaction
+                .auto_compact_retry_not_before_ms
+                .store(SessionActor::current_epoch_ms().saturating_sub(1), Relaxed);
+            assert!(actor.auto_compact_retry_gate_error().is_none());
+            assert_eq!(
+                actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed),
+                AUTO_COMPACT_RETRY_READY
+            );
+        })
+        .await;
+}
 /// A model switch clears suppression the switch (or the fresh budget-driven
 /// trigger) can resolve — sticky size/schema and a stale per-turn `other` — so
 /// the gates re-evaluate against the new window. Account-state credit/auth is
@@ -417,7 +582,7 @@ async fn model_switch_clears_sticky_suppression() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor =
                 Arc::new(create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await);
             for reason in [SuppressReason::Size, SuppressReason::Other] {
@@ -444,6 +609,75 @@ async fn model_switch_clears_sticky_suppression() {
         })
         .await;
 }
+/// Remote metadata may expand a model's context window without changing its
+/// slug. That new budget is a real lifecycle reset: deterministic
+/// suppression and its retry-after-reset gate must clear, but expansion
+/// itself must not launch compaction.
+#[tokio::test(flavor = "current_thread")]
+async fn same_model_context_expansion_clears_sticky_and_retry_gate_without_compacting() {
+    use crate::session::compaction_config::{
+        AUTO_COMPACT_RETRY_AFTER_RESET, AUTO_COMPACT_RETRY_READY, PreviousModelInfo, SUPPRESS_NONE,
+        SUPPRESS_STICKY,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+
+            actor
+                .suppress_auto_compaction(SuppressReason::Size, 180_000, 100_000)
+                .await;
+            actor.record_auto_compact_retry_gate(AutoCompactFailureDisposition::RetryAfterReset);
+            assert_eq!(
+                actor.compaction.auto_compact_suppressed.load(Relaxed),
+                SUPPRESS_STICKY
+            );
+            assert_eq!(
+                actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed),
+                AUTO_COMPACT_RETRY_AFTER_RESET
+            );
+            let compactions_before = actor.compaction.count.load(Relaxed);
+
+            actor.compaction.previous_model.set(Some(PreviousModelInfo {
+                model_slug: cfg.model.clone(),
+                context_window: 100_000,
+            }));
+            actor
+                .maybe_compact_on_model_switch()
+                .await
+                .expect("same-model expansion must reset compaction lifecycle");
+
+            assert_eq!(
+                actor.compaction.auto_compact_suppressed.load(Relaxed),
+                SUPPRESS_NONE,
+                "same-model context expansion must clear deterministic suppression"
+            );
+            assert_eq!(
+                actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed),
+                AUTO_COMPACT_RETRY_READY,
+                "same-model context expansion must clear retry-after-reset"
+            );
+            assert_eq!(
+                actor.compaction.count.load(Relaxed),
+                compactions_before,
+                "context expansion must not launch proactive compaction"
+            );
+            assert!(actor.auto_compact_retry_gate_error().is_none());
+        })
+        .await;
+}
 /// Model switch must not clear credit/auth suppress or compact under it.
 #[tokio::test(flavor = "current_thread")]
 async fn model_switch_keeps_account_state_suppression() {
@@ -455,7 +689,7 @@ async fn model_switch_keeps_account_state_suppression() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor =
                 Arc::new(create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await);
             for (reason, expected) in [
@@ -498,7 +732,7 @@ async fn auth_suppress_clears_on_credential_recovery() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
             actor
                 .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
@@ -526,7 +760,7 @@ async fn clear_auth_suppress_leaves_credit_suppress() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
             actor
                 .suppress_auto_compaction(SuppressReason::CreditBlock, 1_000, 200_000)
@@ -550,7 +784,7 @@ async fn clear_auth_suppress_rearms_pre_sampling_compact_gate() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor = create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await;
             actor
                 .suppress_auto_compaction(SuppressReason::Auth, 1_000, 200_000)
@@ -676,12 +910,21 @@ async fn spawn_deterministic_401_server() -> String {
     )
     .await
 }
+/// Mock LLM that answers every request with a retryable 503.
+async fn spawn_transient_503_server() -> String {
+    spawn_status_body_server(
+        503,
+        r#"{"error":{"type":"server_error","message":"temporarily unavailable"}}"#,
+    )
+    .await
+}
 async fn spawn_status_body_server(status: u16, body: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let status_line = match status {
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        503 => "503 Service Unavailable",
         other => panic!("add status line for {other}"),
     };
     tokio::spawn(async move {
@@ -703,6 +946,256 @@ async fn spawn_status_body_server(status: u16, body: &'static str) -> String {
     });
     format!("http://{addr}")
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn strategy_routing_matrix_hits_expected_codex_endpoints() {
+    use axum::Json;
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::response::sse::Sse;
+    use axum::routing::post;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let compact_hits = Arc::new(AtomicUsize::new(0));
+    let responses_hits = Arc::new(AtomicUsize::new(0));
+    let compact_endpoint_available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let compact_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let responses_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let compact_hits_for_route = compact_hits.clone();
+    let compact_endpoint_available_for_route = compact_endpoint_available.clone();
+    let compact_bodies_for_route = compact_bodies.clone();
+    let responses_hits_for_route = responses_hits.clone();
+    let responses_bodies_for_route = responses_bodies.clone();
+    let app = Router::new()
+        .route(
+            "/v1/responses/compact",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let compact_hits = compact_hits_for_route.clone();
+                let compact_endpoint_available = compact_endpoint_available_for_route.clone();
+                let compact_bodies = compact_bodies_for_route.clone();
+                async move {
+                    compact_hits.fetch_add(1, Ordering::SeqCst);
+                    compact_bodies.lock().unwrap().push(body);
+                    if compact_endpoint_available.load(Ordering::SeqCst) {
+                        Json(json!({
+                            "output": [{
+                                "type": "compaction",
+                                "id": "cmp-default-routing",
+                                "encrypted_content": "opaque-default-routing"
+                            }]
+                        }))
+                        .into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let responses_hits = responses_hits_for_route.clone();
+                let responses_bodies = responses_bodies_for_route.clone();
+                async move {
+                    responses_hits.fetch_add(1, Ordering::SeqCst);
+                    responses_bodies.lock().unwrap().push(body);
+                    let events = xai_grok_test_support::sse::responses_api_events_exact(
+                        &"Local route summary. ".repeat(80),
+                        "gpt-default-routing",
+                    );
+                    Sse::new(futures_util::stream::iter(
+                        events.into_iter().map(Ok::<_, Infallible>),
+                    ))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let base_url = format!("http://{addr}/v1");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            struct RoutingCase {
+                name: &'static str,
+                strategy_override: CompactionStrategyOverride<'static>,
+                user_context: Option<&'static str>,
+                endpoint_available: bool,
+                expect_native_attempt: bool,
+                expect_native_history: bool,
+            }
+
+            let cases = [
+                RoutingCase {
+                    name: "unset default",
+                    strategy_override: CompactionStrategyOverride::Unset,
+                    user_context: None,
+                    endpoint_available: true,
+                    expect_native_attempt: true,
+                    expect_native_history: true,
+                },
+                RoutingCase {
+                    name: "blank default",
+                    strategy_override: CompactionStrategyOverride::Value(" \t\r\n"),
+                    user_context: None,
+                    endpoint_available: true,
+                    expect_native_attempt: true,
+                    expect_native_history: true,
+                },
+                RoutingCase {
+                    name: "explicit local opt-out",
+                    strategy_override: CompactionStrategyOverride::Value("LOCAL_SUMMARY"),
+                    user_context: None,
+                    endpoint_available: true,
+                    expect_native_attempt: false,
+                    expect_native_history: false,
+                },
+                RoutingCase {
+                    name: "user guidance overrides native",
+                    strategy_override: CompactionStrategyOverride::Value("native"),
+                    user_context: Some("retain the edge-caserino guidance"),
+                    endpoint_available: false,
+                    expect_native_attempt: false,
+                    expect_native_history: false,
+                },
+                RoutingCase {
+                    name: "unavailable native endpoint falls back locally",
+                    strategy_override: CompactionStrategyOverride::Unset,
+                    user_context: None,
+                    endpoint_available: false,
+                    expect_native_attempt: true,
+                    expect_native_history: false,
+                },
+            ];
+            let mut expected_compact_hits = 0;
+            let mut expected_responses_hits = 0;
+
+            for (case_index, case) in cases.into_iter().enumerate() {
+                let RoutingCase {
+                    name: case_name,
+                    strategy_override,
+                    user_context,
+                    endpoint_available,
+                    expect_native_attempt,
+                    expect_native_history,
+                } = case;
+                compact_endpoint_available.store(endpoint_available, Ordering::SeqCst);
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let persistence_tx = successful_timeline_persistence();
+                let actor =
+                    create_test_actor(10_000, 200_000, 85, gateway_tx, persistence_tx).await;
+                let canonical_system = format!("canonical instructions {case_index}");
+                let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                cfg.base_url = base_url.clone();
+                cfg.model = "gpt-default-routing".into();
+                cfg.reasoning_effort =
+                    Some(xai_grok_sampling_types::ReasoningEffort::High);
+                cfg.extra_headers.insert(
+                    xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.into(),
+                    format!("acct-default-routing-{case_index}"),
+                );
+                actor.chat_state_handle.update_sampling_config(cfg);
+                actor.chat_state_handle.replace_conversation(vec![
+                    ConversationItem::system(canonical_system.clone()),
+                    ConversationItem::user("preserve the completed implementation"),
+                ]);
+
+                actor
+                    .run_compact_inner(
+                        user_context.map(str::to_owned),
+                        None,
+                        xai_grok_telemetry::events::CompactionTrigger::Manual,
+                        strategy_override,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{case_name} ({strategy_override:?}) must complete through its selected route: {error}"
+                        )
+                    });
+
+                if expect_native_attempt {
+                    expected_compact_hits += 1;
+                }
+                if !expect_native_history {
+                    expected_responses_hits += 1;
+                }
+                assert_eq!(
+                    compact_hits.load(Ordering::SeqCst),
+                    expected_compact_hits,
+                    "{case_name}, override {strategy_override:?}"
+                );
+                assert_eq!(
+                    responses_hits.load(Ordering::SeqCst),
+                    expected_responses_hits,
+                    "{case_name}, override {strategy_override:?}"
+                );
+                let history = actor.chat_state_handle.get_conversation().await;
+                assert!(matches!(
+                    history.first(),
+                    Some(ConversationItem::System(system))
+                        if &*system.content == canonical_system
+                ));
+                let has_native_metadata = history.iter().any(|item| {
+                    matches!(
+                        item,
+                        ConversationItem::Provider(provider)
+                            if provider.is_native_compaction_metadata()
+                    )
+                });
+                let has_encrypted_compaction = history.iter().any(|item| {
+                    matches!(
+                        item,
+                        ConversationItem::Provider(provider)
+                            if provider.is_encrypted_compaction()
+                    )
+                });
+                if expect_native_history {
+                    assert!(has_native_metadata, "{case_name}");
+                    assert!(has_encrypted_compaction, "{case_name}");
+                } else {
+                    assert!(!has_native_metadata, "{case_name}");
+                    assert!(!has_encrypted_compaction, "{case_name}");
+                    assert!(
+                        history
+                            .iter()
+                            .any(|item| item.text_content().contains("Local route summary.")),
+                        "{case_name} did not install the local summary"
+                    );
+                }
+            }
+
+            let bodies = compact_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 3);
+            for body in bodies.iter() {
+                assert_eq!(body["model"], "gpt-default-routing");
+                assert_eq!(
+                    body.pointer("/reasoning/effort"),
+                    Some(&serde_json::Value::String("high".into()))
+                );
+            }
+            drop(bodies);
+
+            let bodies = responses_bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 3);
+            assert!(
+                bodies.iter().any(|body| body
+                    .to_string()
+                    .contains("retain the edge-caserino guidance")),
+                "guided /compact context did not reach the local summarization request"
+            );
+        })
+        .await;
+}
+
 /// 401 auto-compact: SUPPRESS_AUTH + reauthable RetryState (abort for /login).
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {
@@ -732,6 +1225,7 @@ async fn e2e_auto_compact_401_suppresses_auth_and_surfaces_reauth() {
                     tokens_used: 180_000,
                     context_window: 200_000,
                     percentage: 90,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
                 })
                 .await
                 .expect_err("401 mock must fail auto-compact");
@@ -867,7 +1361,7 @@ async fn e2e_model_switch_compact_non_auth_failure_does_not_abort() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor =
                 Arc::new(create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await);
             let base_url = spawn_deterministic_400_server().await;
@@ -904,7 +1398,7 @@ async fn clear_auth_suppress_allows_model_switch_compact_reeval() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor =
                 Arc::new(create_test_actor(214_000, 200_000, 85, gateway_tx, persistence_tx).await);
             actor
@@ -966,7 +1460,7 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let actor =
                 Arc::new(create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await);
             let base_url = spawn_deterministic_400_server().await;
@@ -989,6 +1483,7 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
                     tokens_used: 180_000,
                     context_window: 200_000,
                     percentage: 90,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
                 })
                 .await;
             assert!(result.is_err(), "mock 400 must fail the compaction");
@@ -1000,6 +1495,90 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_auto_compact_reports_error_and_blocks_identical_retry() {
+    use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+    use crate::session::compaction_config::AUTO_COMPACT_RETRY_AFTER_RESET;
+    use crate::session::storage::SessionUpdate;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(180_000, 200_000, 85, gateway_tx, persistence_tx).await);
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = spawn_deterministic_400_server().await;
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("sys"),
+                ConversationItem::user("compact me"),
+            ]);
+            let trigger = AutoCompactTriggerInfo {
+                tokens_used: 180_000,
+                context_window: 200_000,
+                percentage: 90,
+                kind: AutoCompactTriggerKind::SoftThreshold,
+            };
+
+            actor
+                .run_compact_only(trigger)
+                .await
+                .expect_err("invalid request must fail auto-compaction");
+            assert_eq!(
+                actor
+                    .compaction
+                    .auto_compact_retry_not_before_ms
+                    .load(Relaxed),
+                AUTO_COMPACT_RETRY_AFTER_RESET,
+                "deterministic failure must not be re-submitted on another turn"
+            );
+
+            let mut starts = 0;
+            let mut failures = Vec::new();
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::Update(SessionUpdate::Xai(notification)) = msg {
+                    match notification.update {
+                        XaiSessionUpdate::AutoCompactStarted { .. } => starts += 1,
+                        XaiSessionUpdate::AutoCompactFailed { error } => failures.push(error),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(starts, 1);
+            assert_eq!(failures.len(), 1);
+            assert!(
+                failures[0].contains("invalid_request_error") || failures[0].contains("bad schema"),
+                "the original provider error must be observable: {:?}",
+                failures
+            );
+
+            let blocked = actor
+                .run_compact_only(trigger)
+                .await
+                .expect_err("retry gate must block the identical lifecycle");
+            assert!(
+                SessionActor::acp_error_message(&blocked)
+                    .contains("previously failed deterministically")
+            );
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::Update(SessionUpdate::Xai(notification)) = msg {
+                    assert!(
+                        !matches!(
+                            notification.update,
+                            XaiSessionUpdate::AutoCompactStarted { .. }
+                        ),
+                        "blocked retries must not emit a false start or hit the provider"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
 /// A forked session whose whole-transcript inherited prefix alone exceeds
 /// the auto-compact threshold releases the prefix on compaction (so the
 /// conversation can actually shrink below the threshold) and keeps the
@@ -1013,7 +1592,7 @@ async fn forked_prefix_released_under_pressure_and_stays_released() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
             let filler = "x".repeat(8_000);
             let mut conv = vec![ConversationItem::system("small system prompt")];
             for i in 0..9 {
@@ -1088,7 +1667,8 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) =
+                successful_timeline_persistence_with_messages();
             let huge_system = "s".repeat(150_000);
             let conv = vec![
                 ConversationItem::system(huge_system),
@@ -1123,6 +1703,7 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
                 SUPPRESS_STICKY,
                 "an over-threshold released history must set sticky suppression"
             );
+            tokio::task::yield_now().await;
             let mut saw_failure = false;
             while let Ok(msg) = persistence_rx.try_recv() {
                 if let PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(notif)) =
@@ -1142,6 +1723,525 @@ async fn forked_release_still_over_threshold_suppresses_auto() {
         })
         .await;
 }
+/// Ordinary (non-fork) sessions need the same post-install protection as
+/// inherited-prefix sessions. A large fixed system prompt can leave the
+/// rebuilt history over threshold even though summarization succeeded.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_ordinary_replacement_suppresses_auto() {
+    use crate::session::compaction_config::SUPPRESS_STICKY;
+    use std::sync::atomic::Ordering::Relaxed;
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let conv = vec![
+                ConversationItem::system("s".repeat(150_000)),
+                ConversationItem::user("q"),
+                ConversationItem::assistant("a"),
+                ConversationItem::user("final query"),
+            ];
+            let actor =
+                Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Summary. ".repeat(70));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(conv);
+
+            let result = actor.run_compact(None).await;
+            assert!(result.is_ok(), "compaction should succeed: {result:?}");
+            assert_eq!(
+                actor.compaction.auto_compact_suppressed.load(Relaxed),
+                SUPPRESS_STICKY,
+                "an ordinary over-threshold replacement must suppress AUTO"
+            );
+        })
+        .await;
+}
+
+/// Soft-threshold AUTO that lands still over the soft threshold (but under
+/// any Codex safety limit) keeps the installed history and continues with
+/// sticky suppress, instead of reporting failure after a durable install.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_automatic_soft_overshoot_continues_with_suppress() {
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Summary. ".repeat(70));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("s".repeat(150_000)),
+                ConversationItem::user("q"),
+                ConversationItem::assistant("a"),
+                ConversationItem::user("final query"),
+            ]);
+
+            actor
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used: 36_400,
+                    context_window: 40_000,
+                    percentage: 91,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
+                })
+                .await
+                .expect("soft-only overshoot must keep installed history usable");
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "sticky post-install suppression must prevent an immediate soft-threshold retry"
+            );
+        })
+        .await;
+}
+
+/// A sticky suppression can describe a prior successful soft-only
+/// compaction. It must not turn a later transient Codex safety failure into
+/// a permanent retry gate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn codex_transient_failure_after_soft_overshoot_uses_expiring_cooldown() {
+    use crate::session::compaction_config::{AUTO_COMPACT_RETRY_AFTER_RESET, SUPPRESS_STICKY};
+    use std::sync::atomic::Ordering::Relaxed;
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+            let success_server = MockInferenceServer::start().await.unwrap();
+            success_server.set_response("Summary. ".repeat(70));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = success_server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("s".repeat(150_000)),
+                ConversationItem::user("q"),
+                ConversationItem::assistant("a"),
+                ConversationItem::user("final query"),
+            ]);
+
+            actor
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used: 36_400,
+                    context_window: 40_000,
+                    percentage: 91,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
+                })
+                .await
+                .expect("soft-only overshoot must keep installed history usable");
+            assert_eq!(
+                actor.compaction.auto_compact_suppressed.load(Relaxed),
+                SUPPRESS_STICKY,
+                "successful soft overshoot must leave sticky suppression"
+            );
+
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.base_url = spawn_transient_503_server().await;
+            actor.chat_state_handle.update_sampling_config(cfg);
+            let tokens_used = actor.chat_state_handle.get_total_tokens().await;
+            assert!(
+                actor.codex_safety_limit_exceeded(tokens_used).await,
+                "soft overshoot fixture must also exceed the later Codex safety limit"
+            );
+
+            actor
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used,
+                    context_window: 40_000,
+                    percentage: (tokens_used.saturating_mul(100) / 40_000).min(100) as u8,
+                    kind: AutoCompactTriggerKind::CodexSafety,
+                })
+                .await
+                .expect_err("transient 503s must exhaust the Codex compaction lifecycle");
+
+            let retry_at = actor
+                .compaction
+                .auto_compact_retry_not_before_ms
+                .load(Relaxed);
+            assert_ne!(
+                retry_at, AUTO_COMPACT_RETRY_AFTER_RESET,
+                "stale sticky suppression must not make a transient failure permanent"
+            );
+            assert!(
+                retry_at > SessionActor::current_epoch_ms(),
+                "transient failure must leave an active expiring cooldown"
+            );
+            assert!(
+                SessionActor::acp_error_message(
+                    &actor
+                        .auto_compact_retry_gate_error()
+                        .expect("transient cooldown must be active")
+                )
+                .contains("cooling down")
+            );
+        })
+        .await;
+}
+
+/// Post-install validation for a Codex safety trigger only checks the
+/// Codex provider budget — soft threshold may remain over without failing
+/// a Codex-safe install.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_codex_trigger_ignores_soft_dead_band() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            // Soft threshold 80%, Codex safety defaults to 90%.
+            let actor =
+                Arc::new(create_test_actor(0, 100_000, 80, gateway_tx, persistence_tx).await);
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // 85k is over soft (80k) but under Codex safety (90k).
+            assert!(
+                !actor
+                    .auto_compaction_would_immediately_retrigger(
+                        85_000,
+                        AutoCompactTriggerKind::CodexSafety,
+                    )
+                    .await,
+                "Codex-triggered compact must accept history under the Codex safety limit"
+            );
+            assert!(
+                actor
+                    .auto_compaction_would_immediately_retrigger(
+                        85_000,
+                        AutoCompactTriggerKind::SoftThreshold,
+                    )
+                    .await,
+                "soft-triggered compact must still reject soft overshoot"
+            );
+        })
+        .await;
+}
+
+/// Post-install validation must include Codex's provider safety boundary,
+/// which can be lower than the ordinary configured soft threshold.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_honors_codex_safety_limit() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(0, 100_000, 95, gateway_tx, persistence_tx).await);
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            assert!(
+                actor
+                    .auto_compaction_would_immediately_retrigger(
+                        91_000,
+                        AutoCompactTriggerKind::SoftThreshold,
+                    )
+                    .await,
+                "Codex's 90% safety limit must override the higher 95% soft threshold for soft triggers"
+            );
+            assert!(
+                actor
+                    .auto_compaction_would_immediately_retrigger(
+                        91_000,
+                        AutoCompactTriggerKind::CodexSafety,
+                    )
+                    .await,
+                "Codex safety trigger must reject history still over the Codex limit"
+            );
+        })
+        .await;
+}
+
+/// A bounded subagent may compact once. That successful cycle switches it
+/// to tool-free finalization, and a later context refill cannot start a
+/// second compaction request in the same top-level turn.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_bounded_subagent_compacts_once() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let mut actor = create_test_actor(0, 200_000, 90, gateway_tx, persistence_tx).await;
+            actor.tool_context.subagent_depth = 1;
+            actor.tool_context.subagent_compaction_policy =
+                xai_grok_tools::implementations::grok_build::task::types::SubagentCompactionPolicy::FinalizeAfterOneCompaction;
+            let actor = Arc::new(actor);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Verified findings summary. ".repeat(30));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("review system"),
+                ConversationItem::user("review the diff"),
+                ConversationItem::assistant("candidate finding"),
+                ConversationItem::user("continue"),
+            ]);
+            let trigger = AutoCompactTriggerInfo {
+                tokens_used: 182_000,
+                context_window: 200_000,
+                percentage: 91,
+                kind: AutoCompactTriggerKind::SoftThreshold,
+            };
+
+            actor
+                .run_compact_only(trigger)
+                .await
+                .expect("first bounded-task compaction should succeed");
+            assert!(
+                actor.bounded_subagent_must_finalize(),
+                "first success must force synthesis-only mode"
+            );
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                conversation.iter().any(|item| item
+                    .text_content()
+                    .contains("one allowed automatic compaction")),
+                "the compacted task must receive an explicit finalization reminder"
+            );
+            let requests_after_first = server.request_count();
+
+            // Simulate the original failure mode: post-compaction exploration
+            // rapidly refills the context before the task has finalized.
+            // Soft stays quiet in FINALIZING; hard gates remain live so a
+            // second cycle can fail closed via claim_bounded.
+            actor
+                .chat_state_handle
+                .push_user_message(ConversationItem::user("refill ".repeat(120_000)));
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "FINALIZING must suppress soft auto-compact so the finalize reminder cannot re-arm"
+            );
+            assert!(
+                actor.check_preflight_overflow().await.is_some(),
+                "FINALIZING must keep the hard context-window preflight gate live"
+            );
+            // Defense in depth: even a forced run_compact_only must fail closed.
+            let refill_trigger = AutoCompactTriggerInfo {
+                tokens_used: 190_000,
+                context_window: 200_000,
+                percentage: 95,
+                kind: AutoCompactTriggerKind::SoftThreshold,
+            };
+            let err = actor
+                .run_compact_only(refill_trigger)
+                .await
+                .expect_err("a second cycle in the same subagent turn must be rejected");
+            assert!(
+                err.to_string().contains("compaction cycle limit reached"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                server.request_count(),
+                requests_after_first,
+                "the rejected second cycle must not reach the model"
+            );
+
+            actor.reset_bounded_auto_compaction_for_turn();
+            assert_eq!(
+                actor.compaction.bounded_auto_compact_state.load(Relaxed),
+                BOUNDED_COMPACT_NONE,
+                "a genuinely new prompt turn receives a fresh budget"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ordinary_nested_subagent_is_not_implicitly_bounded() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let mut actor = create_test_actor(0, 200_000, 90, gateway_tx, persistence_tx).await;
+            actor.tool_context.subagent_depth = 1;
+
+            assert!(
+                !actor.is_bounded_subagent_task(),
+                "nesting depth alone must not impose a one-compaction lifecycle"
+            );
+            assert!(!actor.bounded_subagent_must_finalize());
+        })
+        .await;
+}
+
+/// FINALIZING must not mute Codex's hard provider safety gate: refill that
+/// crosses the limit should request another compact and then fail closed
+/// at claim_bounded before sampling.
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_finalizing_keeps_codex_safety_gate_live() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let mut actor = create_test_actor(0, 200_000, 90, gateway_tx, persistence_tx).await;
+            actor.tool_context.subagent_depth = 1;
+            actor.tool_context.subagent_compaction_policy =
+                xai_grok_tools::implementations::grok_build::task::types::SubagentCompactionPolicy::FinalizeAfterOneCompaction;
+            let actor = Arc::new(actor);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Verified findings summary. ".repeat(30));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            // Compact against the mock; then flip to Codex URL so the
+            // safety gate evaluates against the installed+refill history.
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("review system"),
+                ConversationItem::user("review the diff"),
+                ConversationItem::assistant("candidate finding"),
+                ConversationItem::user("continue"),
+            ]);
+
+            actor
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used: 182_000,
+                    context_window: 200_000,
+                    percentage: 91,
+                    kind: AutoCompactTriggerKind::SoftThreshold,
+                })
+                .await
+                .expect("first bounded-task compaction should succeed");
+            assert!(actor.bounded_subagent_must_finalize());
+
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor
+                .chat_state_handle
+                .push_user_message(ConversationItem::user("refill ".repeat(120_000)));
+
+            assert!(
+                actor.check_auto_compact_needed().await.is_none(),
+                "soft gate stays suppressed in FINALIZING"
+            );
+            let codex_trigger = actor
+                .check_codex_auto_compact_needed()
+                .await
+                .expect("FINALIZING must keep Codex safety live after refill");
+            let err = actor
+                .run_compact_only(codex_trigger)
+                .await
+                .expect_err("second cycle must fail closed at claim_bounded");
+            assert!(
+                err.to_string().contains("compaction cycle limit reached"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                actor.compaction.bounded_auto_compact_state.load(Relaxed),
+                BOUNDED_COMPACT_FINALIZING,
+                "failed second claim must leave FINALIZING intact"
+            );
+        })
+        .await;
+}
+
+/// Soft-overshoot success is only legal under the hard context window.
+/// A replacement that remains at/above context_window must fail terminally
+/// even on non-Codex backends (where Codex safety is always clear).
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_hard_oversize_fails_closed_without_codex() {
+    use xai_grok_test_support::MockInferenceServer;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            // Tiny window so a long "summary" still exceeds the hard limit.
+            let actor = Arc::new(create_test_actor(0, 1_000, 80, gateway_tx, persistence_tx).await);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Summary that stays oversized. ".repeat(200));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg);
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("s".repeat(20_000)),
+                ConversationItem::user("q"),
+                ConversationItem::assistant("a"),
+                ConversationItem::user("final query"),
+            ]);
+
+            let err = actor
+                .run_compact_only(AutoCompactTriggerInfo {
+                    tokens_used: 900,
+                    context_window: 1_000,
+                    percentage: 90,
+                    kind: AutoCompactTriggerKind::PreflightOverflow,
+                })
+                .await
+                .expect_err("hard-oversize replacement must not report success");
+            assert!(
+                err.to_string().contains("insufficient headroom"),
+                "unexpected error: {err}"
+            );
+        })
+        .await;
+}
+
+/// Codex safety still exceeded after install remains fail-closed — sticky
+/// soft suppress is not enough to continue sampling past the provider budget.
+#[tokio::test(flavor = "current_thread")]
+async fn compaction_loop_guard_codex_still_over_fails_closed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(0, 100_000, 80, gateway_tx, persistence_tx).await);
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            assert!(
+                actor
+                    .auto_compaction_would_immediately_retrigger(
+                        91_000,
+                        AutoCompactTriggerKind::CodexSafety,
+                    )
+                    .await,
+                "history still over Codex 90% must fail the Codex headroom gate"
+            );
+            assert!(
+                actor.codex_safety_limit_exceeded(91_000).await,
+                "codex_safety_limit_exceeded is the fail-closed signal for post-install"
+            );
+        })
+        .await;
+}
+
 /// `classify_suppress_reason` maps each deterministic-failure shape to its
 /// fixed [`SuppressReason`].
 #[test]
@@ -1537,38 +2637,65 @@ async fn test_pre_sampling_uses_estimated_tokens() {
         })
         .await;
 }
-/// Model-switch compaction fires when switching to a smaller context window.
+/// A same-model context-window shrink must clear a deterministic lifecycle
+/// gate and proactively compact when the transcript exceeds the new soft
+/// budget.
 #[tokio::test(flavor = "current_thread")]
-async fn test_model_switch_compaction_triggers_on_downgrade() {
+async fn same_model_context_shrink_reenables_and_triggers_compaction() {
+    use crate::session::compaction_config::PreviousModelInfo;
+    use std::sync::atomic::Ordering::Relaxed;
+    use xai_grok_test_support::MockInferenceServer;
+
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _) = mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _) = mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(86_000, 100_000, 85, gateway_tx, persistence_tx).await;
-            actor.compaction.previous_model.set(Some(
-                crate::session::compaction_config::PreviousModelInfo {
-                    model_slug: "large-model".to_string(),
-                    context_window: 200_000,
-                },
-            ));
-            let prev = actor.compaction.previous_model.take();
-            assert!(prev.is_some());
-            let prev = prev.unwrap();
-            assert_eq!(prev.context_window, 200_000);
-            let cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
-            assert!(prev.context_window > cfg.context_window.get());
-            let total = actor.chat_state_handle.get_estimated_total_tokens().await;
-            let trigger = actor.should_auto_compact(total, cfg.context_window);
-            assert!(trigger.is_some(), "86% > 85% threshold, should trigger");
-            actor.compaction.previous_model.set(Some(
-                crate::session::compaction_config::PreviousModelInfo {
-                    model_slug: "small-model".to_string(),
-                    context_window: 50_000,
-                },
-            ));
-            let prev = actor.compaction.previous_model.take().unwrap();
-            assert!(prev.context_window <= cfg.context_window.get());
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let persistence_tx = successful_timeline_persistence();
+            let actor =
+                Arc::new(create_test_actor(0, 40_000, 80, gateway_tx, persistence_tx).await);
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("Summary. ".repeat(70));
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            actor.chat_state_handle.update_sampling_config(cfg.clone());
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("s".repeat(150_000)),
+                ConversationItem::user("q"),
+                ConversationItem::assistant("a"),
+                ConversationItem::user("final query"),
+            ]);
+            let total_tokens = actor.chat_state_handle.get_estimated_total_tokens().await;
+            assert!(
+                actor
+                    .should_auto_compact(total_tokens, cfg.context_window)
+                    .is_some(),
+                "fixture must exceed the shrunken context budget's soft threshold"
+            );
+
+            actor
+                .suppress_auto_compaction(SuppressReason::Size, total_tokens, 80_000)
+                .await;
+            actor.record_auto_compact_retry_gate(AutoCompactFailureDisposition::RetryAfterReset);
+            actor.compaction.previous_model.set(Some(PreviousModelInfo {
+                model_slug: cfg.model,
+                context_window: 80_000,
+            }));
+
+            actor
+                .maybe_compact_on_model_switch()
+                .await
+                .expect("same-model shrink compaction must remain usable");
+
+            assert_eq!(
+                server.request_count(),
+                1,
+                "same-model shrink must reach the compaction model"
+            );
+            assert_eq!(
+                actor.compaction.count.load(Relaxed),
+                1,
+                "same-model shrink must launch exactly one compaction lifecycle"
+            );
         })
         .await;
 }
@@ -1579,7 +2706,7 @@ async fn get_transcript_path_returns_some_when_file_exists() {
         .run_until(async {
             let (gateway_tx, _gateway_rx) =
                 mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel::<PersistenceMsg>();
+            let persistence_tx = successful_timeline_persistence();
             let mut actor =
                 create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await;
             actor.compaction.compaction_mode = xai_chat_state::CompactionMode::Transcript;

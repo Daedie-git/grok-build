@@ -1052,6 +1052,10 @@ pub struct SamplingConfig {
     /// Which API backend to use for this model
     #[serde(default)]
     pub api_backend: ApiBackend,
+    /// Explicit logical provider identity. Absent values retain legacy URL
+    /// inference when loading older chat-state snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<crate::ProviderId>,
     /// Extra headers to send with requests (e.g., for BYOK scenarios).
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     pub extra_headers: indexmap::IndexMap<String, String>,
@@ -1102,6 +1106,21 @@ pub struct CreateResponseWrapper {
     /// `async_openai`'s `rs::Tool` enum (e.g., `x_search`). Injected
     /// as raw JSON into the serialized request body's `tools` array.
     pub extra_tool_entries: Vec<serde_json::Value>,
+
+    /// Provider fields aligned with serialized user/assistant messages.
+    /// Bridges optional ID/status/phase fields absent from async-openai's
+    /// `EasyInputMessage` without weakening the typed request model.
+    pub response_message_metadata: Vec<crate::CodexResponseMessageMetadata>,
+
+    /// Provider-owned metadata aligned to exact Responses input positions.
+    /// Bridges the pinned async-openai request model without broad raw JSON.
+    pub response_item_metadata_passthrough: Vec<crate::ResponsesInputItemMetadata>,
+
+    /// Exact provider identity to stamp on metadata captured from this response.
+    pub response_metadata_origin: Option<crate::ResponseMetadataOrigin>,
+
+    /// Process-local routing scope for one prompt turn. Never serialized.
+    pub turn_routing_state: Option<crate::TurnRoutingState>,
 }
 
 impl CreateResponseWrapper {
@@ -1118,6 +1137,10 @@ impl CreateResponseWrapper {
             x_grok_user_id: None,
             trace: None,
             extra_tool_entries: vec![],
+            response_message_metadata: vec![],
+            response_item_metadata_passthrough: vec![],
+            response_metadata_origin: None,
+            turn_routing_state: None,
         }
     }
 

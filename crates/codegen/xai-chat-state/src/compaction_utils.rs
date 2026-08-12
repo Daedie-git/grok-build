@@ -4,7 +4,9 @@
 //! no I/O, no actor state. They live in `xai-chat-state` so that both
 //! this crate and `xai-grok-shell` can share them without duplication.
 use std::collections::BTreeSet;
-use xai_grok_sampling_types::{ContentPart, ConversationItem, ToolResultItem};
+use xai_grok_sampling_types::{
+    ContentPart, ConversationItem, ToolResultItem, is_tool_result_run_transparent,
+};
 /// Drops tool results and flattens assistant `tool_calls` into
 /// `[Called tools: ...]` text annotations.
 ///
@@ -124,7 +126,15 @@ pub fn prepare_conversation_for_verbatim_summarization(
 fn estimate_item_tokens(item: &ConversationItem) -> u64 {
     crate::actor::state::estimate_item_tokens(item)
 }
-/// Shrink a verbatim conversation to `max_tokens`: drop oldest whole turns (System kept, tool runs unsplit; the last turn is truncated in place rather than dropped).
+/// Best-effort shrink a verbatim conversation to `max_tokens`: drop oldest
+/// whole turns (System kept, tool runs unsplit; the last turn is truncated in
+/// place rather than dropped).
+///
+/// Retained structural fields have a non-zero minimum cost. If `max_tokens` is
+/// smaller than that minimum, the returned estimate can honestly remain above
+/// budget rather than dropping the required System message or orphaning a tool
+/// result from its call. Callers that report fit status must re-estimate the
+/// returned items.
 pub fn fit_conversation_to_budget(
     conversation: Vec<ConversationItem>,
     max_tokens: u64,
@@ -1002,14 +1012,15 @@ pub fn repair_history(items: &mut Vec<ConversationItem>) -> HistoryRepairReport 
         synthetic_results_inserted,
     }
 }
-/// Strip `ToolResult`s that are not in the contiguous run immediately
-/// following the `Assistant` declaring their `tool_call_id` — both orphans
-/// (owner gone: the bricked-session case) and displaced results. Returns the
+/// Strip `ToolResult`s that are not in the result run following the `Assistant`
+/// declaring their `tool_call_id` — both orphans (owner gone: the
+/// bricked-session case) and displaced results. Responses reasoning siblings
+/// and exact-response manifests are transparent within that run. Returns the
 /// stripped ids in order.
 ///
 /// Deliberately stricter than [`sanitize_compacted_history`]'s "matching id
-/// anywhere before" (providers require adjacency), and deliberately the same
-/// contiguous-run rule as [`repair_dangling_tool_calls`] /
+/// anywhere before" and deliberately uses the same result-run rule as
+/// [`repair_dangling_tool_calls`] /
 /// [`dedup_duplicate_tool_results`] so the [`repair_history`] passes agree on
 /// which calls are answered (a leniency mismatch would make the dangling pass
 /// insert synthetic duplicates next to kept results).
@@ -1033,6 +1044,7 @@ pub fn strip_displaced_tool_results(items: &mut Vec<ConversationItem>) -> Vec<St
                 false
             }
         }
+        item if is_tool_result_run_transparent(item) => true,
         _ => {
             run_ids.clear();
             true

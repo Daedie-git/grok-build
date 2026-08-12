@@ -127,6 +127,64 @@ pub struct Credentials {
     pub client_version: Option<String>,
 }
 
+/// Atomic read of all actor-owned inputs used to reconstruct a sampler.
+#[derive(Debug, Clone)]
+pub struct SamplingState {
+    pub config: SamplingConfig,
+    pub credentials: Credentials,
+}
+
+/// Durable-history portion of an applied sampling transition.
+#[derive(Debug)]
+pub enum SamplingTransitionPersistence {
+    /// Identity-compatible history required no durable replacement.
+    NotRequired,
+    /// The replacement history committed successfully.
+    Committed,
+    /// The replacement cache committed, but non-authoritative bookkeeping
+    /// failed afterward. Memory is installed because it matches durable history.
+    CommittedWithBookkeepingWarning(std::io::Error),
+}
+
+/// Successful authoritative transition of history, config, and credentials.
+#[derive(Debug)]
+pub struct SamplingTransitionApplied {
+    pub history_changed: bool,
+    pub persistence: SamplingTransitionPersistence,
+}
+
+/// Failed authoritative sampling transition. Every variant leaves actor-owned
+/// conversation, sampling config, and credentials unchanged.
+#[derive(Debug)]
+pub enum SamplingTransitionError {
+    History(xai_grok_sampling_types::SamplingIdentityHistoryError),
+    HistoryReplacementNotCommitted(std::io::Error),
+    /// The acknowledgement disappeared after the request was handed to
+    /// persistence, so durable state cannot be inferred safely.
+    HistoryReplacementIndeterminate(std::io::Error),
+}
+
+impl std::fmt::Display for SamplingTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::History(error) => write!(f, "{error}"),
+            Self::HistoryReplacementNotCommitted(error) => {
+                write!(f, "history replacement was not committed: {error}")
+            }
+            Self::HistoryReplacementIndeterminate(error) => {
+                write!(
+                    f,
+                    "history replacement commit status is indeterminate: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SamplingTransitionError {}
+
+pub type SamplingTransitionResult = Result<SamplingTransitionApplied, SamplingTransitionError>;
+
 /// The messages captured during a single conversation turn.
 ///
 /// Produced by `TakeTurnMessages` after a `BeginTurnCapture`/message-push cycle.
@@ -180,6 +238,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -212,11 +271,21 @@ mod tests {
     fn snapshot_round_trips_with_data() {
         use xai_grok_sampling_types::ConversationItem;
 
+        let mut retained_user = ConversationItem::user("Hello!");
+        if let ConversationItem::User(user) = &mut retained_user {
+            user.response_item_id = Some("msg_snapshot_user".into());
+        }
         let snapshot = ChatStateSnapshot {
             conversation: vec![
                 ConversationItem::system("You are a helpful assistant."),
-                ConversationItem::user("Hello!"),
+                retained_user,
                 ConversationItem::assistant("Hi there!"),
+                ConversationItem::encrypted_compaction(
+                    xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                        id: Some("cmp_snapshot".into()),
+                        encrypted_content: "encrypted-checkpoint-context".into(),
+                    },
+                ),
             ],
             sampling_config: SamplingConfig {
                 base_url: "https://api.example.com".to_string(),
@@ -225,6 +294,7 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 extra_headers: Default::default(),
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
@@ -251,7 +321,23 @@ mod tests {
 
         assert_eq!(deserialized.prompt_index, 5);
         assert_eq!(deserialized.total_tokens, 1234);
-        assert_eq!(deserialized.conversation.len(), 3);
+        assert_eq!(deserialized.conversation.len(), 4);
+        assert!(matches!(
+            &deserialized.conversation[1],
+            ConversationItem::User(user)
+                if user.response_item_id.as_deref() == Some("msg_snapshot_user")
+        ));
+        let ConversationItem::Provider(provider) = &deserialized.conversation[3] else {
+            panic!(
+                "expected persisted native compaction item, got {:?}",
+                deserialized.conversation[3]
+            )
+        };
+        let item = provider
+            .as_encrypted_compaction()
+            .expect("encrypted native compaction payload");
+        assert_eq!(item.id.as_deref(), Some("cmp_snapshot"));
+        assert_eq!(item.encrypted_content, "encrypted-checkpoint-context");
         assert_eq!(deserialized.agent_edited_paths.len(), 2);
         assert_eq!(deserialized.prompt_texts.len(), 2);
         assert_eq!(deserialized.stream_start_ms, Some(1234567890));

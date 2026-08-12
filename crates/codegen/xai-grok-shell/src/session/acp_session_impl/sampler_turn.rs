@@ -412,25 +412,42 @@ impl SessionActor {
                 }
             }
         }
-        let cfg = self
+        #[allow(clippy::items_after_statements)]
+        struct AuthManagerBearerResolver(std::sync::Arc<crate::auth::AuthManager>);
+        impl std::fmt::Debug for AuthManagerBearerResolver {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("AuthManagerBearerResolver").finish()
+            }
+        }
+        impl xai_grok_sampler::BearerResolver for AuthManagerBearerResolver {
+            fn current_bearer(&self) -> Option<String> {
+                self.0.current_wire_valid().map(|a| a.key)
+            }
+        }
+        let sampling_state = self
             .chat_state_handle
-            .get_sampling_config()
+            .get_sampling_state()
             .await
-            .unwrap_or_else(|| xai_grok_sampling_types::SamplingConfig {
-                base_url: String::new(),
-                model: String::new(),
-                max_completion_tokens: None,
-                temperature: None,
-                top_p: None,
-                api_backend: Default::default(),
-                extra_headers: Default::default(),
-                query_params: Default::default(),
-                env_http_headers: Default::default(),
-                context_window: std::num::NonZeroU64::new(256_000).unwrap(),
-                reasoning_effort: None,
-                stream_tool_calls: None,
+            .unwrap_or_else(|| xai_chat_state::SamplingState {
+                config: xai_grok_sampling_types::SamplingConfig {
+                    base_url: String::new(),
+                    model: String::new(),
+                    max_completion_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                    api_backend: Default::default(),
+                    provider_id: None,
+                    extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
+                    context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                    reasoning_effort: None,
+                    stream_tool_calls: None,
+                },
+                credentials: xai_chat_state::Credentials::default(),
             });
-        let creds = self.chat_state_handle.get_credentials().await;
+        let cfg = sampling_state.config;
+        let creds = sampling_state.credentials;
         let model_facts = self.model_auth_facts(cfg.model.as_str());
         let auth_method = self.auth_method_id.load();
         let gate =
@@ -456,7 +473,15 @@ impl SessionActor {
         );
         let compaction_at_tokens = self.compaction_at_tokens.get();
         let compactions_remaining = self.compactions_remaining.get();
-        if compactions_remaining.is_some() || compaction_at_tokens.is_some() {
+        if !xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
+            &cfg.base_url,
+        )
+        .capabilities()
+        .skips_grok_compaction_headers()
+            && (compactions_remaining.is_some() || compaction_at_tokens.is_some())
+        {
             let has_compaction_summary = self
                 .chat_state_handle
                 .get_last_compaction_prompt_index()
@@ -491,6 +516,7 @@ impl SessionActor {
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             api_backend: cfg.api_backend,
+            provider_id: cfg.provider_id,
             auth_scheme,
             extra_headers,
             extra_response_includes,
@@ -730,6 +756,15 @@ impl SessionActor {
         &self,
         force_http1: bool,
     ) -> Result<xai_grok_sampler::SamplingClient, acp::Error> {
+        if self
+            .compaction
+            .reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(acp::Error::internal_error().data(
+                "session persistence outcome is ambiguous; reload the session before sampling again",
+            ));
+        }
         self.refresh_token_if_expired().await;
         let mut full_config = self.reconstruct_full_config().await;
         full_config.force_http1 = force_http1;
@@ -883,6 +918,7 @@ impl SessionActor {
                     tokens_used: total_tokens,
                     context_window: cw,
                     percentage,
+                    kind: compaction::AutoCompactTriggerKind::SoftThreshold,
                 };
                 if let Err(e) = self.run_compact_only(trigger_info).await {
                     if Self::is_auth_compact_error(&e) {
@@ -1163,6 +1199,15 @@ impl SessionActor {
         self: &Arc<Self>,
         request: ConversationRequest,
     ) -> Result<SamplerTurnOutcome, acp::Error> {
+        if self
+            .compaction
+            .reconciliation_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(acp::Error::internal_error().data(
+                "session persistence outcome is ambiguous; reload the session before sampling again",
+            ));
+        }
         self.prepare_sampler_for_turn().await;
         let stream_drained_rx = {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1225,12 +1270,9 @@ impl SessionActor {
     /// (grace / optimistic send); 401 recovery remains the safety net.
     pub(crate) async fn refresh_token_if_expired(&self) {
         if let Some(ref am) = self.auth_manager {
-            let creds = self.chat_state_handle.get_credentials().await;
-            let (model_id, base_url) = self
-                .chat_state_handle
-                .get_sampling_config()
-                .await
-                .map(|c| (c.model, c.base_url))
+            let sampling_state = self.chat_state_handle.get_sampling_state().await;
+            let (creds, model_id, base_url) = sampling_state
+                .map(|state| (state.credentials, state.config.model, state.config.base_url))
                 .unwrap_or_default();
             if self.auth_gate(&model_id, &base_url).active() {
                 match am.get_valid_token().await {
@@ -1278,13 +1320,9 @@ impl SessionActor {
         }
         use crate::auth::{is_jwt_expired_or_near, parse_jwt_expiration};
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
-        let creds = self.chat_state_handle.get_credentials().await;
-        let current_key = creds.api_key;
-        let current_model_id = self
-            .chat_state_handle
-            .get_sampling_config()
-            .await
-            .map(|c| c.model)
+        let sampling_state = self.chat_state_handle.get_sampling_state().await;
+        let (current_key, current_model_id) = sampling_state
+            .map(|state| (state.credentials.api_key, state.config.model))
             .unwrap_or_default();
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(

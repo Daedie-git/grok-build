@@ -26,6 +26,8 @@ pub enum SamplingConsumer {
     ResponsesStream,
     /// `create_response`: Responses API non-streaming.
     Responses,
+    /// Native unary Codex `responses/compact` replacement-history request.
+    ResponsesCompact,
     /// `messages_stream`: Anthropic Messages API streaming.
     MessagesStream,
     /// `messages`: Anthropic Messages API non-streaming.
@@ -43,6 +45,7 @@ impl SamplingConsumer {
             Self::ChatCompletions => "chat_completions",
             Self::ResponsesStream => "responses_stream",
             Self::Responses => "responses",
+            Self::ResponsesCompact => "responses_compact",
             Self::MessagesStream => "messages_stream",
             Self::Messages => "messages",
         }

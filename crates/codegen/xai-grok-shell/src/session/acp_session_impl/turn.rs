@@ -272,11 +272,10 @@ impl SessionActor {
             })),
         );
         let origin = super::super::PromptOrigin::from_prompt_id(prompt_id);
-        if let Some(completion_id) = origin.completion_id() {
+        if let super::super::PromptOrigin::WorkflowCompleted { completion_id } = &origin {
+            // Workflow wakes do not use TaskWakeFallback reservations, so retain
+            // their existing reported-at-start behavior.
             self.mark_completions_reported(&[completion_id]).await;
-            if let Some(reservations) = &self.tool_context.task_completion_reservations {
-                reservations.release(completion_id);
-            }
         }
         if !origin.is_synthetic() {
             self.invalidate_side_calls_for_new_prompt();
@@ -471,6 +470,13 @@ impl SessionActor {
             }
         };
         self.events.begin_turn();
+        // A new prompt gets a fresh bounded-task compaction budget. A single
+        // subagent turn may compact once, then it must synthesize without tools.
+        self.reset_bounded_auto_compaction_for_turn();
+        // A prompt turn owns one fresh provider-neutral routing scope. Every
+        // ordinary request, retry, inline compaction, and continuation built
+        // below shares this scope; the next prompt replaces it.
+        self.chat_state_handle.begin_turn_routing_scope();
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
@@ -707,9 +713,13 @@ impl SessionActor {
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({ "reason": "handle_prompt_user_start" })),
             );
-            self.consume_deferred_completions_for_user_turn().await;
+            let consumed = self.consume_deferred_completions_for_user_turn().await;
+            if consumed.is_empty() {
+                self.drain_between_turn_completions_suppressing(&[]).await;
+            }
+        } else {
+            self.drain_between_turn_completions_suppressing(&[]).await;
         }
-        self.drain_between_turn_completions().await;
         self.inject_workflow_status_reminder().await;
         let user_message = if user_images.is_empty() {
             user_message
@@ -798,7 +808,50 @@ impl SessionActor {
                     user_chat.add_image(format!("data:{};base64,{}", image.mime_type, image.data));
                 }
             }
-            if let Some(ack) = persist_ack {
+            let task_wake_completion_id = match &origin {
+                super::super::PromptOrigin::TaskCompleted { task_id } => Some(task_id.as_str()),
+                super::super::PromptOrigin::SubagentCompleted { subagent_id } => {
+                    Some(subagent_id.as_str())
+                }
+                _ => None,
+            };
+            if let Some(completion_id) = task_wake_completion_id {
+                debug_assert!(
+                    persist_ack.is_none(),
+                    "synthetic completion prompts never carry a persistence acknowledgement"
+                );
+                let fallback = {
+                    let mut state = self.state.lock().await;
+                    let Some(front) = state.pending_inputs.front_mut().filter(|input| {
+                        input.prompt_id == prompt_id && input.task_wake_fallback.is_some()
+                    }) else {
+                        tracing::debug!(
+                            prompt_id,
+                            completion_id,
+                            "completion prompt was cancelled before its chat commit"
+                        );
+                        return Err(acp::Error::internal_error()
+                            .data("completion prompt cancelled before chat commit"));
+                    };
+                    self.chat_state_handle.push_user_message(user_chat);
+                    front.task_wake_fallback.take()
+                };
+                // Finalize reporting outside the turn task so Ctrl+C cannot
+                // interrupt the async resource update after the chat commit.
+                // The fallback keeps its exact reservation alive until reporting
+                // finishes, suppressing coordinator/per-tool duplicates.
+                let session = Arc::clone(self);
+                let completion_id = completion_id.to_owned();
+                let (reported_tx, reported_rx) = oneshot::channel();
+                tokio::task::spawn_local(async move {
+                    session.mark_completions_reported(&[&completion_id]).await;
+                    drop(fallback);
+                    let _ = reported_tx.send(());
+                });
+                // Preserve the previous ordering for the normal path while
+                // leaving the detached finalizer alive if this turn is aborted.
+                let _ = reported_rx.await;
+            } else if let Some(ack) = persist_ack {
                 if self
                     .chat_state_handle
                     .push_user_message_and_ack(user_chat)
@@ -1292,9 +1345,28 @@ impl SessionActor {
         max_wait: std::time::Duration,
     ) -> UsageDrainOutcome {
         const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + max_wait;
+        let deadline = tokio::time::Instant::now() + max_wait;
         loop {
-            let reply = self.outstanding_reply_for_prompt(prompt_id).await;
+            let reply = match tokio::time::timeout_at(
+                deadline,
+                self.outstanding_reply_for_prompt(prompt_id),
+            )
+            .await
+            {
+                Ok(reply) => reply,
+                Err(_) => {
+                    tracing::warn!(
+                        prompt_id,
+                        max_wait_ms = max_wait.as_millis() as u64,
+                        "subagent usage drain timed out while querying coordinator; usage may under-count"
+                    );
+                    return UsageDrainOutcome {
+                        fail_closed: true,
+                        background_live: false,
+                        sticky_report: false,
+                    };
+                }
+            };
             match reply.as_ref() {
                 None => {
                     tracing::warn!(
@@ -1315,7 +1387,7 @@ impl SessionActor {
                     };
                 }
                 Some(r) => {
-                    if std::time::Instant::now() >= deadline {
+                    if tokio::time::Instant::now() >= deadline {
                         tracing::warn!(
                             prompt_id,
                             count = r.live_ids.len(),
@@ -1330,7 +1402,7 @@ impl SessionActor {
                     }
                 }
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)).await;
         }
     }
     pub(super) async fn snapshot_prompt_usage(
@@ -2113,6 +2185,20 @@ impl SessionActor {
             if self.tool_context.task_output_token_budget.is_none() {
                 self.refresh_token_if_expired().await;
             }
+            // Codex's effective input budget is a provider safety boundary,
+            // not a configurable soft threshold. Keep it active even when
+            // normal compaction is suppressed or this is a budgeted child.
+            // This executes at every model-loop iteration, including tool-call
+            // follow-ups after their results have entered chat state.
+            if let Some(trigger_info) = self.check_codex_auto_compact_needed().await
+                && let Err(e) = self.run_compact_only(trigger_info).await
+            {
+                tracing::error!(error = %e, "Codex safety-limit compaction failed");
+                if Self::is_auth_compact_error(&e) {
+                    return Err(self.surface_compact_auth_failure(e).await);
+                }
+                return Err(e);
+            }
             if self.tool_context.task_output_token_budget.is_none()
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
@@ -2120,6 +2206,9 @@ impl SessionActor {
                 tracing::error!(error = %e, "Pre-sampling auto-compaction failed");
                 if Self::is_auth_compact_error(&e) {
                     return Err(self.surface_compact_auth_failure(e).await);
+                }
+                if self.is_bounded_subagent_task() {
+                    return Err(e);
                 }
             }
             let backend_search_active = self.backend_search_active();
@@ -2133,6 +2222,13 @@ impl SessionActor {
                 } else {
                     self.turn_base_tool_specs(&tool_definitions)
                 };
+            let bounded_subagent_finalizing = self.bounded_subagent_must_finalize();
+            if bounded_subagent_finalizing {
+                // The first compaction is the convergence boundary for a bounded
+                // child task. Preserve a required structured-output completion
+                // tool below, but remove every exploratory tool.
+                effective_tools.clear();
+            }
             if structured_output_tool && let Some(schema) = json_schema.clone() {
                 effective_tools.push(ToolSpec {
                     name: STRUCTURED_OUTPUT_TOOL.to_string(),
@@ -2185,7 +2281,11 @@ impl SessionActor {
             if structured_output_native {
                 request.json_schema = json_schema.clone();
             }
-            request.hosted_tools = self.hosted_tools_for_turn();
+            request.hosted_tools = if bounded_subagent_finalizing {
+                Vec::new()
+            } else {
+                self.hosted_tools_for_turn()
+            };
             request.max_output_tokens = self
                 .tool_context
                 .clamp_task_model_request(request.max_output_tokens)
@@ -2391,12 +2491,22 @@ impl SessionActor {
                 self.send_available_commands_update().await;
             }
             turn_span_totals.record(&tracing::Span::current(), &response);
-            let _ = self.compaction.auto_compact_suppressed.compare_exchange(
-                crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS,
-                crate::session::compaction_config::SUPPRESS_NONE,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            if self
+                .compaction
+                .auto_compact_suppressed
+                .compare_exchange(
+                    crate::session::compaction_config::SUPPRESS_UNTIL_SUCCESS,
+                    crate::session::compaction_config::SUPPRESS_NONE,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.compaction.auto_compact_retry_not_before_ms.store(
+                    crate::session::compaction_config::AUTO_COMPACT_RETRY_READY,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             self.clear_auth_compact_suppression();
             let model_duration_ms = model_timer.elapsed().as_millis() as u64;
             {
@@ -2723,6 +2833,9 @@ impl SessionActor {
                     tracing::error!(error = %e, "Preflight overflow compaction failed");
                     if Self::is_auth_compact_error(&e) {
                         return Err(self.surface_compact_auth_failure(e).await);
+                    }
+                    if self.is_bounded_subagent_task() {
+                        return Err(e);
                     }
                 }
                 continue;

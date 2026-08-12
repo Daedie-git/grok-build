@@ -537,6 +537,7 @@ impl xai_tool_runtime::Tool for TaskTool {
                 output_token_budget: None,
                 output_schema: None,
                 loop_task_id: None,
+                compaction_policy: SubagentCompactionPolicy::ContinueAfterCompaction,
             },
             run_in_background: input.run_in_background,
             // Model-spawned subagents must still appear in the idle reminder.
@@ -1643,12 +1644,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_overrides_struct_default_is_all_none() {
+    fn runtime_overrides_struct_default_continues_after_compaction() {
         let overrides = SubagentRuntimeOverrides::default();
         assert!(overrides.model.is_none());
         assert!(overrides.reasoning_effort.is_none());
         assert!(overrides.persona.is_none());
         assert!(overrides.capability_mode.is_none());
+        assert_eq!(
+            overrides.compaction_policy,
+            SubagentCompactionPolicy::ContinueAfterCompaction
+        );
     }
 
     #[test]
@@ -2746,6 +2751,11 @@ mod tests {
             );
             assert!(request.runtime_overrides.reasoning_effort.is_none());
             assert!(request.runtime_overrides.persona.is_none());
+            assert_eq!(
+                request.runtime_overrides.compaction_policy,
+                SubagentCompactionPolicy::ContinueAfterCompaction,
+                "ordinary model-issued tasks must retain tools after compaction"
+            );
             let id = request.id.clone();
             request
                 .result_tx

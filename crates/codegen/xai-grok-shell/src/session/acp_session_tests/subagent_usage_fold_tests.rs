@@ -367,6 +367,18 @@ fn scripted_outstanding_responder(
     tx
 }
 
+fn stalled_outstanding_responder() -> tokio::sync::mpsc::UnboundedSender<
+    xai_grok_tools::implementations::grok_build::task::types::SubagentEvent,
+> {
+    use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+    tokio::task::spawn_local(async move {
+        let _request = rx.recv().await;
+        std::future::pending::<()>().await;
+    });
+    tx
+}
+
 /// Drain timeout (wedged foreground child) fails closed: the report and both
 /// ledgers are marked incomplete.
 #[tokio::test(flavor = "current_thread")]
@@ -402,6 +414,26 @@ async fn freeze_timeout_marks_report_and_both_ledgers() {
                     .unwrap()
                     .incomplete
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn freeze_timeout_bounds_an_unresponsive_coordinator_query() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut actor = make_actor().await;
+            actor.tool_context.subagent_event_tx = Some(stalled_outstanding_responder());
+
+            let usage = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                actor.freeze_prompt_usage_bounded("p-1", std::time::Duration::from_millis(120)),
+            )
+            .await
+            .expect("the usage drain's own deadline must bound coordinator queries")
+            .expect("fail-closed usage always attaches");
+
+            assert!(usage.usage_is_incomplete);
         })
         .await;
 }

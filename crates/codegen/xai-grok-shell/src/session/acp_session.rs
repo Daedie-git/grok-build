@@ -217,8 +217,8 @@ pub(crate) struct InputItem {
     /// Who originated this prompt — user or auto-wake system.
     pub(crate) origin: super::PromptOrigin,
     /// Typed deferred completion retained while an admitted task wake is queued.
-    /// Consumed by an interactive stop if it removes the wake before the
-    /// turn starts.
+    /// Also owns the optional trace-start sender until actual promotion.
+    /// Consumed by Ctrl+C if it removes the wake before the turn starts.
     pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
@@ -322,6 +322,9 @@ pub(crate) struct State {
     /// Prompt ids under composer edit, stamped (and re-stamped) by `hold_edit`.
     /// Held followers are skipped by combine; a live held front blocks promote.
     pub(crate) edit_holds: HashMap<String, std::time::Instant>,
+    /// Explicitly consumed completion IDs whose auto-wake command may still be
+    /// in the actor mailbox or between admission and queue insertion.
+    pub(crate) consumed_completion_tombstones: VecDeque<String>,
     /// When true, notifications are buffered but not drained until genuine
     /// user re-engagement. Set by an interactive stop, cleared by a user
     /// prompt.
@@ -343,8 +346,29 @@ pub(crate) struct State {
     pub(crate) nudges_used_this_session: u32,
 }
 impl State {
+    const MAX_CONSUMED_COMPLETION_TOMBSTONES: usize = 256;
+
     pub(crate) fn clear_pending_notifications(&mut self) {
         self.pending_notifications.clear();
+    }
+    pub(crate) fn record_consumed_completion(&mut self, task_id: &str) {
+        if self
+            .consumed_completion_tombstones
+            .iter()
+            .any(|existing| existing == task_id)
+        {
+            return;
+        }
+        self.consumed_completion_tombstones
+            .push_back(task_id.to_owned());
+        while self.consumed_completion_tombstones.len() > Self::MAX_CONSUMED_COMPLETION_TOMBSTONES {
+            self.consumed_completion_tombstones.pop_front();
+        }
+    }
+    pub(crate) fn has_consumed_completion(&self, task_id: &str) -> bool {
+        self.consumed_completion_tombstones
+            .iter()
+            .any(|existing| existing == task_id)
     }
     /// Prompt id of the in-flight turn, if any. This — not
     /// `current_prompt_id` / `is_running_prompt` — is the running-turn
@@ -814,7 +838,7 @@ pub(crate) struct SessionActor {
     /// Live gate shared with the notification bridge (see
     /// `NotificationBridgeConfig::queue_exit_reminder_on_approved_exit`).
     /// Seeded at spawn from the agent definition's harness; refreshed by
-    /// `handle_rebuild_agent_for_definition` so the bridge always agrees
+    /// `install_prepared_agent_rebuild` so the bridge always agrees
     /// with the live harness gate.
     pub(crate) queue_exit_reminder_on_approved_exit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// First skill the current prompt activated via its slash-skill path,
@@ -1096,7 +1120,7 @@ pub(crate) struct SessionActor {
     /// Cached recipe for constructing this session's [`xai_grok_agent::Agent`].
     ///
     /// Populated once at session spawn and then reused by
-    /// `handle_rebuild_agent_for_definition` to build a fresh `Agent`
+    /// `prepare_agent_rebuild` to build a fresh `Agent`
     /// (system prompt, [`xai_grok_tools::bridge::ToolBridge`], tool
     /// registry, tool name aliases, compaction policy, and reminder
     /// policy) when the user picks a model with a different

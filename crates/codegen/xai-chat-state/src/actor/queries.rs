@@ -241,6 +241,11 @@ impl ChatStateActor {
                 }
                 xai_grok_sampling_types::ConversationItem::System(_) => {}
                 xai_grok_sampling_types::ConversationItem::BackendToolCall(_) => {}
+                xai_grok_sampling_types::ConversationItem::Provider(provider) => {
+                    if provider.is_encrypted_compaction() {
+                        counts.assistant += 1;
+                    }
+                }
                 xai_grok_sampling_types::ConversationItem::Reasoning(_) => {}
             }
         }

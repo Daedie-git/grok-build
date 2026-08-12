@@ -361,6 +361,84 @@
         );
     }
 
+    /// A live remote `ModelChanged` that crosses the Grok↔Codex provider
+    /// boundary must schedule a silent account-usage refresh — same as a
+    /// local SwitchModelComplete — so rate-limit UI is not left empty until
+    /// the next turn-end fetch.
+    #[test]
+    fn model_changed_to_codex_schedules_usage_refresh() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "grok-3", &["grok-3", "codex-model"]);
+        let codex_id = acp::ModelId::new(std::sync::Arc::from("codex-model"));
+        let mut info = make_model_info("codex-model");
+        info.meta = serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned();
+        agent.session.models.available.insert(codex_id, info);
+        assert!(!agent.session.models.current_model_is_codex());
+        app.pending_effects.clear();
+
+        let notif = model_changed_ext("sess-1", "codex-model", None);
+        let changed = handle_ext_notification(&notif, &mut app);
+        assert!(changed, "provider-crossing ModelChanged must apply");
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            agent.session.models.current_model_is_codex(),
+            "follower must now be on the Codex model"
+        );
+        assert!(
+            agent.codex_rate_limits.is_none(),
+            "stale Codex windows must be cleared pending refresh"
+        );
+        assert!(
+            app.pending_effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchCodexRateLimits {
+                    agent_id: AgentId(0),
+                    silent: true,
+                    ..
+                }
+            )),
+            "remote switch to Codex must schedule FetchCodexRateLimits; got {:?}",
+            app.pending_effects
+        );
+    }
+
+    /// Remote switch away from Codex schedules the Grok billing refresh.
+    #[test]
+    fn model_changed_from_codex_schedules_billing_refresh() {
+        let mut app = make_app_with_agent("sess-1");
+        let agent = app.agents.get_mut(&AgentId(0)).unwrap();
+        seed_models(agent, "codex-model", &["grok-3", "codex-model"]);
+        let codex_id = acp::ModelId::new(std::sync::Arc::from("codex-model"));
+        let mut info = make_model_info("codex-model");
+        info.meta = serde_json::json!({ "providerKind": "codex" })
+            .as_object()
+            .cloned();
+        agent.session.models.available.insert(codex_id.clone(), info);
+        agent.session.models.set_current(codex_id, None);
+        assert!(agent.session.models.current_model_is_codex());
+        app.pending_effects.clear();
+
+        let notif = model_changed_ext("sess-1", "grok-3", None);
+        assert!(handle_ext_notification(&notif, &mut app));
+
+        assert!(
+            app.pending_effects.iter().any(|e| matches!(
+                e,
+                Effect::FetchBilling {
+                    agent_id: AgentId(0),
+                    silent: true,
+                    ..
+                }
+            )),
+            "remote switch off Codex must schedule FetchBilling; got {:?}",
+            app.pending_effects
+        );
+    }
+
     /// `ModelChanged` for a session this client doesn't own / hasn't loaded
     /// must be dropped — `find_session_match` returns `None`. The bug-flavored
     /// version of this would be: leader-mode A switches model on session X
@@ -388,4 +466,3 @@
             "unrelated-session broadcast must not touch this agent's model"
         );
     }
-

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_paths::AbsPathBuf;
+use xai_grok_tools::implementations::grok_build::task::types::SubagentCompactionPolicy;
 use xai_grok_workspace::file_system::{AsyncFileSystem, AsyncFsWrapper};
 use xai_grok_workspace::session::file_state::FileStateHandle;
 use xai_hunk_tracker::HunkTrackerHandle;
@@ -154,6 +155,9 @@ pub struct ToolContext {
     /// Current subagent nesting depth for this session.
     /// Top-level sessions start at 0; child sessions are parent_depth + 1.
     pub subagent_depth: u32,
+    /// Explicit child lifecycle policy. Nesting depth alone does not make a
+    /// task bounded.
+    pub subagent_compaction_policy: SubagentCompactionPolicy,
     /// Unified subagent event sender — carries spawn, query, cancel,
     /// list-active, completions, and outstanding messages to the coordinator.
     /// `None` if subagent support is not enabled.
@@ -287,6 +291,7 @@ impl ToolContext {
             hunk_tracking_enabled: true,
             prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
             subagent_depth: 0,
+            subagent_compaction_policy: SubagentCompactionPolicy::ContinueAfterCompaction,
             subagent_event_tx: None,
             lsp: None,
             lsp_server_names: Vec::new(),
@@ -353,7 +358,7 @@ mod output_budget_tests {
 }
 #[cfg(test)]
 mod tests {
-    use super::BlockingWaitState;
+    use super::{BlockingWaitState, SubagentCompactionPolicy};
     use crate::{terminal::AsyncTerminalRunner, tools::ToolContext};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -378,6 +383,7 @@ mod tests {
                 hunk_tracking_enabled: true,
                 prompt_index: Arc::new(tokio::sync::Mutex::new(0)),
                 subagent_depth: 0,
+                subagent_compaction_policy: SubagentCompactionPolicy::ContinueAfterCompaction,
                 subagent_event_tx: None,
                 lsp: None,
                 lsp_server_names: Vec::new(),

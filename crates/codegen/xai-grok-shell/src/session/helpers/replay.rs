@@ -6,13 +6,32 @@
 //! `updates.jsonl` and handling `CompactionCheckpoint` / `RewindMarker` entries.
 
 use std::io;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use crate::extensions::notification::{
-    CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
+    CompactionCheckpointFile, CompactionCheckpointInfo,
+    MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION, SessionUpdate as XaiSessionUpdate,
 };
 use crate::sampling::ConversationItem;
+use crate::session::helpers::timeline_transaction::TimelineCommitVerification;
 use crate::session::storage::{SessionUpdate, UpdatesIterator};
+
+/// Alias kept for rewind call sites / tests.
+pub type RewindCommitVerification = TimelineCommitVerification;
+/// Alias kept for native compaction call sites / tests.
+pub type NativeCompactionCommitVerification = TimelineCommitVerification;
+/// Local summary compaction uses the same commit tri-state as native.
+pub type LocalCompactionCommitVerification = TimelineCommitVerification;
+
+/// Whether a compaction lost-ack verify must require a Codex native manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionCommitKind {
+    /// Local summary: marker + staged checkpoint identity is authoritative.
+    LocalSummary,
+    /// Native Codex: staged history must also carry a compatibility manifest.
+    NativeCodex,
+}
 
 /// Result of replaying updates.jsonl up to a target prompt index.
 #[derive(Debug)]
@@ -79,6 +98,381 @@ pub fn find_latest_compaction_checkpoint(
     }
 
     Ok(latest)
+}
+
+/// Return the latest compaction marker only when no later rewind marker changed
+/// the authoritative timeline. This is the startup cache-repair commit record.
+pub fn find_authoritative_compaction_checkpoint(
+    updates_path: &Path,
+) -> io::Result<Option<CompactionCheckpointInfo>> {
+    use crate::session::storage::RawLinePeek;
+
+    let raw_contents = match std::fs::read_to_string(updates_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut authoritative = None;
+    for line in raw_contents
+        .lines()
+        .filter(|line| line.contains("compaction_checkpoint") || line.contains("rewind_marker"))
+    {
+        let Ok(envelope) = serde_json::from_str::<RawLinePeek<'_>>(line) else {
+            continue;
+        };
+        if envelope.method != Some("_x.ai/session/update") {
+            continue;
+        }
+        let Some(params) = envelope.params else {
+            continue;
+        };
+        let Ok(notification) = serde_json::from_str::<
+            crate::extensions::notification::SessionNotification,
+        >(params.get()) else {
+            continue;
+        };
+        match notification.update {
+            XaiSessionUpdate::CompactionCheckpoint(info) => authoritative = Some(*info),
+            XaiSessionUpdate::RewindMarker { .. } => authoritative = None,
+            _ => {}
+        }
+    }
+    Ok(authoritative)
+}
+
+/// Whether the current timeline ends at a committed rewind carrying an exact
+/// replacement snapshot. Such a marker is authoritative over the cache.
+pub fn has_authoritative_rewind_snapshot(updates_path: &Path) -> io::Result<bool> {
+    use crate::session::storage::RawLinePeek;
+
+    let contents = match std::fs::read_to_string(updates_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut authoritative = false;
+    for line in contents
+        .lines()
+        .filter(|line| line.contains("compaction_checkpoint") || line.contains("rewind_marker"))
+    {
+        let Ok(envelope) = serde_json::from_str::<RawLinePeek<'_>>(line) else {
+            continue;
+        };
+        if envelope.method != Some("_x.ai/session/update") {
+            continue;
+        }
+        let Some(params) = envelope.params else {
+            continue;
+        };
+        let Ok(notification) = serde_json::from_str::<
+            crate::extensions::notification::SessionNotification,
+        >(params.get()) else {
+            continue;
+        };
+        match notification.update {
+            XaiSessionUpdate::CompactionCheckpoint(_) => authoritative = false,
+            XaiSessionUpdate::RewindMarker {
+                transaction_id,
+                rewound_history_json,
+                ..
+            } => {
+                authoritative = if transaction_id.is_some() {
+                    let json = rewound_history_json.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "committed rewind transaction is missing its history snapshot",
+                        )
+                    })?;
+                    serde_json::from_str::<Vec<ConversationItem>>(&json)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    true
+                } else {
+                    false
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok(authoritative)
+}
+
+/// Scan `updates.jsonl` for `_x.ai/session/update` entries, invoking `visit`
+/// for each typed notification update.
+///
+/// - `Ok(())` — every line was visited without an early exit
+/// - `Err(outcome)` — open/parse failure, missing file (`NotCommitted`), or
+///   `visit` requested `ControlFlow::Break(outcome)`
+fn scan_timeline_session_updates(
+    updates_path: &Path,
+    mut visit: impl FnMut(XaiSessionUpdate) -> ControlFlow<TimelineCommitVerification>,
+) -> Result<(), TimelineCommitVerification> {
+    use crate::session::storage::RawLinePeek;
+
+    let contents = match std::fs::read_to_string(updates_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(TimelineCommitVerification::NotCommitted);
+        }
+        Err(error) => return Err(TimelineCommitVerification::Indeterminate(error)),
+    };
+
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let envelope = match serde_json::from_str::<RawLinePeek<'_>>(line) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return Err(TimelineCommitVerification::Indeterminate(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error,
+                )));
+            }
+        };
+        if envelope.method != Some("_x.ai/session/update") {
+            continue;
+        }
+        let Some(params) = envelope.params else {
+            return Err(TimelineCommitVerification::Indeterminate(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "timeline transaction is missing params",
+            )));
+        };
+        let notification = match serde_json::from_str::<
+            crate::extensions::notification::SessionNotification,
+        >(params.get())
+        {
+            Ok(notification) => notification,
+            Err(error) => {
+                return Err(TimelineCommitVerification::Indeterminate(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error,
+                )));
+            }
+        };
+        if let ControlFlow::Break(outcome) = visit(notification.update) {
+            return Err(outcome);
+        }
+    }
+    Ok(())
+}
+
+fn timeline_op_supersedes_matched(update: &XaiSessionUpdate) -> bool {
+    matches!(
+        update,
+        XaiSessionUpdate::CompactionCheckpoint(_) | XaiSessionUpdate::RewindMarker { .. }
+    )
+}
+
+/// Verify a rewind commit by exact transaction identity and payload. Cache state
+/// is deliberately irrelevant: the durable marker is the authoritative commit
+/// point and startup can repair a stale derived cache from its snapshot.
+pub fn verify_rewind_commit(
+    updates_path: &Path,
+    transaction_id: &str,
+    target_prompt_index: usize,
+    created_at: &str,
+    rewound_history: &[ConversationItem],
+) -> TimelineCommitVerification {
+    let expected_history = match serde_json::to_value(rewound_history) {
+        Ok(history) => history,
+        Err(error) => {
+            return TimelineCommitVerification::Indeterminate(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error,
+            ));
+        }
+    };
+    let mut matched = false;
+    let mut superseded = false;
+    if let Err(outcome) = scan_timeline_session_updates(updates_path, |update| {
+        match update {
+            XaiSessionUpdate::RewindMarker {
+                target_prompt_index: durable_target,
+                transaction_id: Some(durable_id),
+                rewound_history_json,
+                created_at: durable_created_at,
+            } if durable_id == transaction_id => {
+                if matched {
+                    return ControlFlow::Break(TimelineCommitVerification::Indeterminate(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rewind transaction marker is duplicated",
+                        ),
+                    ));
+                }
+                let Some(history_json) = rewound_history_json else {
+                    return ControlFlow::Break(TimelineCommitVerification::Indeterminate(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rewind transaction marker is missing its history snapshot",
+                        ),
+                    ));
+                };
+                let durable_history: serde_json::Value = match serde_json::from_str(&history_json) {
+                    Ok(history) => history,
+                    Err(error) => {
+                        return ControlFlow::Break(TimelineCommitVerification::Indeterminate(
+                            io::Error::new(io::ErrorKind::InvalidData, error),
+                        ));
+                    }
+                };
+                if durable_target != target_prompt_index
+                    || durable_created_at != created_at
+                    || durable_history != expected_history
+                {
+                    return ControlFlow::Break(TimelineCommitVerification::Indeterminate(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "durable rewind marker does not match the prepared transaction",
+                        ),
+                    ));
+                }
+                matched = true;
+                superseded = false;
+            }
+            ref other if matched && timeline_op_supersedes_matched(other) => {
+                superseded = true;
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }) {
+        return outcome;
+    }
+
+    if !matched {
+        TimelineCommitVerification::NotCommitted
+    } else if superseded {
+        TimelineCommitVerification::Indeterminate(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rewind transaction was superseded by a later timeline operation",
+        ))
+    } else {
+        TimelineCommitVerification::Committed
+    }
+}
+
+/// Verify a compaction commit by its exact checkpoint transaction ID.
+///
+/// Scans the full timeline, binds the marker to the staged file, and — for
+/// [`CompactionCommitKind::NativeCodex`] only — requires a native compatibility
+/// manifest. A staged checkpoint alone is never a commit.
+pub fn verify_compaction_commit(
+    session_dir: &Path,
+    staged: &CompactionCheckpointFile,
+    kind: CompactionCommitKind,
+) -> TimelineCommitVerification {
+    let updates_path = session_dir.join("updates.jsonl");
+    let mut matching_marker: Option<CompactionCheckpointInfo> = None;
+    let mut superseded = false;
+    if let Err(outcome) = scan_timeline_session_updates(&updates_path, |update| {
+        match update {
+            XaiSessionUpdate::CompactionCheckpoint(info)
+                if info.checkpoint_id == staged.checkpoint_id =>
+            {
+                if matching_marker.is_some() {
+                    return ControlFlow::Break(TimelineCommitVerification::Indeterminate(
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "compaction transaction marker is duplicated",
+                        ),
+                    ));
+                }
+                matching_marker = Some(*info);
+                superseded = false;
+            }
+            ref other if matching_marker.is_some() && timeline_op_supersedes_matched(other) => {
+                superseded = true;
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }) {
+        return outcome;
+    }
+
+    let Some(marker) = matching_marker else {
+        return TimelineCommitVerification::NotCommitted;
+    };
+    if superseded {
+        return TimelineCommitVerification::Indeterminate(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compaction transaction was superseded by a later timeline operation",
+        ));
+    }
+    let expected_path = format!("compaction_checkpoints/{}.json", staged.checkpoint_id);
+    if marker.checkpoint_file != expected_path
+        || marker.prompt_index_at_compaction != staged.prompt_index_at_compaction
+        || marker.schema_version != staged.schema_version
+        || marker.created_at != staged.created_at
+    {
+        return TimelineCommitVerification::Indeterminate(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compaction marker does not match the staged transaction",
+        ));
+    }
+
+    let checkpoint_path = session_dir.join(&marker.checkpoint_file);
+    let durable: CompactionCheckpointFile =
+        match std::fs::read(&checkpoint_path).and_then(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        }) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return TimelineCommitVerification::Indeterminate(error),
+        };
+    let same_history = match (
+        serde_json::to_value(&durable.compacted_history),
+        serde_json::to_value(&staged.compacted_history),
+    ) {
+        (Ok(durable), Ok(staged)) => durable == staged,
+        _ => false,
+    };
+    if durable.checkpoint_id != staged.checkpoint_id
+        || durable.prompt_index_at_compaction != staged.prompt_index_at_compaction
+        || durable.schema_version != staged.schema_version
+        || durable.created_at != staged.created_at
+        || durable.original_user_info != staged.original_user_info
+        || durable.reread_file_paths != staged.reread_file_paths
+        || !same_history
+    {
+        return TimelineCommitVerification::Indeterminate(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable compaction checkpoint does not match the staged transaction",
+        ));
+    }
+    match kind {
+        CompactionCommitKind::LocalSummary => TimelineCommitVerification::Committed,
+        CompactionCommitKind::NativeCodex => {
+            match xai_grok_sampling_types::native_compaction_compatibility(
+                &durable.compacted_history,
+            ) {
+                Ok(Some(_)) => TimelineCommitVerification::Committed,
+                Ok(None) => TimelineCommitVerification::Indeterminate(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable native compaction checkpoint has no native compatibility manifest",
+                )),
+                Err(error) => TimelineCommitVerification::Indeterminate(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    error,
+                )),
+            }
+        }
+    }
+}
+
+/// Verify a native-compaction commit (requires Codex compatibility manifest).
+pub fn verify_native_compaction_commit(
+    session_dir: &Path,
+    staged: &CompactionCheckpointFile,
+) -> TimelineCommitVerification {
+    verify_compaction_commit(session_dir, staged, CompactionCommitKind::NativeCodex)
+}
+
+/// Verify a local-summary compaction commit (no native manifest required).
+pub fn verify_local_compaction_commit(
+    session_dir: &Path,
+    staged: &CompactionCheckpointFile,
+) -> TimelineCommitVerification {
+    verify_compaction_commit(session_dir, staged, CompactionCommitKind::LocalSummary)
 }
 
 /// Replay `updates.jsonl` to reconstruct the conversation at `target_prompt_index`.
@@ -279,11 +673,45 @@ impl ReplayState {
         Ok(ReplayAction::Continue)
     }
 
+    fn validate_checkpoint_file(
+        info: &CompactionCheckpointInfo,
+        file: &CompactionCheckpointFile,
+    ) -> io::Result<()> {
+        if file.schema_version > MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported checkpoint schema version {}. Cannot safely rewind past the compaction point.",
+                    file.schema_version
+                ),
+            ));
+        }
+        if file.checkpoint_id != info.checkpoint_id
+            || file.prompt_index_at_compaction != info.prompt_index_at_compaction
+            || file.schema_version != info.schema_version
+            || file.created_at != info.created_at
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compaction checkpoint file does not match its marker",
+            ));
+        }
+        Ok(())
+    }
+
     fn handle_checkpoint(
         &mut self,
         info: &CompactionCheckpointInfo,
         session_dir: &Path,
     ) -> io::Result<ReplayAction> {
+        let expected_checkpoint_file =
+            format!("compaction_checkpoints/{}.json", info.checkpoint_id);
+        if info.checkpoint_file != expected_checkpoint_file {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compaction checkpoint marker has an unexpected checkpoint path",
+            ));
+        }
         if self.target < info.prompt_index_at_compaction {
             // Target is before this compaction — don't load the compacted
             // history (we'll reconstruct from raw updates). But the
@@ -312,6 +740,7 @@ impl ReplayState {
             };
             match serde_json::from_slice::<CompactionCheckpointFile>(&bytes) {
                 Ok(file) => {
+                    Self::validate_checkpoint_file(info, &file)?;
                     if self.original_user_info.is_none() {
                         self.original_user_info = file.original_user_info;
                     }
@@ -377,21 +806,7 @@ impl ReplayState {
                 }
             };
 
-            if file.schema_version > 1 {
-                tracing::error!(
-                    schema_version = file.schema_version,
-                    path = %checkpoint_path.display(),
-                    "Unsupported checkpoint schema version, cannot reconstruct conversation"
-                );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Unsupported checkpoint schema version {}. \
-                         Cannot safely rewind past the compaction point.",
-                        file.schema_version
-                    ),
-                ));
-            }
+            Self::validate_checkpoint_file(info, &file)?;
 
             // Capture original_user_info from the checkpoint (even if we
             // replace the conversation — it's needed by handle_rewind for
@@ -644,10 +1059,337 @@ mod tests {
     use super::*;
     use crate::extensions::notification::{
         AutoContinueInfo, CompactionCheckpointFile, CompactionCheckpointInfo,
-        SessionNotification as XaiNotification, SessionUpdate as XaiSessionUpdate,
+        FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION, SessionNotification as XaiNotification,
+        SessionUpdate as XaiSessionUpdate,
     };
     use agent_client_protocol as acp;
     use tempfile::TempDir;
+
+    fn local_verification_fixture(dir: &Path) -> (CompactionCheckpointFile, SessionUpdate) {
+        let checkpoint = CompactionCheckpointFile {
+            checkpoint_id: "tx-local".into(),
+            prompt_index_at_compaction: 2,
+            compacted_history: vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("summary of prior turns"),
+            ],
+            schema_version: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            original_user_info: Some("user-info".into()),
+            reread_file_paths: vec![],
+        };
+        let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("verify"),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                prompt_index_at_compaction: checkpoint.prompt_index_at_compaction,
+                checkpoint_file: "compaction_checkpoints/tx-local.json".into(),
+                auto_continue: None,
+                schema_version: checkpoint.schema_version,
+                created_at: checkpoint.created_at.clone(),
+            })),
+            meta: None,
+        }));
+        std::fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        (checkpoint, marker)
+    }
+
+    fn stage_local_verification_checkpoint(dir: &Path, checkpoint: &CompactionCheckpointFile) {
+        std::fs::write(
+            dir.join("compaction_checkpoints/tx-local.json"),
+            serde_json::to_vec(checkpoint).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_compaction_lost_ack_commits_without_native_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, marker) = local_verification_fixture(tmp.path());
+        stage_local_verification_checkpoint(tmp.path(), &checkpoint);
+        append_verification_update(tmp.path(), &marker);
+        assert!(matches!(
+            verify_local_compaction_commit(tmp.path(), &checkpoint),
+            LocalCompactionCommitVerification::Committed
+        ));
+        assert!(
+            matches!(
+                verify_native_compaction_commit(tmp.path(), &checkpoint),
+                NativeCompactionCommitVerification::Indeterminate(_)
+            ),
+            "native verify must still require a compatibility manifest"
+        );
+    }
+
+    #[test]
+    fn local_compaction_lost_ack_not_committed_without_marker() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, _) = local_verification_fixture(tmp.path());
+        stage_local_verification_checkpoint(tmp.path(), &checkpoint);
+        assert!(matches!(
+            verify_local_compaction_commit(tmp.path(), &checkpoint),
+            LocalCompactionCommitVerification::NotCommitted
+        ));
+    }
+
+    #[test]
+    fn local_compaction_lost_ack_indeterminate_when_superseded() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, marker) = local_verification_fixture(tmp.path());
+        stage_local_verification_checkpoint(tmp.path(), &checkpoint);
+        append_verification_update(tmp.path(), &marker);
+        append_verification_update(tmp.path(), &make_rewind_marker(0));
+        assert!(matches!(
+            verify_local_compaction_commit(tmp.path(), &checkpoint),
+            LocalCompactionCommitVerification::Indeterminate(_)
+        ));
+    }
+
+    fn native_verification_fixture(dir: &Path) -> (CompactionCheckpointFile, SessionUpdate) {
+        let mut compatibility =
+            xai_grok_sampling_types::NativeCompactionCompatibility::codex("test-model", None);
+        compatibility.replacement_segment_items = 1;
+        compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+            input_index: 0,
+            kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+            item_id: Some("cmp-verify".into()),
+            internal_chat_message_metadata_passthrough: None,
+            user_message_provider_metadata: None,
+        }];
+        let checkpoint = CompactionCheckpointFile {
+            checkpoint_id: "tx-verify".into(),
+            prompt_index_at_compaction: 3,
+            compacted_history: vec![
+                ConversationItem::system("system"),
+                ConversationItem::native_compaction_metadata(compatibility),
+                ConversationItem::encrypted_compaction(
+                    xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                        id: Some("cmp-verify".into()),
+                        encrypted_content: "cipher".into(),
+                    },
+                ),
+            ],
+            schema_version: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            original_user_info: Some("user-info".into()),
+            reread_file_paths: vec![],
+        };
+        let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("verify"),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                prompt_index_at_compaction: checkpoint.prompt_index_at_compaction,
+                checkpoint_file: "compaction_checkpoints/tx-verify.json".into(),
+                auto_continue: None,
+                schema_version: checkpoint.schema_version,
+                created_at: checkpoint.created_at.clone(),
+            })),
+            meta: None,
+        }));
+        std::fs::create_dir_all(dir.join("compaction_checkpoints")).unwrap();
+        (checkpoint, marker)
+    }
+
+    fn stage_verification_checkpoint(dir: &Path, checkpoint: &CompactionCheckpointFile) {
+        std::fs::write(
+            dir.join("compaction_checkpoints/tx-verify.json"),
+            serde_json::to_vec(checkpoint).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn append_verification_update(dir: &Path, update: &SessionUpdate) {
+        use std::io::Write as _;
+        let envelope = crate::session::storage::SessionUpdateEnvelope::from_update(update).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("updates.jsonl"))
+            .unwrap();
+        serde_json::to_writer(&mut file, &envelope).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+
+    async fn verify_after_ack_sender_drop(
+        dir: &Path,
+        checkpoint: &CompactionCheckpointFile,
+    ) -> NativeCompactionCommitVerification {
+        let (ack_sender, ack_receiver) = tokio::sync::oneshot::channel::<()>();
+        drop(ack_sender);
+        assert!(
+            ack_receiver.await.is_err(),
+            "the persistence acknowledgement sender must be gone"
+        );
+        verify_native_compaction_commit(dir, checkpoint)
+    }
+
+    #[tokio::test]
+    async fn lost_ack_before_dequeue_or_after_checkpoint_staging_is_not_committed() {
+        let before_dequeue = TempDir::new().unwrap();
+        let (checkpoint, _) = native_verification_fixture(before_dequeue.path());
+        assert!(matches!(
+            verify_after_ack_sender_drop(before_dequeue.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::NotCommitted
+        ));
+
+        let after_staging = TempDir::new().unwrap();
+        let (checkpoint, _) = native_verification_fixture(after_staging.path());
+        stage_verification_checkpoint(after_staging.path(), &checkpoint);
+        assert!(matches!(
+            verify_after_ack_sender_drop(after_staging.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::NotCommitted
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_ack_after_marker_not_committed_preserves_old_authority() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, _) = native_verification_fixture(tmp.path());
+        stage_verification_checkpoint(tmp.path(), &checkpoint);
+        // A marker append returning NotCommitted leaves no timeline record.
+        assert!(matches!(
+            verify_after_ack_sender_drop(tmp.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::NotCommitted
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_ack_after_marker_commit_verifies_exact_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, marker) = native_verification_fixture(tmp.path());
+        stage_verification_checkpoint(tmp.path(), &checkpoint);
+        append_verification_update(tmp.path(), &marker);
+        assert!(matches!(
+            verify_after_ack_sender_drop(tmp.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::Committed
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_ack_after_cache_commit_verifies_exact_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, marker) = native_verification_fixture(tmp.path());
+        stage_verification_checkpoint(tmp.path(), &checkpoint);
+        append_verification_update(tmp.path(), &marker);
+        std::fs::write(tmp.path().join("chat_history.jsonl"), "cache committed\n").unwrap();
+        assert!(matches!(
+            verify_after_ack_sender_drop(tmp.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::Committed
+        ));
+    }
+
+    #[tokio::test]
+    async fn lost_ack_after_actor_termination_with_torn_or_superseded_marker_is_indeterminate() {
+        let tmp = TempDir::new().unwrap();
+        let (checkpoint, marker) = native_verification_fixture(tmp.path());
+        stage_verification_checkpoint(tmp.path(), &checkpoint);
+        std::fs::write(
+            tmp.path().join("updates.jsonl"),
+            r#"{"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"compaction_checkpoint","checkpoint_id":"tx-verify""#,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_after_ack_sender_drop(tmp.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::Indeterminate(_)
+        ));
+
+        std::fs::remove_file(tmp.path().join("updates.jsonl")).unwrap();
+        append_verification_update(tmp.path(), &marker);
+        append_verification_update(tmp.path(), &make_rewind_marker(1));
+        assert!(matches!(
+            verify_after_ack_sender_drop(tmp.path(), &checkpoint).await,
+            NativeCompactionCommitVerification::Indeterminate(_)
+        ));
+    }
+
+    fn rewind_verification_fixture() -> (Vec<ConversationItem>, SessionUpdate) {
+        let history = vec![
+            ConversationItem::system("system"),
+            ConversationItem::user("kept"),
+        ];
+        let marker = SessionUpdate::Xai(Box::new(XaiNotification {
+            session_id: acp::SessionId::new("verify"),
+            update: XaiSessionUpdate::RewindMarker {
+                target_prompt_index: 1,
+                transaction_id: Some("rewind-verify".into()),
+                rewound_history_json: Some(serde_json::to_string(&history).unwrap()),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            meta: None,
+        }));
+        (history, marker)
+    }
+
+    #[test]
+    fn rewind_lost_ack_verifies_only_the_exact_committed_transaction() {
+        let absent = TempDir::new().unwrap();
+        let (history, _) = rewind_verification_fixture();
+        assert!(matches!(
+            verify_rewind_commit(
+                &absent.path().join("updates.jsonl"),
+                "rewind-verify",
+                1,
+                "2026-01-01T00:00:00Z",
+                &history,
+            ),
+            RewindCommitVerification::NotCommitted
+        ));
+
+        let committed = TempDir::new().unwrap();
+        let (history, marker) = rewind_verification_fixture();
+        append_verification_update(committed.path(), &marker);
+        assert!(matches!(
+            verify_rewind_commit(
+                &committed.path().join("updates.jsonl"),
+                "rewind-verify",
+                1,
+                "2026-01-01T00:00:00Z",
+                &history,
+            ),
+            RewindCommitVerification::Committed
+        ));
+        assert!(matches!(
+            verify_rewind_commit(
+                &committed.path().join("updates.jsonl"),
+                "different-id",
+                1,
+                "2026-01-01T00:00:00Z",
+                &history,
+            ),
+            RewindCommitVerification::NotCommitted
+        ));
+    }
+
+    #[test]
+    fn rewind_lost_ack_is_indeterminate_for_mismatch_or_superseding_transaction() {
+        let mismatched = TempDir::new().unwrap();
+        let (history, marker) = rewind_verification_fixture();
+        append_verification_update(mismatched.path(), &marker);
+        assert!(matches!(
+            verify_rewind_commit(
+                &mismatched.path().join("updates.jsonl"),
+                "rewind-verify",
+                0,
+                "2026-01-01T00:00:00Z",
+                &history,
+            ),
+            RewindCommitVerification::Indeterminate(_)
+        ));
+
+        let superseded = TempDir::new().unwrap();
+        append_verification_update(superseded.path(), &marker);
+        append_verification_update(superseded.path(), &make_rewind_marker(0));
+        assert!(matches!(
+            verify_rewind_commit(
+                &superseded.path().join("updates.jsonl"),
+                "rewind-verify",
+                1,
+                "2026-01-01T00:00:00Z",
+                &history,
+            ),
+            RewindCommitVerification::Indeterminate(_)
+        ));
+    }
 
     fn make_user_update(session_id: &str, text: &str) -> SessionUpdate {
         SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
@@ -760,6 +1502,8 @@ mod tests {
             session_id: acp::SessionId::new("test"),
             update: XaiSessionUpdate::RewindMarker {
                 target_prompt_index: target,
+                transaction_id: None,
+                rewound_history_json: None,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             },
             meta: None,
@@ -778,7 +1522,7 @@ mod tests {
                 prompt_index_at_compaction,
                 checkpoint_file: format!("compaction_checkpoints/{checkpoint_id}.json"),
                 auto_continue,
-                schema_version: 1,
+                schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
                 created_at: "2024-01-01T00:00:00Z".to_string(),
             })),
             meta: None,
@@ -797,7 +1541,7 @@ mod tests {
             checkpoint_id: checkpoint_id.to_string(),
             prompt_index_at_compaction,
             compacted_history,
-            schema_version: 1,
+            schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             original_user_info: None,
             reread_file_paths: vec![],
@@ -983,6 +1727,30 @@ mod tests {
         assert_eq!(result.conversation[2].text_content(), "P2");
         assert_eq!(result.conversation[3].text_content(), "R2");
         assert_eq!(result.prompt_index_reached, 3);
+    }
+
+    #[test]
+    fn test_replay_rejects_checkpoint_identity_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        write_checkpoint_file(
+            tmp.path(),
+            "ckpt-mismatch",
+            2,
+            vec![ConversationItem::system("checkpoint")],
+        );
+        let update = make_checkpoint("ckpt-mismatch", 3, None);
+        let envelope =
+            crate::session::storage::SessionUpdateEnvelope::from_update(&update).unwrap();
+        let updates_path = tmp.path().join("updates.jsonl");
+        std::fs::write(
+            &updates_path,
+            format!("{}\n", serde_json::to_string(&envelope).unwrap()),
+        )
+        .unwrap();
+
+        let error = replay_to_prompt(&updates_path, tmp.path(), 3).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match its marker"));
     }
 
     /// A checkpoint written before this binary's validation (or before the

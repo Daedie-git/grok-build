@@ -88,6 +88,7 @@ mod tests {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::ChatCompletions,
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             extra_response_includes: Vec::new(),

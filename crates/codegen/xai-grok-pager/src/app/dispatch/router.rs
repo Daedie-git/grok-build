@@ -902,6 +902,7 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             }]
         }
         Action::NextModel => vec![],
+        Action::CycleEffort => dispatch_cycle_effort(app),
         Action::SwitchModel { model_id, effort } => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -1581,4 +1582,49 @@ pub(super) fn dispatch_action_result(
             }
         },
     }
+}
+
+/// Cycle the active model's reasoning effort to the next menu entry.
+///
+/// Reuses [`Effect::SwitchModel`] with the same model id so the ACP session
+/// and footer badge stay consistent with `/effort`.
+fn dispatch_cycle_effort(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let Some(model_id) = agent.session.models.current.clone() else {
+        agent.show_toast("No active model");
+        return vec![];
+    };
+    let Some(next) = agent.session.models.next_reasoning_effort() else {
+        let name = agent.session.models.display_name_for(&model_id);
+        agent.show_toast(&format!("{name} does not support reasoning effort"));
+        return vec![];
+    };
+    if agent.session.models.reasoning_effort == Some(next) {
+        // Single-level menu: still confirm current so the chord feels responsive.
+        agent.show_toast(&format!("Reasoning effort: {next}"));
+        return vec![];
+    }
+    let Some(session_id) = agent.session.session_id.clone() else {
+        agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
+            model_id,
+            effort: Some(next),
+            prev_model_id: None,
+        });
+        agent.show_toast(&format!("Reasoning effort: {next}"));
+        return vec![];
+    };
+    agent.session.model_switch_pending = true;
+    agent.show_toast(&format!("Reasoning effort: {next}"));
+    vec![Effect::SwitchModel {
+        agent_id: id,
+        session_id,
+        model_id,
+        effort: Some(next),
+        prev_model_id: None,
+    }]
 }

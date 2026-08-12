@@ -525,31 +525,22 @@ impl SubagentPresentation {
         Arc::clone(&self.is_turn_active)
     }
 }
-pub(crate) fn present_child_completion(
-    completion: ChildCompletion<ShellCompletionData>,
+const SUBAGENT_WAKE_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct PendingSubagentWake {
+    admission_rx: oneshot::Receiver<bool>,
+    prompt_id: String,
+    completion_rx: oneshot::Receiver<SubagentPromptTurnResult>,
+    promotion_trace_start_rx: Option<crate::session::commands::PromotionTraceStart>,
+}
+
+fn emit_child_completion_notification(
+    request: &SubagentRequest,
+    result: &SubagentResult,
+    completion_data: &ShellCompletionData,
     gateway: &GatewaySender,
+    will_wake: bool,
 ) {
-    let ChildCompletion {
-        request,
-        result,
-        completion_data,
-        disposition,
-    } = completion;
-    let parent_channel_open = completion_data
-        .parent_cmd_tx
-        .as_ref()
-        .is_some_and(|tx| !tx.is_closed());
-    let will_wake = should_auto_wake_subagent(
-        disposition.backgrounded,
-        result.cancelled,
-        completion_data.auto_wake_enabled,
-        disposition.waiter_delivered,
-        disposition.explicitly_killed,
-        completion_data
-            .goal_loop_active
-            .load(std::sync::atomic::Ordering::Relaxed),
-        parent_channel_open,
-    ) && disposition.should_surface;
     if completion_data.spawned_notification_emitted || request.run_in_background {
         emit_subagent_notification(
             gateway,
@@ -569,16 +560,89 @@ pub(crate) fn present_child_completion(
             completion_data.parent_cmd_tx.as_ref(),
         );
     }
-    if will_wake {
-        inject_subagent_completed_prompt(
-            &request.id,
-            &result,
-            &request,
-            &completion_data.task_completion_reservations,
-            completion_data.parent_cmd_tx.as_ref(),
-            &completion_data.task_output_tool_name,
-            &completion_data.synthetic_trace_tx,
-        );
+}
+
+pub(crate) fn present_child_completion(
+    completion: ChildCompletion<ShellCompletionData>,
+    gateway: &GatewaySender,
+) {
+    let ChildCompletion {
+        request,
+        result,
+        completion_data,
+        disposition,
+    } = completion;
+    let parent_channel_open = completion_data
+        .parent_cmd_tx
+        .as_ref()
+        .is_some_and(|tx| !tx.is_closed());
+    let should_wake = should_auto_wake_subagent(
+        disposition.backgrounded,
+        result.cancelled,
+        completion_data.auto_wake_enabled,
+        disposition.waiter_delivered,
+        disposition.explicitly_killed,
+        completion_data
+            .goal_loop_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        parent_channel_open,
+    ) && disposition.should_surface;
+    let pending_wake = should_wake
+        .then(|| {
+            inject_subagent_completed_prompt(
+                &request.id,
+                &result,
+                &request,
+                &completion_data.task_completion_reservations,
+                completion_data.parent_cmd_tx.as_ref(),
+                &completion_data.task_output_tool_name,
+                completion_data.synthetic_trace_tx.is_some(),
+            )
+        })
+        .flatten();
+    if let Some(pending_wake) = pending_wake {
+        let gateway = gateway.clone();
+        tokio::spawn(async move {
+            let PendingSubagentWake {
+                admission_rx,
+                prompt_id,
+                completion_rx,
+                promotion_trace_start_rx,
+            } = pending_wake;
+            let admitted = tokio::time::timeout(SUBAGENT_WAKE_ADMISSION_TIMEOUT, admission_rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+
+            emit_child_completion_notification(
+                &request,
+                &result,
+                &completion_data,
+                &gateway,
+                admitted,
+            );
+
+            // Admission only means the actor retained the wake. Trace work
+            // starts when the retained InputItem is actually promoted; a
+            // declined, timed-out, or user-preempted wake drops the sender.
+            if admitted
+                && let (Some(trace_tx), Some(promotion_trace_start_rx)) = (
+                    completion_data.synthetic_trace_tx.as_ref(),
+                    promotion_trace_start_rx,
+                )
+                && let Ok(before_session_copy_rx) = promotion_trace_start_rx.await
+            {
+                let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
+                    session_id: acp::SessionId::new(request.parent_session_id.clone()),
+                    prompt_id,
+                    completion_rx,
+                    before_session_copy_rx,
+                });
+            }
+        });
+    } else {
+        emit_child_completion_notification(&request, &result, &completion_data, gateway, false);
     }
 }
 /// Resolve the sampling config and model ID for a subagent.
@@ -775,8 +839,9 @@ async fn read_parent_sampling_config(
     ctx: &SubagentSpawnContext,
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(ref chat_state) = ctx.parent_chat_state {
-        if let Some(cfg) = chat_state.get_sampling_config().await {
-            let creds = chat_state.get_credentials().await;
+        if let Some(state) = chat_state.get_sampling_state().await {
+            let cfg = state.config;
+            let creds = state.credentials;
             let mut extra_headers = cfg.extra_headers;
             crate::agent::config::inject_url_derived_headers(
                 &mut extra_headers,
@@ -805,6 +870,7 @@ async fn read_parent_sampling_config(
                 temperature: cfg.temperature,
                 top_p: cfg.top_p,
                 api_backend: cfg.api_backend,
+                provider_id: cfg.provider_id,
                 auth_scheme,
                 extra_headers,
                 extra_response_includes,
@@ -1081,8 +1147,7 @@ fn verbatim_or_normalize_fork(
         };
     }
     let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&items);
-    const SAFE_FORK_PERCENT: u64 = 80;
-    let threshold = child_context_window * SAFE_FORK_PERCENT / 100;
+    let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
     if estimated_tokens <= threshold && conversation_tail_is_complete(&items) {
         let prefix_len = items.len();
         return InitialContext {
@@ -1161,11 +1226,99 @@ fn stamp_live_fork_session_metadata(
         tracing::warn!(error = %e, "live fork: failed to write forked session summary");
     }
 }
+fn native_history_replayability(
+    items: &[ConversationItem],
+    sampling_config: &xai_grok_sampler::SamplerConfig,
+) -> Result<bool, String> {
+    let identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+        sampling_config.provider_id,
+        sampling_config.api_backend.clone(),
+        &sampling_config.base_url,
+        &sampling_config.model,
+        &sampling_config.extra_headers,
+        &sampling_config.env_http_headers,
+    )
+    .map_err(|error| error.to_string())?;
+    xai_grok_sampling_types::validate_history_for_sampling_identity(items, &identity)
+        .map_err(|error| error.to_string())?;
+    Ok(items.iter().any(|item| {
+        matches!(item, ConversationItem::Provider(provider) if provider.is_native_compaction_item())
+    }))
+}
+
+/// Shared inherit budget for resume/fork of large transcripts (percent of
+/// child context window). Native opaque history may only pass when it also
+/// fits this budget with a complete tail — otherwise inheritance must abort
+/// rather than summarize.
+const SAFE_INHERIT_PERCENT: u64 = 80;
+
+/// Whether a transcript needs summarized/partial inheritance (oversize or
+/// incomplete tool-call tail). Ordinary forks may summarize; native opaque
+/// history must abort instead.
+fn requires_summarized_inheritance(items: &[ConversationItem], child_context_window: u64) -> bool {
+    let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
+    xai_chat_state::estimate_conversation_tokens(items) > threshold
+        || !conversation_tail_is_complete(items)
+}
+
+/// Fork policy for identity-bound native Codex history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeHistoryForkPolicy {
+    /// No identity-bound native history — ordinary summarize/verbatim rules apply.
+    Ordinary,
+    /// Native history present and safe to inherit only as a verbatim mirror.
+    VerbatimOnly,
+}
+
+/// Evaluate whether parent/source history may be forked into a child with the
+/// given sampling identity. Fail-closed on origin mismatch; abort when native
+/// history would require summarized or partial inheritance.
+fn evaluate_native_history_fork_policy(
+    items: &[ConversationItem],
+    sampling_config: &xai_grok_sampler::SamplerConfig,
+    child_context_window: u64,
+) -> Result<NativeHistoryForkPolicy, String> {
+    match native_history_replayability(items, sampling_config)? {
+        false => Ok(NativeHistoryForkPolicy::Ordinary),
+        true if requires_summarized_inheritance(items, child_context_window) => Err(
+            "identity-bound native Codex history can only be inherited verbatim; this parent transcript requires summarized or partial inheritance"
+                .to_string(),
+        ),
+        true => Ok(NativeHistoryForkPolicy::VerbatimOnly),
+    }
+}
+
 enum BootstrapInitialContext {
     Ready(InitialContext),
-    /// Explicit resume_from failed — abort spawn (fail closed).
+    /// Explicit resume or requested fork cannot safely inherit context.
     ResumeAbort(String),
 }
+
+/// Native provider history has already passed exact identity and size checks.
+/// Keep it byte-for-byte instead of sending it through ordinary fork
+/// normalization, which may discard synthetic/provider items or summarize it.
+fn verbatim_native_fork(items: Vec<ConversationItem>) -> InitialContext {
+    let prefix_len = items.len();
+    InitialContext {
+        source: InitialContextSource::Forked,
+        copy_error: None,
+        prefix_len: Some(prefix_len),
+        conversation: items,
+        verbatim_fork: true,
+    }
+}
+
+/// Resolve the live session storage root. `grok_home()` is process-cached, but
+/// test harnesses and embedded callers can intentionally provide a later
+/// `GROK_HOME`; disk bootstrap must inspect and copy from the same root rather
+/// than mixing a live override with a stale cached path.
+fn bootstrap_storage_root() -> std::path::PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::util::grok_home::grok_home)
+}
+
 /// Phase 3: resume (fail-closed on copy error) > fork (live then disk, fail-open) > New.
 /// Unresolved non-empty resume is aborted by the caller before this runs.
 async fn bootstrap_initial_context(
@@ -1175,8 +1328,9 @@ async fn bootstrap_initial_context(
     child_session_info: &SessionInfo,
     child_session_dir: &std::path::Path,
     effective_model_id: &str,
-    child_context_window: u64,
+    effective_sampling_config: &xai_grok_sampler::SamplerConfig,
 ) -> BootstrapInitialContext {
+    let child_context_window = effective_sampling_config.context_window;
     if request.fork_context && request.resume_from.is_some() {
         tracing::info!(
             subagent_id = %request.id,
@@ -1191,7 +1345,7 @@ async fn bootstrap_initial_context(
             cwd: source.child_cwd.clone(),
         };
         let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
+            bootstrap_storage_root(),
         );
         let copy_options = crate::session::storage::CopySessionOptions {
             parent_session_id: Some(source.child_session_id.clone()),
@@ -1229,13 +1383,20 @@ async fn bootstrap_initial_context(
                         ));
                     }
                 };
+                if let Err(error) =
+                    native_history_replayability(&conversation, effective_sampling_config)
+                {
+                    return BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot resume from subagent '{}': {error}",
+                        source.subagent_id,
+                    ));
+                }
                 let estimated_tokens = xai_chat_state::estimate_conversation_tokens(&conversation);
-                const SAFE_RESUME_PERCENT: u64 = 80;
-                let threshold = child_context_window * SAFE_RESUME_PERCENT / 100;
+                let threshold = child_context_window * SAFE_INHERIT_PERCENT / 100;
                 if estimated_tokens > threshold {
                     return BootstrapInitialContext::ResumeAbort(format!(
                         "Cannot resume from subagent '{}': source transcript \
-                         (~{estimated_tokens} tokens) exceeds {SAFE_RESUME_PERCENT}% of \
+                         (~{estimated_tokens} tokens) exceeds {SAFE_INHERIT_PERCENT}% of \
                          the model's context window ({child_context_window} tokens). \
                          The source conversation is too large for the current model.",
                         source.subagent_id,
@@ -1274,7 +1435,24 @@ async fn bootstrap_initial_context(
         None => None,
     };
     if let Some(items) = live_items {
-        let ctx_out = verbatim_or_normalize_fork(items, child_context_window);
+        let native_policy = match evaluate_native_history_fork_policy(
+            &items,
+            effective_sampling_config,
+            child_context_window,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: {error}"
+                ));
+            }
+        };
+        let ctx_out = match native_policy {
+            NativeHistoryForkPolicy::VerbatimOnly => verbatim_native_fork(items),
+            NativeHistoryForkPolicy::Ordinary => {
+                verbatim_or_normalize_fork(items, child_context_window)
+            }
+        };
         tracing::info!(
             subagent_id = %request.id,
             subagent_type = %request.subagent_type,
@@ -1302,8 +1480,30 @@ async fn bootstrap_initial_context(
     }
     if let Some(ref parent_info) = ctx.parent_session_info {
         let storage = crate::session::storage::jsonl::JsonlStorageAdapter::with_root(
-            crate::util::grok_home::grok_home(),
+            bootstrap_storage_root(),
         );
+        let source_items = match storage.load_authoritative_chat_history_for_copy(parent_info) {
+            Ok(items) => items,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: failed to inspect authoritative source transcript before inheritance: {error}"
+                ));
+            }
+        };
+        let source_native_policy = match evaluate_native_history_fork_policy(
+            &source_items,
+            effective_sampling_config,
+            child_context_window,
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return BootstrapInitialContext::ResumeAbort(format!(
+                    "Cannot fork parent context: {error}"
+                ));
+            }
+        };
+        let source_has_native_history =
+            matches!(source_native_policy, NativeHistoryForkPolicy::VerbatimOnly);
         let copy_options = crate::session::storage::CopySessionOptions {
             parent_session_id: Some(ctx.parent_session_id.clone()),
             new_model_id: Some(effective_model_id.to_string()),
@@ -1314,7 +1514,11 @@ async fn bootstrap_initial_context(
             copy_plan_mode_state: false,
             copy_signals: false,
             copy_tool_state: false,
-            fork_filter: true,
+            // The decision and copy share this exact authoritative snapshot.
+            // Opaque native history must remain byte-for-byte; ordinary
+            // history keeps the established filtered disk-fork behavior.
+            source_chat_history: Some(source_items),
+            fork_filter: !source_has_native_history,
             ..Default::default()
         };
         use crate::session::storage::StorageAdapter as _;
@@ -1330,32 +1534,51 @@ async fn bootstrap_initial_context(
                     tool_state = result.tool_state_copied,
                     "Fork-copied parent session data into child (disk fallback)"
                 );
-                let items = storage
-                    .load_chat_history_from_dir(child_session_dir)
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to load forked chat history, starting with empty context"
-                        );
-                        vec![]
-                    });
-                BootstrapInitialContext::Ready(forked_initial_context(items))
+                let items = match storage.load_chat_history_from_dir(child_session_dir) {
+                    Ok(items) => items,
+                    Err(error) => {
+                        return BootstrapInitialContext::ResumeAbort(format!(
+                            "Cannot fork parent context: failed to inspect copied transcript before inheritance: {error}"
+                        ));
+                    }
+                };
+                match evaluate_native_history_fork_policy(
+                    &items,
+                    effective_sampling_config,
+                    child_context_window,
+                ) {
+                    Err(error) => BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot fork parent context: {error}"
+                    )),
+                    Ok(NativeHistoryForkPolicy::VerbatimOnly) => {
+                        BootstrapInitialContext::Ready(verbatim_native_fork(items))
+                    }
+                    Ok(NativeHistoryForkPolicy::Ordinary) => {
+                        BootstrapInitialContext::Ready(forked_initial_context(items))
+                    }
+                }
             }
             Err(e) => {
                 let err_msg = format!("{e}");
-                tracing::warn!(
-                    subagent_id = %request.id,
-                    subagent_type = %request.subagent_type,
-                    error = %e,
-                    "Failed to fork-copy parent session, falling back to fresh"
-                );
-                BootstrapInitialContext::Ready(InitialContext {
-                    source: InitialContextSource::New,
-                    copy_error: Some(err_msg),
-                    prefix_len: None,
-                    conversation: vec![],
-                    verbatim_fork: false,
-                })
+                if source_has_native_history {
+                    BootstrapInitialContext::ResumeAbort(format!(
+                        "Cannot fork parent context with identity-bound native Codex history: verbatim copy failed: {err_msg}"
+                    ))
+                } else {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        subagent_type = %request.subagent_type,
+                        error = %e,
+                        "Failed to fork-copy parent session, falling back to fresh"
+                    );
+                    BootstrapInitialContext::Ready(InitialContext {
+                        source: InitialContextSource::New,
+                        copy_error: Some(err_msg),
+                        prefix_len: None,
+                        conversation: vec![],
+                        verbatim_fork: false,
+                    })
+                }
             }
         };
     }
@@ -1915,6 +2138,10 @@ fn should_auto_wake_subagent(
 ///
 /// Only called for background subagents when auto-wake is enabled
 /// and the result has not been consumed (via block-wait or explicit kill).
+/// Returns the pending actor-admission acknowledgement and trace inputs. The
+/// caller must retain them until the parent admits the prompt so cancellation
+/// can durably fall back to the notification drain. Session snapshot and trace
+/// work must not start until that acknowledgement is `true`.
 fn inject_subagent_completed_prompt(
     subagent_id: &str,
     result: &SubagentResult,
@@ -1924,16 +2151,17 @@ fn inject_subagent_completed_prompt(
     >,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
     task_output_tool_name: &str,
-    synthetic_trace_tx: &Option<
-        mpsc::UnboundedSender<crate::upload::turn::SyntheticTurnTraceRequest>,
-    >,
-) {
+    trace_enabled: bool,
+) -> Option<PendingSubagentWake> {
     let Some(cmd_tx) = parent_cmd_tx else {
-        return;
+        return None;
     };
-    if let Some(reservations) = task_completion_reservations {
-        reservations.reserve(subagent_id.to_string());
-    }
+    let completion_reservation = task_completion_reservations.as_ref().map(|reservations| {
+        crate::session::commands::OwnedCompletionReservation::reserve(
+            reservations.clone(),
+            subagent_id.to_string(),
+        )
+    });
     let summary =
         xai_grok_tools::implementations::grok_build::task::completion_summary(request, result);
     let message = xai_grok_tools::reminders::task_completion::format_subagent_completion(
@@ -1942,16 +2170,14 @@ fn inject_subagent_completed_prompt(
     );
     let wrapped = xai_grok_tools::reminders::wrap_reminder(&message);
     let prompt_id = format!("subagent-completed-{subagent_id}");
-    let before_rx = if synthetic_trace_tx.is_some() {
-        let (before_tx, before_rx) = tokio::sync::oneshot::channel();
-        let _ = cmd_tx.send(SessionCommand::CopyFile {
-            respond_to: before_tx,
-        });
-        Some(before_rx)
-    } else {
-        None
-    };
     let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
+    let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+    let (promotion_trace_start, promotion_trace_start_rx) = if trace_enabled {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let prompt_blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(wrapped))];
     if cmd_tx
         .send(SessionCommand::Prompt {
@@ -1965,7 +2191,18 @@ fn inject_subagent_completed_prompt(
             traceparent: None,
             json_schema: None,
             send_now: false,
-            admission: None,
+            admission: Some(crate::session::commands::TaskWakeAdmission {
+                respond_to: admission_tx,
+                fallback: crate::session::commands::TaskWakeFallback {
+                    prompt_id: format!("subagent-completed-{subagent_id}"),
+                    prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(message))],
+                    source: crate::session::commands::NotificationSource::SubagentCompleted {
+                        subagent_id: subagent_id.to_owned(),
+                    },
+                    promotion_trace_start,
+                    completion_reservation,
+                },
+            }),
             tool_overrides_update: None,
             respond_to,
             persist_ack: None,
@@ -1973,20 +2210,14 @@ fn inject_subagent_completed_prompt(
         })
         .is_err()
     {
-        if let Some(reservations) = task_completion_reservations {
-            reservations.release(subagent_id);
-        }
-        return;
+        return None;
     }
-    if let Some(trace_tx) = synthetic_trace_tx {
-        let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
-            session_id: acp::SessionId::new(request.parent_session_id.clone()),
-            prompt_id,
-            completion_rx,
-            before_session_copy_rx: before_rx
-                .expect("before_rx set when synthetic_trace_tx is Some"),
-        });
-    }
+    Some(PendingSubagentWake {
+        admission_rx,
+        prompt_id,
+        completion_rx,
+        promotion_trace_start_rx,
+    })
 }
 fn telemetry_owner_kind(
     request: &SubagentRequest,

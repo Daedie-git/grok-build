@@ -493,22 +493,31 @@ impl SessionActor {
             } else {
                 let mut kept = VecDeque::with_capacity(state.pending_inputs.len());
                 let mut cancelled = VecDeque::new();
-                for (idx, item) in std::mem::take(&mut state.pending_inputs)
+                for (idx, mut item) in std::mem::take(&mut state.pending_inputs)
                     .into_iter()
                     .enumerate()
                 {
                     let is_running_turn = idx == 0;
                     if is_running_turn {
+                        // A promoted completion has not committed until
+                        // `handle_prompt` takes this fallback while pushing its
+                        // user message under the same state lock. Preserve it
+                        // across cancellation rather than losing the only
+                        // model-visible copy of the completion.
+                        if let Some(fallback) = item.task_wake_fallback.take() {
+                            self.push_task_wake_fallback(&mut state, fallback);
+                        }
                         cancelled.push_back(item);
                     } else if suppress_task_wakes
                         && matches!(
                             &item.origin,
                             super::PromptOrigin::TaskCompleted { .. }
+                                | super::PromptOrigin::SubagentCompleted { .. }
                                 | super::PromptOrigin::WorkflowCompleted { .. }
                         )
                     {
                         if let Some(fallback) = item.task_wake_fallback {
-                            Self::push_task_wake_fallback(&mut state, fallback);
+                            self.push_task_wake_fallback(&mut state, fallback);
                         }
                         Self::respond_removed_prompt(item.respond_to);
                     } else {
@@ -538,6 +547,13 @@ impl SessionActor {
                 had_queued_user_prompt,
             )
         };
+        // Abort before the first await after removing the running queue item.
+        // `handle_prompt` commits completion messages under the same state lock,
+        // so either its commit wins or this abort prevents it from continuing
+        // after the fallback has been parked.
+        if let Some(running_task) = &running_task {
+            running_task.abort();
+        }
         // Authoritative cancel identity: the task actually torn down. The pin
         // is only a fallback for windows where a cancel raced ahead of the
         // promote (no task yet) — see the capture comment above.
@@ -609,9 +625,6 @@ impl SessionActor {
                 });
         }
 
-        if let Some(running_task) = running_task {
-            running_task.abort();
-        }
         if let Some(is_turn_active) = &self.tool_context.is_turn_active {
             is_turn_active.store(false, std::sync::atomic::Ordering::Relaxed);
         }
@@ -691,11 +704,6 @@ impl SessionActor {
         for (idx, input) in pending_inputs.into_iter().enumerate() {
             // Running turn is idx 0; queued prompts never spent tokens.
             let is_running_turn = idx == 0;
-            if let Some(task_id) = input.origin.completion_id()
-                && let Some(reservations) = &self.tool_context.task_completion_reservations
-            {
-                reservations.release(task_id);
-            }
             let _ = input
                 .respond_to
                 .send(Ok(PromptTurnOk {

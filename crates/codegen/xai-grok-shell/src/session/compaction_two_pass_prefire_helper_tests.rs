@@ -1,5 +1,34 @@
-use super::{fingerprint_prefix, prefire_lead_percent};
+use super::{
+    CompactionStrategyOverride, ConfiguredCodexCompactionStrategy, fingerprint_prefix,
+    prefire_lead_percent,
+};
 use xai_grok_sampling_types::ConversationItem;
+
+#[test]
+fn strategy_environment_snapshot_distinguishes_absent_invalid_and_text_values() {
+    let unset =
+        ConfiguredCodexCompactionStrategy::from_env_result(Err(std::env::VarError::NotPresent));
+    assert_eq!(unset, ConfiguredCodexCompactionStrategy::Unset);
+    assert_eq!(unset.as_override(), CompactionStrategyOverride::Unset);
+
+    for value in ["", "local", " native_codex "] {
+        let configured = ConfiguredCodexCompactionStrategy::from_env_result(Ok(value.to_owned()));
+        assert_eq!(
+            configured.as_override(),
+            CompactionStrategyOverride::Value(value)
+        );
+    }
+
+    let invalid =
+        ConfiguredCodexCompactionStrategy::from_env_result(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("synthetic non-Unicode environment value"),
+        )));
+    assert_eq!(invalid, ConfiguredCodexCompactionStrategy::InvalidEncoding);
+    assert_eq!(
+        invalid.as_override(),
+        CompactionStrategyOverride::InvalidEncoding
+    );
+}
 
 #[test]
 fn fingerprint_stable_for_same_prefix() {

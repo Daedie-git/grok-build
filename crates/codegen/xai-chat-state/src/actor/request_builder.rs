@@ -108,6 +108,14 @@ impl ChatStateActor {
             prompt_cache_key: None,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            turn_routing_state: xai_grok_sampling_types::resolve_provider(
+                self.state.sampling_config.provider_id,
+                self.state.sampling_config.api_backend.clone(),
+                &self.state.sampling_config.base_url,
+            )
+            .capabilities()
+            .uses_turn_routing()
+            .then(|| self.state.turn_routing_state.clone()),
         }
     }
 }

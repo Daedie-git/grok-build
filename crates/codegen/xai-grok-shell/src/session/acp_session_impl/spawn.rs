@@ -437,6 +437,7 @@ pub(crate) async fn spawn_session_actor(
         temperature: sampling_config.temperature,
         top_p: sampling_config.top_p,
         api_backend: sampling_config.api_backend.clone(),
+        provider_id: sampling_config.provider_id,
         extra_headers: sampling_config.extra_headers.clone(),
         query_params: sampling_config.query_params.clone(),
         env_http_headers: sampling_config.env_http_headers.clone(),
@@ -482,6 +483,7 @@ pub(crate) async fn spawn_session_actor(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -1132,8 +1134,9 @@ pub(crate) async fn spawn_session_actor(
     if retry_only_before_output {
         sampler_config_initial.doom_loop_recovery = None;
     }
+    let resolved_max_retries = xai_grok_sampler::resolve_max_retries(max_retries);
     let sampler_retry_policy = xai_grok_sampler::RetryPolicy {
-        max_retries: max_retries.unwrap_or(5),
+        max_retries: resolved_max_retries,
         rate_limit_retry_threshold: 2,
         retry_only_before_output,
     };
@@ -1497,12 +1500,15 @@ pub(crate) async fn spawn_session_actor(
             context_window_override,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode,
             verbatim_input: compaction_verbatim_input,
             tool_choice: compaction_tool_choice,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
         memory: super::memory_state::SessionMemory {
@@ -1540,7 +1546,7 @@ pub(crate) async fn spawn_session_actor(
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(inference_idle_timeout_secs),
         max_turns,
-        max_retries: xai_grok_sampler::resolve_max_retries(max_retries),
+        max_retries: resolved_max_retries,
         pending_interjections: InterjectionBuffer::new(),
         pending_skill_reminders: Mutex::new(Vec::new()),
         idle_flush_timeout: memory_config

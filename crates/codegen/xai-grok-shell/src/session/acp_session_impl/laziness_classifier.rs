@@ -393,6 +393,7 @@ pub(crate) fn flatten_transcript_for_classifier(
                     }
                 }
             }
+            ConversationItem::Provider(_) => {}
         }
     }
     out

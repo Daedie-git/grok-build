@@ -6,12 +6,14 @@ use tokio::sync::oneshot;
 
 use super::super::coordinator_state::{
     BlockingWaiter, CompletedChild, ListRequest, OUTPUT_UNAVAILABLE_PLACEHOLDER, ProgressFuture,
-    ProgressTarget, RunningSeed, completed_inspection, completed_snapshot, pending_inspection,
-    pending_snapshot, queued_inspection, queued_snapshot, running_inspection, running_seed,
+    ProgressTarget, RunningSeed, TimedProgressFuture, completed_inspection, completed_snapshot,
+    pending_inspection, pending_snapshot, queued_inspection, queued_snapshot, running_inspection,
+    running_seed,
 };
 use super::super::types::{SubagentInspection, SubagentSnapshot};
 use super::{ChildControl, ChildRunner, SubagentCoordinator, SubagentProgress, belongs_to_session};
 
+const PROGRESS_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const DEFAULT_QUERY_BLOCK_TIMEOUT_MS: u64 = 30_000;
 
 impl<R: ChildRunner> SubagentCoordinator<R> {
@@ -38,6 +40,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         timeout_ms: Option<u64>,
         respond_to: oneshot::Sender<Option<SubagentSnapshot>>,
     ) {
+        // Tool cancellation can drop the receiver while its already-enqueued
+        // command is still waiting in the actor mailbox. Do not turn that
+        // abandoned query into progress work or a concrete blocking waiter.
+        if respond_to.is_closed() {
+            return;
+        }
         if let Some(child) = self
             .completed
             .get(&id)
@@ -60,6 +68,9 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             if block {
                 self.push_blocking_waiter(id, timeout_ms, respond_to);
             } else {
+                if respond_to.is_closed() {
+                    return;
+                }
                 self.queue_active_progress(&id, ProgressTarget::Query(respond_to));
             }
             return;
@@ -173,6 +184,37 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             })
     }
 
+    /// Return the coordinator's current state without consulting the child
+    /// runtime. This is intentionally used at hard deadlines, where starting
+    /// another await would make the timeout advisory rather than binding.
+    pub(super) fn snapshot_without_progress(&self, id: &str) -> Option<SubagentSnapshot> {
+        self.completed
+            .get(id)
+            .filter(|child| !child.request.owner.is_workflow())
+            .map(|child| self.completed_snapshot_for_query(child))
+            .or_else(|| {
+                self.active
+                    .get(id)
+                    .filter(|child| !child.request.owner.is_workflow())
+                    .map(|child| {
+                        running_inspection(running_seed(child), SubagentProgress::default())
+                            .snapshot
+                    })
+            })
+            .or_else(|| {
+                self.pending
+                    .get(id)
+                    .filter(|child| !child.request.owner.is_workflow())
+                    .map(pending_snapshot)
+            })
+            .or_else(|| {
+                self.queued
+                    .iter()
+                    .find(|queued| queued.request.id == id && !queued.request.owner.is_workflow())
+                    .map(|queued| queued_snapshot(&queued.request, queued.queued_at.into_std()))
+            })
+    }
+
     pub(super) fn handle_list_running(
         &mut self,
         parent_session_id: String,
@@ -208,6 +250,12 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     }
 
     pub(super) fn queue_active_progress(&mut self, id: &str, target: ProgressTarget) {
+        // Recheck immediately before invoking the child runtime. The receiver
+        // can disappear concurrently after `handle_query`'s mailbox-entry
+        // check.
+        if target.is_closed() {
+            return;
+        }
         let Some(child) = self.active.get(id) else {
             match target {
                 ProgressTarget::Query(tx) => {
@@ -226,8 +274,14 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             }
             return;
         };
+        let subagent_id = id.to_owned();
+        let progress = child.control.progress();
         self.progress.push(ProgressFuture {
-            future: Box::pin(child.control.progress()),
+            future: Box::pin(TimedProgressFuture::new(
+                progress,
+                subagent_id,
+                PROGRESS_SNAPSHOT_TIMEOUT,
+            )),
             seed: Some(running_seed(child)),
             target: Some(target),
         });
@@ -239,7 +293,13 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         target: ProgressTarget,
         progress: SubagentProgress,
     ) {
-        let still_active = self.active.contains_key(&seed.subagent_id);
+        // A progress result belongs to the exact child generation that
+        // produced its seed. Completion (or a future ID reuse) always wins
+        // over an older running snapshot.
+        let still_active = self
+            .active
+            .get(&seed.subagent_id)
+            .is_some_and(|child| child.child_session_id == seed.child_session_id);
         if !still_active {
             match target {
                 ProgressTarget::Query(respond_to) => {

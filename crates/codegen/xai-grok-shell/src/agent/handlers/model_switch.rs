@@ -40,7 +40,7 @@ pub(crate) async fn apply(
     let required_agent_type =
         resolve_required_agent_type(Some(model.info().agent_type.as_str()), session_default);
     let previous_model_id = handle.model_id.0.clone();
-    let mut pending_rebuild_definition: Option<xai_grok_agent::AgentDefinition> = None;
+    let mut pending_rebuild_definition: Option<Box<xai_grok_agent::AgentDefinition>> = None;
     {
         let required = &required_agent_type;
         let turn_count = handle
@@ -109,7 +109,7 @@ pub(crate) async fn apply(
                         agent_def_name = %def.name,
                         "set_session_model: zero-turn harness switch — queued agent rebuild"
                     );
-                    pending_rebuild_definition = Some(def);
+                    pending_rebuild_definition = Some(Box::new(def));
                 }
                 None => {
                     tracing::warn!(
@@ -145,6 +145,17 @@ pub(crate) async fn apply(
         }
     }
     let applied_effort = model_sampling.reasoning_effort;
+
+    let sampling_identity = xai_grok_sampler::resolve_runtime_sampling_identity_for_provider(
+        model_sampling.provider_id,
+        model_sampling.api_backend.clone(),
+        &model_sampling.base_url,
+        &model_sampling.model,
+        &model_sampling.extra_headers,
+        &model_sampling.env_http_headers,
+    )
+    .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
+
     let gate_closed = !handle
         .gateway_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -157,43 +168,7 @@ pub(crate) async fn apply(
         );
         pending_rebuild_definition = None;
     }
-    let did_rebuild = if let Some(def) = pending_rebuild_definition {
-        let (rebuild_tx, rebuild_rx) = oneshot::channel();
-        let _ = handle
-            .cmd_tx
-            .send(SessionCommand::RebuildAgentForDefinition {
-                definition: def,
-                responds_to: rebuild_tx,
-            });
-        let rebuild_result = rebuild_rx
-            .await
-            .map_err(|_| acp::Error::internal_error().data("rebuild_agent: actor closed"))?;
-        match rebuild_result {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    session_id = %session_id.0,
-                    model_id = %model_id.0,
-                    error = ?e,
-                    "set_session_model: zero-turn harness rebuild failed; aborting model switch"
-                );
-                xai_grok_telemetry::session_ctx::log_event(
-                    xai_grok_telemetry::events::ModelSwitched {
-                        session_id: session_id.0.to_string(),
-                        previous_model_id: previous_model_id.to_string(),
-                        new_model_id: model_id.0.to_string(),
-                        success: false,
-                        error_code: Some(config::MODEL_SWITCH_REBUILD_FAILED.to_string()),
-                        required_agent_type: Some(required_agent_type.clone()),
-                        current_agent_type: None,
-                    },
-                );
-                return Err(e);
-            }
-        }
-    } else {
-        false
-    };
+    let did_rebuild = pending_rebuild_definition.is_some();
     let model_unchanged = previous_model_id == model_id.0;
     let new_threshold = {
         let cfg = agent.cfg.borrow();
@@ -208,6 +183,8 @@ pub(crate) async fn apply(
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         sampling_config: model_sampling,
+        sampling_identity,
+        rebuild_definition: pending_rebuild_definition,
         use_concise,
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,
@@ -216,7 +193,7 @@ pub(crate) async fn apply(
     });
     let updated_model = rx
         .await
-        .map_err(|_| acp::Error::internal_error().data("failed to set session model"))?;
+        .map_err(|_| acp::Error::internal_error().data("failed to set session model"))??;
     agent.with_resident_mut(&session_id, |handle| {
         handle.model_id = model_id.clone();
         handle.reasoning_effort = applied_effort;

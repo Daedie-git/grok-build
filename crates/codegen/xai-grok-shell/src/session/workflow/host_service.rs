@@ -7,8 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_tools::implementations::grok_build::task::backend::{ChannelBackend, SubagentBackend};
 use xai_grok_tools::implementations::grok_build::task::types::{
-    ModelOverrideProvenance, SubagentCancelRequest, SubagentCancelTarget, SubagentEvent,
-    SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
+    ModelOverrideProvenance, SubagentCancelRequest, SubagentCancelTarget, SubagentCompactionPolicy,
+    SubagentEvent, SubagentOwner, SubagentRequest, SubagentRuntimeOverrides,
 };
 use xai_workflow::{AgentOpts, AgentResult, BudgetState, HostError, WorkflowHostRequest};
 
@@ -542,6 +542,7 @@ impl HostService {
                         capability_mode,
                         isolation,
                         output_schema: None,
+                        compaction_policy: SubagentCompactionPolicy::FinalizeAfterOneCompaction,
                         ..Default::default()
                     },
                     run_in_background: false,

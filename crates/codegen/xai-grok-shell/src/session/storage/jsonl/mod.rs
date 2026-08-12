@@ -80,9 +80,32 @@ impl JsonlStorageAdapter {
         dir: &std::path::Path,
     ) -> std::io::Result<Vec<ConversationItem>> {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
-        self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
+        let items = self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)?;
+        Self::validate_native_history(&items)?;
+        Ok(items)
     }
-    fn session_dir(&self, info: &Info) -> PathBuf {
+
+    /// Load the exact read-only source snapshot a session copy would derive.
+    /// Committed compaction/rewind markers override the chat cache. Fork mode,
+    /// compatibility, size/tail policy, and the eventual copy must all use the
+    /// returned value rather than independently re-reading either source.
+    pub(crate) fn load_authoritative_chat_history_for_copy(
+        &self,
+        source_info: &Info,
+    ) -> io::Result<Vec<ConversationItem>> {
+        let source_summary = self.read_summary_sync(source_info)?;
+        let cached = self.read_chat_history_sync(
+            self.chat_file(source_info),
+            source_summary.chat_format_version,
+        )?;
+        let items =
+            super::chat_rebuild::derive_authoritative_history(&self.session_dir(source_info))?
+                .unwrap_or(cached);
+        Self::validate_native_history(&items)?;
+        Ok(items)
+    }
+
+    pub(crate) fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => {
                 crate::util::grok_home::sessions_cwd_dir_in(root, &info.cwd)
@@ -502,6 +525,198 @@ impl JsonlStorageAdapter {
     async fn write_jsonl<T: serde::Serialize>(&self, path: PathBuf, items: &[T]) -> io::Result<()> {
         super::write_jsonl_atomic_async(&path, items).await
     }
+    async fn replace_chat_history_with_bookkeeping(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+    ) -> Result<(), super::ReplaceChatHistoryError> {
+        self.write_jsonl(self.chat_file(info), messages)
+            .await
+            .map_err(super::ReplaceChatHistoryError::NotCommitted)?;
+        let new_count = messages.len();
+        let cwd_switch_bookkeeping_generation = messages
+            .iter()
+            .filter_map(ConversationItem::working_directory_switch_generation)
+            .max()
+            .unwrap_or(0);
+        self.apply_summary_patch(
+            info,
+            super::summary_write::SummaryPatch {
+                chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
+                chat_format_version: Some(CHAT_FORMAT_VERSION),
+                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(super::ReplaceChatHistoryError::Committed)
+    }
+    async fn reconcile_committed_compaction_cache(&self, info: &Info) -> io::Result<bool> {
+        use crate::extensions::notification::{
+            FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+            MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+        };
+
+        let updates_path = self.updates_file(info);
+        if crate::session::helpers::replay::has_authoritative_rewind_snapshot(&updates_path)? {
+            let session_dir = self.session_dir(info);
+            let rebuilt_count = tokio::task::spawn_blocking(move || {
+                super::chat_rebuild::rebuild_chat_history(&session_dir)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            let rebuilt = self.read_chat_history_sync(self.chat_file(info), CHAT_FORMAT_VERSION)?;
+            if rebuilt.iter().any(|item| {
+                matches!(
+                    item,
+                    ConversationItem::Provider(provider) if provider.is_native_compaction_item()
+                )
+            }) {
+                xai_grok_sampling_types::native_compaction_compatibility(&rebuilt)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "rewind snapshot contains native history without a compatibility manifest",
+                        )
+                    })?;
+            }
+            tracing::warn!(
+                rebuilt_count,
+                "rebuilt chat history from committed rewind transaction"
+            );
+            match self
+                .replace_chat_history_with_bookkeeping(info, &rebuilt)
+                .await
+            {
+                Ok(()) => {}
+                Err(super::ReplaceChatHistoryError::Committed(error)) => tracing::warn!(
+                    %error,
+                    "rewind cache rebuilt but summary bookkeeping repair failed"
+                ),
+                // The reducer already atomically published the same rebuilt
+                // cache; a second cache write failure only blocks bookkeeping.
+                Err(super::ReplaceChatHistoryError::NotCommitted(error)) => tracing::warn!(
+                    %error,
+                    "rewind cache rebuilt; bookkeeping rewrite could not be repeated"
+                ),
+            }
+            return Ok(true);
+        }
+        let Some(marker) =
+            crate::session::helpers::replay::find_authoritative_compaction_checkpoint(
+                &updates_path,
+            )?
+        else {
+            return Ok(false);
+        };
+        let expected_checkpoint_file =
+            format!("compaction_checkpoints/{}.json", marker.checkpoint_id);
+        if marker.checkpoint_file != expected_checkpoint_file {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "committed compaction marker has an unexpected checkpoint path",
+            ));
+        }
+        let checkpoint_path = self.session_dir(info).join(&marker.checkpoint_file);
+        let bytes = tokio::fs::read(&checkpoint_path).await?;
+        let checkpoint: crate::extensions::notification::CompactionCheckpointFile =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if checkpoint.schema_version > MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION
+            || checkpoint.checkpoint_id != marker.checkpoint_id
+            || checkpoint.prompt_index_at_compaction != marker.prompt_index_at_compaction
+            || checkpoint.schema_version != marker.schema_version
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "committed compaction checkpoint {} does not match its marker",
+                    checkpoint_path.display()
+                ),
+            ));
+        }
+        let contains_native_items = checkpoint.compacted_history.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::Provider(provider) if provider.is_native_compaction_item()
+            )
+        });
+        if contains_native_items {
+            xai_grok_sampling_types::native_compaction_compatibility(&checkpoint.compacted_history)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "native compaction checkpoint is missing compatibility metadata",
+                    )
+                })?;
+        } else if checkpoint.schema_version < FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION {
+            // Schema-v1 local checkpoints predate finalized-history staging:
+            // their derived cache may contain a fork-prefix transform that is
+            // absent from the checkpoint, so the cache must remain untouched.
+            return Ok(false);
+        }
+        // Finalized local-summary checkpoints are written through the same
+        // marker-first transaction as native: the staged history is the
+        // authoritative final replacement (including any fork-prefix
+        // transform). Repair a stale or missing derived cache from it.
+        let cache = match self.read_chat_history_sync(self.chat_file(info), CHAT_FORMAT_VERSION) {
+            Ok(cache) => cache,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let checkpoint_prefix_matches = cache.len() >= checkpoint.compacted_history.len()
+            && cache
+                .iter()
+                .zip(&checkpoint.compacted_history)
+                .all(|(cached, authoritative)| {
+                    serde_json::to_value(cached).ok() == serde_json::to_value(authoritative).ok()
+                });
+        if checkpoint_prefix_matches {
+            return Ok(false);
+        }
+
+        tracing::warn!(
+            checkpoint_id = %marker.checkpoint_id,
+            cached_items = cache.len(),
+            authoritative_items = checkpoint.compacted_history.len(),
+            "repairing stale or missing chat history from committed compaction checkpoint"
+        );
+        match self
+            .replace_chat_history_with_bookkeeping(info, &checkpoint.compacted_history)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(super::ReplaceChatHistoryError::Committed(error)) => {
+                tracing::warn!(
+                    %error,
+                    "compaction cache repaired but summary bookkeeping repair failed"
+                );
+                Ok(true)
+            }
+            Err(super::ReplaceChatHistoryError::NotCommitted(error)) => Err(error),
+        }
+    }
+    fn validate_native_history(items: &[ConversationItem]) -> io::Result<()> {
+        if !items.iter().any(|item| {
+            matches!(
+                item,
+                ConversationItem::Provider(provider) if provider.is_native_compaction_item()
+            )
+        }) {
+            return Ok(());
+        }
+        xai_grok_sampling_types::native_compaction_compatibility(items)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native compaction history is missing its compatibility manifest",
+                )
+            })?;
+        Ok(())
+    }
     fn read_jsonl<T: serde::de::DeserializeOwned>(&self, path: PathBuf) -> io::Result<Vec<T>> {
         if !path.exists() {
             return Ok(Vec::new());
@@ -673,20 +888,18 @@ impl JsonlStorageAdapter {
         };
         let mut entries: Vec<_> = std::fs::read_dir(&workflows_dir)?
             .filter_map(Result::ok)
-            .take(MAX_RESTORED_WORKFLOW_RUNS.saturating_add(1))
             .collect();
-        let entries_truncated = entries.len() > MAX_RESTORED_WORKFLOW_RUNS;
-        entries.truncate(MAX_RESTORED_WORKFLOW_RUNS);
         entries.sort_by_key(|entry| entry.file_name());
-        if entries_truncated {
-            tracing::warn!(
-                path = %workflows_dir.display(),
-                limit = MAX_RESTORED_WORKFLOW_RUNS,
-                "workflow restore run-count cap reached; ignoring remaining entries"
-            );
-        }
         let mut restored = Vec::new();
         for entry in entries {
+            if restored.len() == MAX_RESTORED_WORKFLOW_RUNS {
+                tracing::warn!(
+                    path = %workflows_dir.display(),
+                    limit = MAX_RESTORED_WORKFLOW_RUNS,
+                    "workflow restore run-count cap reached; ignoring remaining entries"
+                );
+                break;
+            }
             let run_dir = entry.path();
             let Ok(run_meta) = std::fs::symlink_metadata(&run_dir) else {
                 continue;
@@ -965,6 +1178,7 @@ fn transform_session_id_in_update(
         }
     }
 }
+
 /// Next `segment_NNN` index in `compaction_dir`: one past the highest existing
 /// segment, or 0 when none exist. Resume-safe — derived from disk, not memory.
 async fn next_compaction_segment_index(compaction_dir: &std::path::Path) -> u64 {
@@ -1272,10 +1486,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         }
     }
     async fn load_session(&self, info: &Info) -> io::Result<PersistedData> {
-        let summary = self.read_summary_sync(info)?;
+        let mut summary = self.read_summary_sync(info)?;
+        if self.reconcile_committed_compaction_cache(info).await? {
+            summary = self.read_summary_sync(info).unwrap_or(summary);
+        }
         let chat_file = self.chat_file(info);
         self.ensure_chat_history(info, summary.chat_format_version)?;
         let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
+        Self::validate_native_history(&chat_history)?;
         let updates = self.read_updates_jsonl(self.updates_file(info))?;
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
@@ -1327,10 +1545,14 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
     ) -> io::Result<super::PersistedDataLight> {
         tracing::info!("Loading session data (without updates) from JSONL");
-        let summary = self.read_summary_sync(info)?;
+        let mut summary = self.read_summary_sync(info)?;
+        if self.reconcile_committed_compaction_cache(info).await? {
+            summary = self.read_summary_sync(info).unwrap_or(summary);
+        }
         let chat_file = self.chat_file(info);
         self.ensure_chat_history(info, summary.chat_format_version)?;
         let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
+        Self::validate_native_history(&chat_history)?;
         let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
         let plan_mode_state = self
             .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
@@ -1468,23 +1690,17 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
         messages: &[ConversationItem],
     ) -> io::Result<()> {
-        self.write_jsonl(self.chat_file(info), messages).await?;
-        let new_count = messages.len();
-        let cwd_switch_bookkeeping_generation = messages
-            .iter()
-            .filter_map(ConversationItem::working_directory_switch_generation)
-            .max()
-            .unwrap_or(0);
-        self.apply_summary_patch(
-            info,
-            super::summary_write::SummaryPatch {
-                chat_messages: Some(super::summary_write::CounterOp::Set(new_count)),
-                chat_format_version: Some(CHAT_FORMAT_VERSION),
-                cwd_switch_bookkeeping_generation: Some(cwd_switch_bookkeeping_generation),
-                ..Default::default()
-            },
-        )
-        .await
+        self.replace_chat_history_with_bookkeeping(info, messages)
+            .await
+            .map_err(super::ReplaceChatHistoryError::into_io_error)
+    }
+    async fn replace_chat_history_commit_aware(
+        &self,
+        info: &Info,
+        messages: &[ConversationItem],
+    ) -> Result<(), super::ReplaceChatHistoryError> {
+        self.replace_chat_history_with_bookkeeping(info, messages)
+            .await
     }
     async fn copy_session_data(
         &self,
@@ -1577,7 +1793,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         let path = dir.join(format!("{}.json", checkpoint.checkpoint_id));
         let bytes = serde_json::to_vec_pretty(checkpoint)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        tokio::fs::write(path, bytes).await
+        super::write_bytes_atomic_durable_async(&path, bytes).await
     }
     async fn write_compaction_request(
         &self,

@@ -107,7 +107,8 @@ fn inline_image_count(conversation: &[ConversationItem]) -> usize {
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
             | ConversationItem::BackendToolCall(_)
-            | ConversationItem::Reasoning(_) => 0,
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Provider(_) => 0,
         })
         .sum()
 }
@@ -220,7 +221,8 @@ fn conversation_body_bytes(conversation: &[ConversationItem]) -> usize {
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
             | ConversationItem::BackendToolCall(_)
-            | ConversationItem::Reasoning(_) => {}
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Provider(_) => {}
         }
     }
     serialized_json_bytes(&blanked) + image_url_bytes
@@ -278,7 +280,8 @@ fn evict_images_to_budget(
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
             | ConversationItem::BackendToolCall(_)
-            | ConversationItem::Reasoning(_) => {}
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Provider(_) => {}
         }
     }
 

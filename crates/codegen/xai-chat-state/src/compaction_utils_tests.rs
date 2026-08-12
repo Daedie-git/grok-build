@@ -1436,6 +1436,40 @@ fn repair_history_dedups_duplicate_results() {
     }
 }
 #[test]
+fn repair_history_keeps_results_across_response_siblings() {
+    use xai_grok_sampling_types::{ResponseOutputItemMetadata, rs};
+
+    let mut items = vec![
+        ConversationItem::assistant_tool_calls(vec![call("call_A")]),
+        ConversationItem::tool_result("call_A", "stale synthetic cancellation"),
+        ConversationItem::Reasoning(rs::ReasoningItem {
+            id: "rs-after-message".into(),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("cipher".into()),
+            status: None,
+        }),
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-output".into(),
+            output_items: 0,
+            items: vec![],
+            origin: None,
+        }),
+        ConversationItem::tool_result("call_A", "real result"),
+    ];
+    let report = repair_history(&mut items);
+    assert_eq!(report.duplicates_removed, 1);
+    assert!(report.stripped_tool_result_ids.is_empty());
+    assert_eq!(report.synthetic_results_inserted, 0);
+    assert!(matches!(items[1], ConversationItem::Reasoning(_)));
+    assert!(matches!(items[2], ConversationItem::Provider(_)));
+    let ConversationItem::ToolResult(result) = &items[3] else {
+        panic!("real result must remain after the response siblings");
+    };
+    assert_eq!(result.content.as_ref(), "real result");
+}
+
+#[test]
 fn repair_history_is_noop_and_idempotent_on_valid_history() {
     let valid = vec![
         ConversationItem::system("sys"),
@@ -1675,6 +1709,7 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         // [3] Assistant with 2 parallel tool calls
         ConversationItem::Assistant(AssistantItem {
             content: "I'll read both files for you.".into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".into(),
@@ -1708,6 +1743,7 @@ async fn build_compacted_history_multi_turn_with_parallel_tool_calls() {
         // [8] Assistant with 2 parallel tool calls
         ConversationItem::Assistant(AssistantItem {
             content: "I'll fix the typo and run tests.".into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_3".into(),
@@ -2053,6 +2089,7 @@ fn conversation_item_preserves_reasoning_siblings() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "response".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -2077,6 +2114,7 @@ fn strip_reasoning_blocks_drops_reasoning_siblings() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "response".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -2123,6 +2161,7 @@ fn prepare_for_summarization_drops_reasoning_sibling_on_mutated_assistant() {
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
             content: "I'll search.".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "grep".into(),
@@ -2170,6 +2209,7 @@ fn prepare_for_summarization_drops_standalone_reasoning_sibling() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "plain text response".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -2202,6 +2242,7 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
             content: "calling grep".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "grep".into(),
@@ -2216,6 +2257,7 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         mk_reasoning(),
         ConversationItem::Assistant(AssistantItem {
             content: "thinking only".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -2225,6 +2267,7 @@ fn prepare_for_summarization_handles_multi_assistant_mixed_conversation() {
         ConversationItem::user("third turn"),
         ConversationItem::Assistant(AssistantItem {
             content: "plain reply".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -2290,6 +2333,7 @@ fn prepare_for_summarization_is_idempotent() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "hi".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "ls".into(),
@@ -2630,6 +2674,90 @@ fn fit_truncates_oversized_tail_result_in_place() {
         "truncated unit should fit budget (+ marker slack)"
     );
 }
+/// A large single-result jump keeps the complete call/result unit and does
+/// not orphan either side of a multi-call assistant turn.
+#[test]
+fn fit_large_tool_result_jump_preserves_all_call_result_boundaries() {
+    use xai_grok_sampling_types::ToolCall;
+    let huge = "tool output ".repeat(20_000);
+    let conv = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("inspect both files"),
+        ConversationItem::assistant_tool_calls(vec![
+            ToolCall {
+                id: "call-a".into(),
+                name: "read_file".into(),
+                arguments: r#"{"target_file":"a.rs"}"#.into(),
+            },
+            ToolCall {
+                id: "call-b".into(),
+                name: "read_file".into(),
+                arguments: r#"{"target_file":"b.rs"}"#.into(),
+            },
+        ]),
+        ConversationItem::tool_result("call-a", huge.as_str()),
+        ConversationItem::tool_result("call-b", "small but useful result"),
+    ];
+    let out = fit_conversation_to_budget(conv, 256);
+    let calls: BTreeSet<String> = out
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::Assistant(assistant) => Some(
+                assistant
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let results: BTreeSet<String> = out
+        .iter()
+        .filter_map(|item| match item {
+            ConversationItem::ToolResult(result) => Some(result.tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls, results,
+        "every retained tool result must retain its owning call"
+    );
+    assert_eq!(
+        calls,
+        BTreeSet::from(["call-a".to_string(), "call-b".to_string()])
+    );
+    assert!(out.iter().any(|item| matches!(
+        item,
+        ConversationItem::ToolResult(result)
+            if result.tool_call_id == "call-a" && result.content.contains("truncated")
+    )));
+
+    let request = xai_grok_sampling_types::ConversationRequest::from_items(out);
+    let created: xai_grok_sampling_types::rs::CreateResponse = (&request).into();
+    let wire = serde_json::to_value(&created).expect("serialize fitted Responses request");
+    let input = wire["input"]
+        .as_array()
+        .expect("serialized fitted request input array");
+    let serialized_calls: BTreeSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_owned))
+        .collect();
+    let serialized_results: BTreeSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(serialized_calls, calls);
+    assert_eq!(serialized_results, results);
+    assert_eq!(
+        serialized_calls, serialized_results,
+        "serialized fitted request must preserve every tool call/result ID pair"
+    );
+}
+
 /// A single oversized trailing text turn is also truncated in place, not dropped.
 #[test]
 fn fit_truncates_oversized_tail_text_item() {

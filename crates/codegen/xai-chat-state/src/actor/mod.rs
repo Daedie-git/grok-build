@@ -19,11 +19,37 @@ use tracing::debug;
 use crate::commands::{ChatStateCommand, StrictAppendAck};
 use crate::events::ChatStateEvent;
 use crate::handle::ChatStateHandle;
-use crate::persistence::ChatPersistence;
-use crate::types::{PruningConfig, TurnCapture};
+use crate::persistence::{ChatPersistence, ReplaceHistoryAck, ReplaceHistoryError};
+use crate::types::{
+    PruningConfig, SamplingTransitionApplied, SamplingTransitionError,
+    SamplingTransitionPersistence, TurnCapture,
+};
 
 use state::ChatState;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
+
+const SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+async fn await_history_replacement_ack(
+    receiver: tokio::sync::oneshot::Receiver<Result<ReplaceHistoryAck, ReplaceHistoryError>>,
+    timeout: std::time::Duration,
+) -> Result<ReplaceHistoryAck, ReplaceHistoryError> {
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "history replacement acknowledgement dropped",
+        ))),
+        Err(_) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "history replacement acknowledgement timed out after {} seconds",
+                timeout.as_secs()
+            ),
+        ))),
+    }
+}
 
 /// The actor that owns all chat state.
 /// Runs in a dedicated tokio task and processes commands sequentially.
@@ -40,6 +66,8 @@ pub struct ChatStateActor {
     event_tx: mpsc::UnboundedSender<ChatStateEvent>,
     /// Cancellation token for graceful shutdown.
     cancellation_token: tokio_util::sync::CancellationToken,
+    /// Actor-local bound for identity-transition persistence acknowledgements.
+    sampling_transition_ack_timeout: std::time::Duration,
 }
 
 impl ChatStateActor {
@@ -77,6 +105,46 @@ impl ChatStateActor {
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> ChatStateHandle {
+        Self::spawn_inner(
+            initial_conversation,
+            sampling_config,
+            pruning_config,
+            persistence,
+            event_tx,
+            cancellation_token,
+            SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_persistence_ack_timeout(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        sampling_transition_ack_timeout: std::time::Duration,
+    ) -> ChatStateHandle {
+        Self::spawn_inner(
+            initial_conversation,
+            sampling_config,
+            PruningConfig::default(),
+            persistence,
+            event_tx,
+            cancellation_token,
+            sampling_transition_ack_timeout,
+        )
+    }
+
+    fn spawn_inner(
+        initial_conversation: Vec<ConversationItem>,
+        sampling_config: SamplingConfig,
+        pruning_config: PruningConfig,
+        persistence: Box<dyn ChatPersistence>,
+        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        sampling_transition_ack_timeout: std::time::Duration,
+    ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         let actor = ChatStateActor {
@@ -86,6 +154,7 @@ impl ChatStateActor {
             cmd_rx,
             event_tx,
             cancellation_token,
+            sampling_transition_ack_timeout,
         };
 
         tokio::spawn(actor.run());
@@ -206,6 +275,68 @@ impl ChatStateActor {
             ChatStateCommand::UpdateSamplingConfig { config } => {
                 self.state.sampling_config = config;
             }
+            ChatStateCommand::TransitionSamplingState {
+                target,
+                credentials,
+                reply,
+            } => {
+                let (config, identity) = target.into_parts();
+                let mut proposed_history = self.state.conversation.clone();
+                let history_changed =
+                    match xai_grok_sampling_types::prepare_history_for_sampling_identity(
+                        &mut proposed_history,
+                        &identity,
+                    ) {
+                        Ok(changed) => changed,
+                        Err(error) => {
+                            let _ = reply.send(Err(SamplingTransitionError::History(error)));
+                            return;
+                        }
+                    };
+
+                if !history_changed {
+                    self.state.sampling_config = config;
+                    self.state.credentials = credentials;
+                    let _ = reply.send(Ok(SamplingTransitionApplied {
+                        history_changed: false,
+                        persistence: SamplingTransitionPersistence::NotRequired,
+                    }));
+                    return;
+                }
+
+                let persist_rx = self.persistence.replace_history_and_ack(&proposed_history);
+                let persisted =
+                    await_history_replacement_ack(persist_rx, self.sampling_transition_ack_timeout)
+                        .await;
+                let persistence = match persisted {
+                    Ok(ReplaceHistoryAck::Committed) => SamplingTransitionPersistence::Committed,
+                    Ok(ReplaceHistoryAck::CommittedWithBookkeepingWarning(error)) => {
+                        SamplingTransitionPersistence::CommittedWithBookkeepingWarning(error)
+                    }
+                    Err(ReplaceHistoryError::NotCommitted(error)) => {
+                        let _ = reply.send(Err(
+                            SamplingTransitionError::HistoryReplacementNotCommitted(error),
+                        ));
+                        return;
+                    }
+                    Err(ReplaceHistoryError::Indeterminate(error)) => {
+                        let _ = reply.send(Err(
+                            SamplingTransitionError::HistoryReplacementIndeterminate(error),
+                        ));
+                        return;
+                    }
+                };
+
+                // Persistence is now authoritative. Reuse the existing install
+                // semantics so no duplicate replacement is emitted.
+                self.replace_conversation_without_persistence(proposed_history, false);
+                self.state.sampling_config = config;
+                self.state.credentials = credentials;
+                let _ = reply.send(Ok(SamplingTransitionApplied {
+                    history_changed: true,
+                    persistence,
+                }));
+            }
             ChatStateCommand::RecordAgentEditedPath { path } => {
                 self.state.agent_edited_paths.insert(path);
             }
@@ -281,12 +412,23 @@ impl ChatStateActor {
             ChatStateCommand::RestoreSnapshot(snapshot) => {
                 self.restore_snapshot(*snapshot);
             }
+            ChatStateCommand::BeginTurnRoutingScope => {
+                self.state.turn_routing_state = xai_grok_sampling_types::TurnRoutingState::fresh();
+            }
             ChatStateCommand::BeginTurnCapture => {
                 self.state.turn_capture = Some(state::TurnCaptureState {
                     turn_start_offset: self.state.conversation.len(),
                     pre_replacement_messages: Vec::new(),
                     compaction_occurred: false,
                 });
+            }
+            ChatStateCommand::InstallPersistedCompaction { items, reply } => {
+                self.replace_conversation_without_persistence(items, true);
+                let _ = reply.send(());
+            }
+            ChatStateCommand::InstallPersistedRewind { snapshot, reply } => {
+                self.install_persisted_rewind(*snapshot);
+                let _ = reply.send(());
             }
             ChatStateCommand::AppendHarnessTraceItems { items } => {
                 self.state.harness_trace_buffer.extend(items);
@@ -334,6 +476,9 @@ impl ChatStateActor {
             ChatStateCommand::GetPromptIndex { reply } => {
                 let _ = reply.send(self.state.prompt_index);
             }
+            ChatStateCommand::GetTurnRoutingState { reply } => {
+                let _ = reply.send(self.state.turn_routing_state.clone());
+            }
             ChatStateCommand::GetLastCompactionPromptIndex { reply } => {
                 let _ = reply.send(self.state.last_compaction_prompt_index);
             }
@@ -355,6 +500,12 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetSamplingConfig { reply } => {
                 let _ = reply.send(self.state.sampling_config.clone());
+            }
+            ChatStateCommand::GetSamplingState { reply } => {
+                let _ = reply.send(crate::types::SamplingState {
+                    config: self.state.sampling_config.clone(),
+                    credentials: self.state.credentials.clone(),
+                });
             }
             ChatStateCommand::GetAgentEditedPaths { reply } => {
                 let _ = reply.send(self.state.agent_edited_paths.clone());

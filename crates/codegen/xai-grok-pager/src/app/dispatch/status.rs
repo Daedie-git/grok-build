@@ -375,6 +375,13 @@ pub(super) fn commit_session_usage_block(
 
 /// Consumer credit follow-up for `/usage` (redirect or non-silent billing fetch).
 pub(super) fn append_consumer_billing_surface(app: &mut AppView, agent_id: AgentId) -> Vec<Effect> {
+    if let Some(agent) = app.agents.get_mut(&agent_id)
+        && agent.session.models.current_model_is_codex()
+    {
+        return vec![super::billing::account_usage_refresh_effect(
+            agent, agent_id, false,
+        )];
+    }
     if !app.usage_visible {
         return vec![];
     }

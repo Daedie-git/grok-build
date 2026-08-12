@@ -194,6 +194,7 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         return false;
     }
     let mut plugins_changed_needs_skills_refetch = false;
+    let mut needs_account_usage_refresh = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
@@ -1010,10 +1011,22 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
                 .and_then(|s| s.parse::<ReasoningEffort>().ok());
             let prev_model = agent.session.models.current.clone();
             let prev_effort = agent.session.models.reasoning_effort;
+            let previous_was_codex = agent.session.models.current_model_is_codex();
             agent
                 .session
                 .models
                 .set_current(new_model_id.clone(), effort);
+            let provider_changed =
+                previous_was_codex != agent.session.models.current_model_is_codex();
+            if provider_changed {
+                // Mirror local SwitchModelComplete: clear stale Codex windows
+                // and schedule a silent usage refresh for the new provider.
+                if agent.session.models.current_model_is_codex() {
+                    agent.codex_rate_limits = None;
+                }
+                agent.refresh_restricted_commands_for_model();
+                needs_account_usage_refresh = true;
+            }
             agent.session.user_model_preference = Some(new_model_id.clone());
             let resolved_effort = agent.session.models.reasoning_effort;
             let actually_changed =
@@ -1171,6 +1184,10 @@ pub(super) fn handle_session_notification(notif: &acp::ExtNotification, app: &mu
         } else {
             tracing::warn!("PluginsChanged: agent or modal disappeared before skills re-fetch");
         }
+    }
+    if needs_account_usage_refresh && let Some(agent) = app.agents.get_mut(&parent_id) {
+        let effect = crate::app::dispatch::account_usage_refresh_effect(agent, parent_id, true);
+        app.pending_effects.push(effect);
     }
     if let Some(agent) = app.agents.get_mut(&parent_id) {
         if let Some(seq) = meta.event_seq

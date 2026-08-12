@@ -30,6 +30,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
             extra_response_includes: Vec::new(),

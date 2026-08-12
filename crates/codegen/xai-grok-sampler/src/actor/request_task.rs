@@ -1000,10 +1000,9 @@ mod tests {
         );
     }
 
-    /// A StreamError-sourced info has `status_code: None`; synthesis falls
-    /// back to a 500 Api error. That fallback must stay inside the
-    /// classifier's 400|500 gate, or coded mid-stream image rejections
-    /// silently stop stripping after the round trip.
+    /// A StreamError-sourced info carries its structured status through
+    /// synthesis. Coded mid-stream image rejections must remain inside the
+    /// classifier's 400|500 gate after that round trip.
     #[test]
     fn synthesize_stream_sourced_info_still_classifies_for_strip() {
         let original = SamplingError::StreamError {
@@ -1014,7 +1013,7 @@ mod tests {
         assert!(original.is_image_processing_error());
 
         let info = SamplingErrorInfo::from(&original);
-        assert_eq!(info.status_code, None, "stream errors carry no status");
+        assert_eq!(info.status_code, Some(400));
 
         let round_tripped = synthesize_from_info(&info);
         assert!(

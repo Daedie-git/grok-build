@@ -205,6 +205,7 @@ Actions that affect the agent session, available from the agent screen.
 | `?` (Shift+/) | Agent screen | Open the command palette (alt binding) |
 | `Ctrl+M` | Agent screen | Open the model picker / switch model |
 | `Ctrl+M` | Prompt focused | Toggle multiline input mode |
+| `Ctrl+R` | Agent screen | Cycle reasoning effort on the current model |
 | `Ctrl+C` | Agent screen | Cancel the current turn (or clear non-empty draft first; see Escape table) |
 | `Ctrl+O` | Agent screen | Toggle always-approve (YOLO) mode |
 | `Ctrl+S` | Agent screen | Open the session picker (resume a previous session) |
@@ -439,6 +440,7 @@ Rewind (idle):    Esc Esc within 800ms (empty prompt + messages)
 ```
 Command palette:  Ctrl+P or ?
 Model picker:     Ctrl+M (from scrollback)
+Cycle effort:     Ctrl+R
 Cancel:           Ctrl+C (see Escape table)
 Always-approve:   Ctrl+O (toggle YOLO)
 New session:      Ctrl+N (press again, then choose normal/worktree)

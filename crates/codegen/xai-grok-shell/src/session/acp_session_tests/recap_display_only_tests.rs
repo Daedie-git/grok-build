@@ -1364,6 +1364,7 @@ async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
                 )),
                 ConversationItem::Assistant(AssistantItem {
                     content: String::new().into(),
+                    response_item_id: None,
                     tool_calls: vec![ToolCall {
                         id: "tc1".into(),
                         name: "read_file".into(),

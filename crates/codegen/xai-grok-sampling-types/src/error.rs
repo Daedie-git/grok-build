@@ -212,6 +212,99 @@ pub enum SamplingError {
 /// both non-stream error bodies and mid-stream SSE error events.
 pub const INVALID_IMAGE_ERROR_CODE: &str = "invalid_image";
 
+/// Responses API image failures caused by the submitted image itself. These
+/// are deterministic for an unchanged request, but callers may recover by
+/// removing images and resubmitting.
+const RECOVERABLE_IMAGE_ERROR_CODES: &[&str] = &[
+    INVALID_IMAGE_ERROR_CODE,
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "invalid_image_mode",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "empty_image_file",
+];
+
+fn is_recoverable_image_error_code(value: &str) -> bool {
+    RECOVERABLE_IMAGE_ERROR_CODES.contains(&value)
+}
+
+fn contains_recoverable_image_error_code(value: &str) -> bool {
+    RECOVERABLE_IMAGE_ERROR_CODES
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+/// Map a structured SSE error code and message to the HTTP-equivalent status
+/// used by downstream retry and recovery policy.
+///
+/// Unknown dispositions remain a retryable 500 for backward compatibility.
+/// Known request, authentication, account, and image failures map to permanent
+/// 4xx statuses so replaying an unchanged Grok request does not consume the
+/// retry budget.
+pub fn structured_stream_error_status(error_type: &str, message: &str) -> StatusCode {
+    let kind = error_type.trim().to_ascii_lowercase();
+    if let Some(status) = kind
+        .parse::<u16>()
+        .ok()
+        .and_then(|status| StatusCode::from_u16(status).ok())
+    {
+        return status;
+    }
+
+    let exact_status = match kind.as_str() {
+        "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        "authentication_error" | "unauthorized" => Some(StatusCode::UNAUTHORIZED),
+        "permission_error" | "forbidden" | "account_deactivated" => Some(StatusCode::FORBIDDEN),
+        "insufficient_quota" | "billing_error" => Some(StatusCode::PAYMENT_REQUIRED),
+        "not_found_error" | "image_file_not_found" => Some(StatusCode::NOT_FOUND),
+        "rate_limit_error" | "rate_limit_exceeded" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "service_unavailable_error" | "overloaded_error" => Some(StatusCode::SERVICE_UNAVAILABLE),
+        "timeout_error" | "vector_store_timeout" => Some(StatusCode::GATEWAY_TIMEOUT),
+        "image_content_policy_violation" => Some(StatusCode::FORBIDDEN),
+        value if is_recoverable_image_error_code(value) => Some(StatusCode::BAD_REQUEST),
+        _ => None,
+    };
+    if let Some(status) = exact_status {
+        return status;
+    }
+
+    let message = message.to_ascii_lowercase();
+    if is_context_length_error(&message)
+        || message.contains("invalid_request_error")
+        || message.contains("invalid_prompt")
+        || contains_recoverable_image_error_code(&message)
+    {
+        StatusCode::BAD_REQUEST
+    } else if message.contains("authentication_error") {
+        StatusCode::UNAUTHORIZED
+    } else if message.contains("permission_error")
+        || message.contains("account_deactivated")
+        || message.contains("image_content_policy_violation")
+    {
+        StatusCode::FORBIDDEN
+    } else if message.contains("insufficient_quota") || message.contains("billing_error") {
+        StatusCode::PAYMENT_REQUIRED
+    } else if message.contains("not_found_error") || message.contains("image_file_not_found") {
+        StatusCode::NOT_FOUND
+    } else if message.contains("rate_limit_error") || message.contains("rate_limit_exceeded") {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if message.contains("service_unavailable_error") || message.contains("overloaded_error")
+    {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if message.contains("timeout_error") || message.contains("vector_store_timeout") {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// A wire `error.code`, parsed once at the boundary so classification
 /// compares variants instead of strings. `#[non_exhaustive]`: the next
 /// semantic code is a new variant, not another const and `||` chain.
@@ -293,24 +386,36 @@ impl SamplingError {
         // OIDC refresh and then surfaces as acp::Error::auth_required on
         // the client, which in the desktop app tears down the session and
         // can race with invalid_grant_threshold to wipe auth.json.
-        matches!(
-            self,
+        match self {
             SamplingError::Auth { .. }
-                | SamplingError::Api {
-                    status: StatusCode::UNAUTHORIZED,
-                    ..
-                }
-        )
+            | SamplingError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+                ..
+            } => structured_stream_error_status(error_type, message) == StatusCode::UNAUTHORIZED,
+            _ => false,
+        }
     }
 
     pub fn is_rate_limited(&self) -> bool {
-        matches!(
-            self,
+        match self {
             SamplingError::Api {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 ..
+            } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+                ..
+            } => {
+                structured_stream_error_status(error_type, message) == StatusCode::TOO_MANY_REQUESTS
             }
-        )
+            _ => false,
+        }
     }
 
     pub fn is_payload_too_large(&self) -> bool {
@@ -373,10 +478,21 @@ impl SamplingError {
                 error_code,
                 ..
             } if matches!(status.as_u16(), 400 | 500) => {
-                *error_code == Some(ApiErrorCode::InvalidImage)
-                    || message.contains("Could not process image")
+                error_code.as_ref().is_some_and(|code| {
+                    is_recoverable_image_error_code(&code.as_str().to_ascii_lowercase())
+                }) || message.contains("Could not process image")
+                    || contains_recoverable_image_error_code(&message.to_ascii_lowercase())
             }
-            SamplingError::StreamError { code, .. } => *code == Some(ApiErrorCode::InvalidImage),
+            SamplingError::StreamError {
+                error_type,
+                message,
+                code,
+            } => {
+                code.as_ref().is_some_and(|code| {
+                    is_recoverable_image_error_code(&code.as_str().to_ascii_lowercase())
+                }) || is_recoverable_image_error_code(&error_type.trim().to_ascii_lowercase())
+                    || contains_recoverable_image_error_code(&message.to_ascii_lowercase())
+            }
             // Explicit like `is_retryable`: a new variant must state its
             // image classification instead of silently defaulting to false.
             SamplingError::Api { .. }
@@ -398,9 +514,17 @@ impl SamplingError {
             SamplingError::InvalidConfiguration(_) => false,
             SamplingError::Http(err) => is_retryable_reqwest(err),
             SamplingError::Serialization(_) => false,
+            SamplingError::Api {
+                should_retry: Some(false),
+                ..
+            } => false,
             SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
-            SamplingError::StreamError { .. } => true,
+            SamplingError::StreamError {
+                error_type,
+                message,
+                ..
+            } => is_retryable_api_status(structured_stream_error_status(error_type, message)),
             SamplingError::IdleTimeout { .. } => false,
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
@@ -546,7 +670,7 @@ struct ParsedError {
     code: Option<ApiErrorCode>,
 }
 
-/// Extract the error fields from either error format.
+/// Extract the error fields from a supported provider error format.
 fn try_parse_error(data: &str) -> Option<ParsedError> {
     if let Ok(resp) = serde_json::from_str::<ErrorResponse>(data) {
         return Some(ParsedError {
@@ -568,6 +692,22 @@ fn try_parse_error(data: &str) -> Option<ParsedError> {
             code,
             error_type: flat.code.unwrap_or_else(|| "server_error".to_string()),
             message: flat.error,
+        });
+    }
+    // Some Responses-compatible gateways emit FastAPI-style failures as a
+    // successful SSE response whose event is only `{ "detail": "..." }`.
+    // Recognize that envelope before the closed Responses event enum turns it
+    // into a serialization error. Requiring the standard event discriminator
+    // to be absent prevents a future valid event that happens to carry a
+    // `detail` field from being swallowed as an error.
+    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(data)
+        && !object.contains_key("type")
+        && let Some(message) = object.get("detail").and_then(serde_json::Value::as_str)
+    {
+        return Some(ParsedError {
+            error_type: "unknown".to_string(),
+            message: message.to_string(),
+            code: None,
         });
     }
     None
@@ -702,6 +842,8 @@ pub fn is_context_length_error(message: &str) -> bool {
         || m.contains("maximum prompt length")
         || m.contains("maximum context length")
         || m.contains("context_length_exceeded")
+        || m.contains("exceeds the context window")
+        || m.contains("exceeded the available context")
         || (m.contains("current message") && m.contains("exceeds budget"))
 }
 
@@ -1034,6 +1176,33 @@ mod tests {
             try_parse_stream_error(data).is_none(),
             "valid chunk should not be parsed as error"
         );
+    }
+
+    #[test]
+    fn try_parse_stream_error_bare_detail_format() {
+        let data = r#"{"detail":"The prompt is too long for this model's context window."}"#;
+        let err = try_parse_stream_error(data).expect("bare detail must be a stream error");
+        match err {
+            SamplingError::StreamError {
+                error_type,
+                message,
+                code,
+            } => {
+                assert_eq!(error_type, "unknown");
+                assert_eq!(
+                    message,
+                    "The prompt is too long for this model's context window."
+                );
+                assert_eq!(code, None);
+            }
+            other => panic!("expected StreamError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_parse_stream_error_does_not_swallow_typed_detail_event() {
+        let data = r#"{"type":"response.example","detail":"event payload"}"#;
+        assert!(try_parse_stream_error(data).is_none());
     }
 
     #[test]

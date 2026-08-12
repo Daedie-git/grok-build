@@ -683,6 +683,7 @@ fn test_conversation_item_with_sibling_reasoning_serialization() {
     });
     let assistant_item = ConversationItem::Assistant(AssistantItem {
         content: "The answer is 42.".into(),
+        response_item_id: None,
         tool_calls: vec![],
         model_id: Some("grok-3".to_string()),
         model_fingerprint: None,
@@ -715,6 +716,7 @@ fn test_encrypted_reasoning_included_in_responses_api_request() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "The answer is 4.".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
             model_fingerprint: None,
@@ -775,6 +777,7 @@ fn test_only_encrypted_reasoning_included_in_request() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: "Hi!".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,
@@ -1048,6 +1051,7 @@ fn test_transform_cwd_rewrites_reasoning_sibling() {
         }),
         ConversationItem::Assistant(AssistantItem {
             content: format!("I edited {worktree}/src/main.rs").into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: Some("grok-3".to_string()),
             model_fingerprint: None,
@@ -1237,6 +1241,7 @@ fn empty_reason_reasoning_only() {
             }),
             ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: Vec::new(),
                 model_id: None,
                 model_fingerprint: None,
@@ -1625,6 +1630,7 @@ fn empty_content_assistant_with_tool_calls_and_reasoning() {
         reasoning_sibling("r1", "must call a tool", Some("enc_pre_tool")),
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(""),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: Arc::<str>::from("call_1"),
                 name: "read_file".to_string(),

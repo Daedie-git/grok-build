@@ -19,6 +19,7 @@ fn item_kind_str(item: &ConversationItem) -> &'static str {
         ConversationItem::Assistant(_) => "assistant",
         ConversationItem::ToolResult(_) => "tool_result",
         ConversationItem::BackendToolCall(_) => "backend_tool_call",
+        ConversationItem::Provider(_) => "provider",
         ConversationItem::Reasoning(_) => "reasoning",
     }
 }
@@ -406,6 +407,21 @@ impl ChatStateActor {
                 ConversationItem::Assistant(a) => a.content.len(),
                 ConversationItem::ToolResult(tr) => tr.content.len(),
                 ConversationItem::BackendToolCall(b) => b.text_summary().len(),
+                ConversationItem::Provider(provider) => {
+                    if let Some(metadata) = provider.as_native_compaction_metadata() {
+                        metadata.model.len()
+                            + metadata.backend_family.len()
+                            + metadata
+                                .chatgpt_account_id
+                                .as_deref()
+                                .map(str::len)
+                                .unwrap_or(0)
+                    } else if let Some(item) = provider.as_encrypted_compaction() {
+                        item.encrypted_content.len()
+                    } else {
+                        0
+                    }
+                }
                 ConversationItem::Reasoning(r) => {
                     xai_grok_sampling_types::reasoning_item_text(r).len()
                         + r.encrypted_content.as_deref().map(str::len).unwrap_or(0)
@@ -511,6 +527,23 @@ impl ChatStateActor {
         items: Vec<ConversationItem>,
         is_compaction: bool,
     ) {
+        self.replace_conversation_inner(items, is_compaction, true);
+    }
+
+    pub(super) fn replace_conversation_without_persistence(
+        &mut self,
+        items: Vec<ConversationItem>,
+        is_compaction: bool,
+    ) {
+        self.replace_conversation_inner(items, is_compaction, false);
+    }
+
+    fn replace_conversation_inner(
+        &mut self,
+        items: Vec<ConversationItem>,
+        is_compaction: bool,
+        persist: bool,
+    ) {
         self.snapshot_turn_slice();
         if is_compaction && let Some(cap) = &mut self.state.turn_capture {
             cap.compaction_occurred = true;
@@ -519,7 +552,9 @@ impl ChatStateActor {
         // `harness_trace_buffer` / `harness_trace_turns` intentionally untouched:
         // the planner/verifier subagents ran, so their sealed trace turns survive
         // a conversation replace (same intent as the `TruncateToPromptIndex` arm).
-        self.persistence.replace_history(&items);
+        if persist {
+            self.persistence.replace_history(&items);
+        }
         let base_estimate = super::state::estimate_conversation_tokens(&items);
         let mut estimated_tokens =
             if is_compaction && pre_replace_total > 0 && self.state.estimate_at_last_response > 0 {
@@ -567,6 +602,19 @@ impl ChatStateActor {
         debug_assert!(changed, "head mismatch must produce a change");
         self.replace_conversation(conversation, false);
         changed
+    }
+
+    /// Install an externally-persisted rewind and publish the same reset/token
+    /// events as a normal conversation replacement, without writing history a
+    /// second time.
+    pub(super) fn install_persisted_rewind(&mut self, snap: ChatStateSnapshot) {
+        self.restore_snapshot(snap);
+        self.send_event(ChatStateEvent::ConversationReset {
+            new_len: self.state.conversation.len(),
+        });
+        self.send_event(ChatStateEvent::TokensUpdated {
+            total_tokens: self.state.total_tokens,
+        });
     }
 
     /// Restore all state fields from a snapshot.

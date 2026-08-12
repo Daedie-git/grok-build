@@ -156,6 +156,21 @@ pub enum ModelOverrideProvenance {
     Tool,
 }
 
+/// Controls whether automatic compaction is a transparent context-recovery
+/// mechanism or a one-cycle convergence boundary for a child agent.
+///
+/// This is deliberately independent from nesting depth and output-token
+/// budgets. Ordinary model-issued tasks may be nested and long-running; only
+/// harnesses with a real bounded lifecycle should opt into finalization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubagentCompactionPolicy {
+    /// Continue sampling with the normal toolset after automatic compaction.
+    #[default]
+    ContinueAfterCompaction,
+    /// Permit one automatic compaction, then require a tool-free final answer.
+    FinalizeAfterOneCompaction,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRuntimeOverrides {
     /// Override the model (e.g. "test-model").
@@ -185,6 +200,8 @@ pub struct SubagentRuntimeOverrides {
     pub output_token_budget: Option<u64>,
     pub output_schema: Option<serde_json::Value>,
     pub loop_task_id: Option<String>,
+    /// Explicit automatic-compaction lifecycle for this child.
+    pub compaction_policy: SubagentCompactionPolicy,
 }
 
 /// Re-export of [`xai_tool_types::is_not_sentinel`] for existing call sites.

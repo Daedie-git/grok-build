@@ -12,8 +12,34 @@ impl AsyncTerminalRunner for DummyTerminal {
         Err(TerminalError::Other("dummy terminal".into()))
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn persist_ack_waits_for_disk_flush_before_success() {
+
+/// Run full session-turn futures with the same stack budget as the dedicated
+/// production session thread.
+fn run_large_stack_session_test<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(test());
+        })
+        .expect("spawn session-stack test thread")
+        .join()
+        .expect("session-stack test thread");
+}
+
+#[test]
+fn persist_ack_waits_for_disk_flush_before_success() {
+    run_large_stack_session_test(persist_ack_waits_for_disk_flush_before_success_inner);
+}
+
+async fn persist_ack_waits_for_disk_flush_before_success_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -46,6 +72,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 extra_response_includes: Vec::new(),
@@ -96,6 +123,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -123,6 +151,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     pending_inputs: VecDeque::new(),
                     edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
+                    consumed_completion_tombstones: VecDeque::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     front_message_committed: false,
@@ -168,12 +197,15 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+                    bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
                     tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
+                    reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
@@ -372,6 +404,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     auth_scheme: Default::default(),
                     context_window: 100_000,
                     client_version: None,
@@ -421,6 +454,7 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -470,8 +504,14 @@ async fn first_turn_memory_injection_persists_to_chat_history() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
+#[test]
+fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history() {
+    run_large_stack_session_test(
+        first_turn_memory_injection_disabled_does_not_persist_to_chat_history_inner,
+    );
+}
+
+async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -507,6 +547,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 temperature: None,
                 top_p: None,
                 api_backend: Default::default(),
+                provider_id: None,
                 auth_scheme: Default::default(),
                 context_window: 100_000,
                 client_version: None,
@@ -558,6 +599,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     temperature: None,
                     top_p: None,
                     api_backend: Default::default(),
+                    provider_id: None,
                     extra_headers: Default::default(),
                     query_params: Default::default(),
                     env_http_headers: Default::default(),
@@ -601,6 +643,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     pending_inputs: VecDeque::new(),
                     edit_holds: HashMap::new(),
                     pending_notifications: Vec::new(),
+                    consumed_completion_tombstones: VecDeque::new(),
                     notifications_suppressed: false,
                     rewindable: false,
                     front_message_committed: false,
@@ -646,12 +689,15 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+                    bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
                     tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
+                    reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
@@ -862,6 +908,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
+                consumed_completion_tombstones: VecDeque::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
@@ -940,12 +987,15 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+                    bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
                     tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
+                    reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
@@ -1579,8 +1629,12 @@ async fn handle_prompt_send_now_frames_interjection_envelope() {
 /// between the abort and the user's resend must NOT consume the one-shot or
 /// inject the reminder — it has to survive to the next *genuine* user turn.
 /// Guards the `PromptOrigin::User` gate on the injection call.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
+#[test]
+fn handle_prompt_synthetic_origin_preserves_interrupt_reminder() {
+    run_large_stack_session_test(handle_prompt_synthetic_origin_preserves_interrupt_reminder_inner);
+}
+
+async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1759,18 +1813,40 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
                 tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
             let (persistence_tx, _persistence_rx) =
                 tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
-            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            let actor =
+                Arc::new(create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await);
+            let reservations = actor
+                .tool_context
+                .task_completion_reservations
+                .clone()
+                .expect("completion reservations");
             *actor
                 .current_prompt_id
                 .lock()
                 .expect("current_prompt_id mutex poisoned") =
                 Some("task-completed-bg-1".to_string());
-            let (wake_item, mut wake_rx) = input_with_origin_rx(
+            let (mut wake_item, mut wake_rx) = input_with_origin_rx(
                 "task-completed-bg-1",
                 crate::session::PromptOrigin::TaskCompleted {
                     task_id: "bg-1".to_string(),
                 },
             );
+            wake_item.task_wake_fallback = Some(crate::session::commands::TaskWakeFallback {
+                prompt_id: "bash-completed-bg-1".to_string(),
+                prompt_blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "completion bg-1",
+                ))],
+                source: NotificationSource::BashTaskCompleted {
+                    task_id: "bg-1".to_string(),
+                },
+                promotion_trace_start: None,
+                completion_reservation: Some(
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        reservations.clone(),
+                        "bg-1".to_string(),
+                    ),
+                ),
+            });
             let (user_item, mut user_rx) =
                 input_with_origin_rx("user-clarify", crate::session::PromptOrigin::User);
             {
@@ -1802,6 +1878,13 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
                 "the queued user prompt must survive a cancel that lands during \
                  the auto-wake turn"
             );
+            assert!(matches!(
+                state.pending_notifications.as_slice(),
+                [PendingNotification {
+                    source: NotificationSource::BashTaskCompleted { task_id },
+                    ..
+                }] if task_id == "bg-1"
+            ));
             drop(state);
             assert!(
                 matches!(
@@ -1816,6 +1899,15 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
             assert!(
                 matches!(user_rx.try_recv(), Err(TryRecvError::Empty)),
                 "the user prompt must remain pending (it runs next), not be cancelled"
+            );
+            assert!(
+                reservations.contains("bg-1"),
+                "the parked fallback must retain its completion reservation"
+            );
+            actor.consume_deferred_completions_for_user_turn().await;
+            assert!(
+                !reservations.contains("bg-1"),
+                "consuming the parked fallback must release its exact reservation"
             );
         })
         .await;
@@ -1836,7 +1928,6 @@ async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
                 .task_completion_reservations
                 .clone()
                 .expect("completion reservations");
-            reservations.reserve("bg-queued".to_string());
             let actor = Arc::new(actor);
             let (running_item, mut running_rx) =
                 input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
@@ -1854,6 +1945,13 @@ async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
                 source: NotificationSource::BashTaskCompleted {
                     task_id: "bg-queued".to_string(),
                 },
+                promotion_trace_start: None,
+                completion_reservation: Some(
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        reservations.clone(),
+                        "bg-queued".to_string(),
+                    ),
+                ),
             });
             let (queued_user, mut queued_user_rx) =
                 input_with_origin_rx("user-next", crate::session::PromptOrigin::User);
@@ -1991,7 +2089,6 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
                 .task_completion_reservations
                 .clone()
                 .expect("completion reservations");
-            reservations.reserve("bg-queued".to_string());
             let actor = Arc::new(actor);
             let (running_item, mut running_rx) =
                 input_with_origin_rx("user-running", crate::session::PromptOrigin::User);
@@ -2009,6 +2106,13 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
                 source: NotificationSource::BashTaskCompleted {
                     task_id: "bg-queued".to_string(),
                 },
+                promotion_trace_start: None,
+                completion_reservation: Some(
+                    crate::session::commands::OwnedCompletionReservation::reserve(
+                        reservations.clone(),
+                        "bg-queued".to_string(),
+                    ),
+                ),
             });
             let (queued_user, mut queued_user_rx) =
                 input_with_origin_rx("user-next", crate::session::PromptOrigin::User);
@@ -2325,6 +2429,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 temperature: None,
                 top_p: None,
                 api_backend: xai_grok_sampler::ApiBackend::Responses,
+                provider_id: None,
                 auth_scheme: Default::default(),
                 extra_headers: Default::default(),
                 extra_response_includes: Vec::new(),
@@ -2389,6 +2494,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 pending_inputs: VecDeque::new(),
                 edit_holds: HashMap::new(),
                 pending_notifications: Vec::new(),
+                consumed_completion_tombstones: VecDeque::new(),
                 notifications_suppressed: false,
                 rewindable: false,
                 front_message_committed: false,
@@ -2467,12 +2573,15 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                     context_window_override: None,
                     count: std::sync::atomic::AtomicU64::new(0),
                     auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+                    auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+                    bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
                     previous_model: std::cell::Cell::new(None),
                     compaction_mode: xai_chat_state::CompactionMode::Transcript,
                     verbatim_input: true,
                     tool_choice: crate::util::config::CompactionToolChoice::Auto,
                     prefire: crate::session::compaction_config::PrefireState::default(),
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
+                    reconciliation_required: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
                 memory: crate::session::memory_state::SessionMemory {
@@ -2635,6 +2744,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                             content: vec![xai_grok_sampling_types::ContentPart::Text {
                                 text: "hi".into(),
                             }],
+                            response_item_id: None,
                             synthetic_reason: None,
                             ..Default::default()
                         },

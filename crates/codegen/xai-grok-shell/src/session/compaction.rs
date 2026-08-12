@@ -5,19 +5,26 @@
 //! error-recovery compaction, preflight overflow detection, and checkpoint
 //! persistence. These methods form a second `impl SessionActor` block that
 //! lives alongside the primary one in `acp_session.rs`.
+#[path = "compaction/native/mod.rs"]
+mod native;
+use native::*;
+
 use super::SessionActor;
 use super::is_project_instructions;
 use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use crate::session::compaction_config::{
-    AsyncCompactionCache, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN,
+    AUTO_COMPACT_RETRY_AFTER_RESET, AUTO_COMPACT_RETRY_READY, AsyncCompactionCache,
+    BOUNDED_COMPACT_FAILED, BOUNDED_COMPACT_FINALIZING, BOUNDED_COMPACT_IN_FLIGHT,
+    BOUNDED_COMPACT_NONE, SUPPRESS_AUTH, SUPPRESS_NONE, SUPPRESS_STICKY, SUPPRESS_TURN,
     SUPPRESS_UNTIL_SUCCESS,
 };
 use crate::session::helpers::CompactionStateContext;
 use crate::session::helpers::compaction_context::CompactionInputs;
 use crate::session::helpers::compaction_context::to_system_reminder;
+use crate::session::helpers::replay::CompactionCommitKind;
 use crate::session::helpers::session_compact::{
-    CompactOutput, CompactionOutcome, build_two_pass_compaction_prompt, generate_session_compact,
-    is_context_length_error,
+    CompactOutput, CompactionOutcome, build_compaction_prompt, build_two_pass_compaction_prompt,
+    generate_session_compact, is_context_length_error,
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
@@ -32,6 +39,56 @@ use xai_chat_state::compaction_utils::{
     validate_compacted_history,
 };
 use xai_grok_sampling_types::{ApiBackend, ConversationItem};
+
+/// The validated replacement produced by exactly one compaction implementation.
+/// Keeping native and local products discriminated prevents native history from
+/// accidentally entering local summary reconstruction or sanitization.
+enum CompactionProduct {
+    NativeCodex {
+        replacement_history: Vec<ConversationItem>,
+        output: CompactOutput,
+    },
+    LocalSummary {
+        summary: String,
+        output: CompactOutput,
+    },
+}
+
+enum CompactionReplacement {
+    NativeCodex(Vec<ConversationItem>),
+    LocalSummary(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCompactFailureDisposition {
+    Cooldown,
+    RetryAfterReset,
+}
+
+impl CompactionProduct {
+    fn local_summary(&self) -> Option<&str> {
+        match self {
+            Self::NativeCodex { .. } => None,
+            Self::LocalSummary { summary, .. } => Some(summary),
+        }
+    }
+
+    fn into_parts(self) -> (CompactionReplacement, CompactOutput) {
+        match self {
+            Self::NativeCodex {
+                replacement_history,
+                output,
+            } => (
+                CompactionReplacement::NativeCodex(replacement_history),
+                output,
+            ),
+            Self::LocalSummary { summary, output } => {
+                (CompactionReplacement::LocalSummary(summary), output)
+            }
+        }
+    }
+}
+
 /// Default percentage points below the auto-compact threshold at which prefire
 /// (background pass-1) starts, giving pass-1 runway to finish before the limit.
 /// Override with `GROK_PREFIRE_LEAD_PERCENT`.
@@ -41,6 +98,42 @@ fn prefire_lead_percent() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_PREFIRE_LEAD_PERCENT)
+}
+
+/// Owned snapshot of the process-level Codex compaction strategy override.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfiguredCodexCompactionStrategy {
+    Unset,
+    Value(String),
+    InvalidEncoding,
+}
+
+impl ConfiguredCodexCompactionStrategy {
+    fn from_env_result(result: Result<String, std::env::VarError>) -> Self {
+        match result {
+            Ok(value) => Self::Value(value),
+            Err(std::env::VarError::NotPresent) => Self::Unset,
+            Err(std::env::VarError::NotUnicode(_)) => Self::InvalidEncoding,
+        }
+    }
+
+    fn as_override(&self) -> CompactionStrategyOverride<'_> {
+        match self {
+            Self::Unset => CompactionStrategyOverride::Unset,
+            Self::Value(value) => CompactionStrategyOverride::Value(value),
+            Self::InvalidEncoding => CompactionStrategyOverride::InvalidEncoding,
+        }
+    }
+}
+
+/// Snapshot the developer strategy override once at compaction invocation.
+///
+/// Keeping the global read outside `run_compact_inner` makes its policy input
+/// explicit and lets tests cover default behavior without mutating process state.
+fn configured_codex_compaction_strategy() -> ConfiguredCodexCompactionStrategy {
+    ConfiguredCodexCompactionStrategy::from_env_result(std::env::var(
+        "GROK_CODEX_COMPACTION_STRATEGY",
+    ))
 }
 /// Cheap fingerprint of a conversation prefix for prefire NOTE₁ validity. A
 /// mismatch means the prefix changed (edit / rewind / branch) since pass-1, so
@@ -57,8 +150,30 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
             ConversationItem::ToolResult(_) => 3,
             ConversationItem::BackendToolCall(_) => 4,
             ConversationItem::Reasoning(_) => 5,
+            ConversationItem::Provider(provider) => {
+                if provider.is_native_compaction_metadata() {
+                    6
+                } else if provider.is_encrypted_compaction() {
+                    7
+                } else {
+                    8
+                }
+            }
         };
         tag.hash(&mut h);
+        if let ConversationItem::Provider(provider) = it {
+            if let Some(metadata) = provider.as_native_compaction_metadata() {
+                metadata.schema_version.hash(&mut h);
+                metadata.backend_family.hash(&mut h);
+                metadata.model.hash(&mut h);
+                metadata.chatgpt_account_id.hash(&mut h);
+            }
+            if let Some(metadata) = provider.as_response_output_metadata() {
+                serde_json::to_string(metadata)
+                    .unwrap_or_default()
+                    .hash(&mut h);
+            }
+        }
         it.text_content().hash(&mut h);
     }
     h.finish()
@@ -393,11 +508,282 @@ impl SessionActor {
     }
 }
 /// Trigger info for auto-compact decisions.
+/// Why automatic compaction fired. Post-install headroom validation is
+/// trigger-aware: a Codex safety compact must only prove Codex headroom, while
+/// a soft-threshold compact must also clear Codex's provider limit when present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCompactTriggerKind {
+    SoftThreshold,
+    CodexSafety,
+    PreflightOverflow,
+    Forced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoCompactTriggerInfo {
     pub tokens_used: u64,
     pub context_window: u64,
     pub percentage: u8,
+    pub kind: AutoCompactTriggerKind,
 }
+
+const BOUNDED_SUBAGENT_FINALIZE_REMINDER: &str = "This bounded subagent task has used its one allowed automatic compaction. Stop exploring now and return the best complete final result using only evidence already collected. Do not call or request exploratory tools. If a required final-output tool is available, call only that tool once to submit the result. Preserve concrete file/line references and verified evidence; omit or explicitly qualify anything you could not verify.";
+
+/// Token reserve for the finalize reminder (including `<system-reminder>` wrap)
+/// so post-install headroom accounts for the message we are about to push.
+fn bounded_finalize_reminder_token_reserve() -> u64 {
+    let wrapped =
+        format!("<system-reminder>\n{BOUNDED_SUBAGENT_FINALIZE_REMINDER}\n</system-reminder>");
+    xai_token_estimation::estimate_tokens(&wrapped)
+}
+
+/// Output runway reserved when fitting a near-limit *local-summary* request.
+/// Native Codex compaction bypasses this policy: `/responses/compact` owns its
+/// replacement-history budget and receives the full prepared transcript.
+const SUMMARY_BUDGET_RESERVE_TOKENS: u64 = 32_768;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionInputStage {
+    Verbatim,
+    VerbatimFitted,
+    Lossy,
+}
+
+impl CompactionInputStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verbatim => "verbatim",
+            Self::VerbatimFitted => "verbatim_fitted",
+            Self::Lossy => "lossy",
+        }
+    }
+
+    fn after_context_overflow(self) -> Option<Self> {
+        match self {
+            Self::Verbatim => Some(Self::VerbatimFitted),
+            Self::VerbatimFitted => Some(Self::Lossy),
+            Self::Lossy => None,
+        }
+    }
+}
+
+/// Maximum prepared-history tokens that leave room for tool definitions, the
+/// summary instruction, and the summary output reserve.
+fn fitted_compaction_history_budget(
+    context_window: u64,
+    tool_tokens: u64,
+    summary_prompt_tokens: u64,
+) -> u64 {
+    context_window
+        .saturating_sub(SUMMARY_BUDGET_RESERVE_TOKENS)
+        .saturating_sub(tool_tokens)
+        .saturating_sub(summary_prompt_tokens)
+}
+
+fn codex_auto_compaction_needs_prefit(
+    prepared_history_tokens: u64,
+    context_window: u64,
+    tool_tokens: u64,
+    summary_prompt_tokens: u64,
+) -> bool {
+    prepared_history_tokens
+        > fitted_compaction_history_budget(context_window, tool_tokens, summary_prompt_tokens)
+}
+
+fn initial_compaction_input_stage(
+    verbatim_input_enabled: bool,
+    auto_trigger: bool,
+    capabilities: xai_grok_sampling_types::ProviderCapabilities,
+    prepared_history_tokens: u64,
+    context_window: u64,
+    tool_tokens: u64,
+    summary_prompt_tokens: u64,
+) -> CompactionInputStage {
+    if !verbatim_input_enabled {
+        return CompactionInputStage::Lossy;
+    }
+    if auto_trigger
+        && capabilities.enforces_auto_compact_safety()
+        && codex_auto_compaction_needs_prefit(
+            prepared_history_tokens,
+            context_window,
+            tool_tokens,
+            summary_prompt_tokens,
+        )
+    {
+        CompactionInputStage::VerbatimFitted
+    } else {
+        CompactionInputStage::Verbatim
+    }
+}
+
+/// Cached two-pass pass 2 is built from its own unfitted prefix/tail history.
+/// Until it can share the same fitting budget, bypass it when the safety
+/// policy selected a fitted first request.
+fn two_pass_allowed_for_initial_stage(two_pass_enabled: bool, stage: CompactionInputStage) -> bool {
+    two_pass_enabled && stage != CompactionInputStage::VerbatimFitted
+}
+
+#[cfg(test)]
+mod codex_prefit_tests {
+    use super::*;
+
+    #[test]
+    fn prefit_threshold_includes_tools_prompt_and_output_reserve() {
+        let context_window = 100_000;
+        let tool_tokens = 4_000;
+        let prompt_tokens = 2_000;
+        let threshold =
+            fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens);
+        assert_eq!(threshold, 61_232);
+        assert!(!codex_auto_compaction_needs_prefit(
+            threshold,
+            context_window,
+            tool_tokens,
+            prompt_tokens,
+        ));
+        assert!(codex_auto_compaction_needs_prefit(
+            threshold + 1,
+            context_window,
+            tool_tokens,
+            prompt_tokens,
+        ));
+    }
+
+    #[test]
+    fn initial_stage_selection_covers_trigger_backend_and_verbatim_policy() {
+        let context_window = 100_000;
+        let tool_tokens = 4_000;
+        let prompt_tokens = 2_000;
+        let over_budget =
+            fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens) + 1;
+        let stage = |verbatim, auto, provider_id| {
+            let capabilities = xai_grok_sampling_types::resolve_provider(
+                Some(provider_id),
+                xai_grok_sampling_types::ApiBackend::Responses,
+                "http://127.0.0.1:3210/v1",
+            )
+            .capabilities();
+            initial_compaction_input_stage(
+                verbatim,
+                auto,
+                capabilities,
+                over_budget,
+                context_window,
+                tool_tokens,
+                prompt_tokens,
+            )
+        };
+
+        assert_eq!(
+            stage(true, true, xai_grok_sampling_types::ProviderId::Codex),
+            CompactionInputStage::VerbatimFitted,
+            "automatic over-budget Codex must prefit"
+        );
+        assert_eq!(
+            stage(true, false, xai_grok_sampling_types::ProviderId::Codex),
+            CompactionInputStage::Verbatim,
+            "manual Codex keeps the normal ladder entry"
+        );
+        assert_eq!(
+            stage(
+                true,
+                true,
+                xai_grok_sampling_types::ProviderId::OpenAiCompatible,
+            ),
+            CompactionInputStage::Verbatim,
+            "automatic non-Codex keeps the normal ladder entry"
+        );
+        assert_eq!(
+            stage(false, true, xai_grok_sampling_types::ProviderId::Codex),
+            CompactionInputStage::Lossy,
+            "disabled verbatim input starts lossy"
+        );
+    }
+
+    #[test]
+    fn two_pass_enabled_cannot_bypass_over_budget_automatic_codex_prefit() {
+        let history = vec![
+            ConversationItem::system("system"),
+            ConversationItem::user("old ".repeat(20_000)),
+            ConversationItem::assistant("old answer ".repeat(20_000)),
+            ConversationItem::user("most recent useful request"),
+            ConversationItem::assistant("most recent useful work"),
+        ];
+        let history_tokens = xai_chat_state::estimate_conversation_tokens(&history);
+        let context_window = 50_000;
+        let tool_tokens = 2_000;
+        let prompt_tokens = 1_000;
+        let budget = fitted_compaction_history_budget(context_window, tool_tokens, prompt_tokens);
+        let capabilities = xai_grok_sampling_types::resolve_provider(
+            Some(xai_grok_sampling_types::ProviderId::Codex),
+            xai_grok_sampling_types::ApiBackend::Responses,
+            "http://127.0.0.1:3210/v1",
+        )
+        .capabilities();
+        let stage = initial_compaction_input_stage(
+            true,
+            true,
+            capabilities,
+            history_tokens,
+            context_window,
+            tool_tokens,
+            prompt_tokens,
+        );
+        assert_eq!(stage, CompactionInputStage::VerbatimFitted);
+        assert!(
+            !two_pass_allowed_for_initial_stage(true, stage),
+            "an enabled two-pass cache must not send its unfitted pass-2 request"
+        );
+
+        let outbound =
+            xai_chat_state::compaction_utils::fit_conversation_to_budget(history.clone(), budget);
+        assert!(
+            outbound.len() < history.len(),
+            "the selected single-pass first request must already be fitted"
+        );
+        let fitted_tokens = xai_chat_state::estimate_conversation_tokens(&outbound);
+        assert!(
+            fitted_tokens <= budget,
+            "fit is achievable for this fixture: {fitted_tokens} > {budget}"
+        );
+        assert!(
+            outbound
+                .iter()
+                .any(|item| item.text_content() == "most recent useful work")
+        );
+    }
+
+    #[test]
+    fn impossible_tiny_fit_reports_structural_minimum_above_budget() {
+        let history = vec![
+            ConversationItem::system("required system instructions"),
+            ConversationItem::assistant("required newest turn"),
+        ];
+        let budget = 0;
+        let outbound =
+            xai_chat_state::compaction_utils::fit_conversation_to_budget(history, budget);
+        let retained_tokens = xai_chat_state::estimate_conversation_tokens(&outbound);
+        assert!(
+            retained_tokens > budget,
+            "a zero budget cannot honestly be reported as fitting retained structure"
+        );
+    }
+
+    #[test]
+    fn fitted_stage_keeps_overflow_fallback_to_lossy() {
+        assert_eq!(
+            CompactionInputStage::Verbatim.after_context_overflow(),
+            Some(CompactionInputStage::VerbatimFitted)
+        );
+        assert_eq!(
+            CompactionInputStage::VerbatimFitted.after_context_overflow(),
+            Some(CompactionInputStage::Lossy)
+        );
+        assert_eq!(CompactionInputStage::Lossy.after_context_overflow(), None);
+    }
+}
+
 /// Why auto-compaction was suppressed after a deterministic failure.
 /// [`SuppressReason::as_str`] is a stable telemetry value (BQ/OTLP/dashboards key
 /// off it) — don't rename the strings.
@@ -409,6 +795,12 @@ pub(crate) enum SuppressReason {
     Schema,
     Other,
 }
+
+/// Delay after a transient automatic-compaction lifecycle exhausts its own
+/// retry budget. New turns may still be processed, but they cannot immediately
+/// launch the same expensive network lifecycle again.
+const AUTO_COMPACT_FAILURE_COOLDOWN_MS: u64 = 60_000;
+
 impl SuppressReason {
     fn as_str(self) -> &'static str {
         match self {
@@ -474,6 +866,74 @@ fn project_preserved_reseed_tokens(
     ((preserved_estimate as f64 * ratio).round() as u64).min(tokens_before)
 }
 impl SessionActor {
+    /// Only explicitly bounded child tasks must converge within one automatic
+    /// compaction cycle. Nesting depth identifies a child but does not define
+    /// its context-recovery lifecycle.
+    pub(crate) fn is_bounded_subagent_task(&self) -> bool {
+        self.tool_context.subagent_depth > 0
+            && self.tool_context.subagent_compaction_policy
+                == xai_grok_tools::implementations::grok_build::task::types::SubagentCompactionPolicy::FinalizeAfterOneCompaction
+    }
+
+    /// Reset the bounded-task circuit breaker at the start of a genuinely new prompt turn.
+    pub(crate) fn reset_bounded_auto_compaction_for_turn(&self) {
+        self.compaction
+            .bounded_auto_compact_state
+            .store(BOUNDED_COMPACT_NONE, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// After the first successful automatic compaction, the next model call is
+    /// synthesis-only: no further exploration tools are exposed.
+    pub(crate) fn bounded_subagent_must_finalize(&self) -> bool {
+        self.is_bounded_subagent_task()
+            && self
+                .compaction
+                .bounded_auto_compact_state
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == BOUNDED_COMPACT_FINALIZING
+    }
+
+    fn claim_bounded_auto_compaction(&self) -> Result<bool, acp::Error> {
+        if !self.is_bounded_subagent_task() {
+            return Ok(false);
+        }
+        self.compaction
+            .bounded_auto_compact_state
+            .compare_exchange(
+                BOUNDED_COMPACT_NONE,
+                BOUNDED_COMPACT_IN_FLIGHT,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .map(|_| true)
+            .map_err(|state| {
+                let prior = match state {
+                    BOUNDED_COMPACT_IN_FLIGHT => "an automatic compaction is already in flight",
+                    BOUNDED_COMPACT_FINALIZING => {
+                        "one automatic compaction already succeeded and finalization did not converge"
+                    }
+                    BOUNDED_COMPACT_FAILED => "the first automatic compaction failed",
+                    _ => "the automatic compaction state is invalid",
+                };
+                acp::Error::internal_error().data(format!(
+                    "bounded subagent compaction cycle limit reached: {prior}; stopping instead of starting another compaction"
+                ))
+            })
+    }
+
+    fn finish_bounded_auto_compaction(&self, success: bool) {
+        if self.is_bounded_subagent_task() {
+            self.compaction.bounded_auto_compact_state.store(
+                if success {
+                    BOUNDED_COMPACT_FINALIZING
+                } else {
+                    BOUNDED_COMPACT_FAILED
+                },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Path to the raw `updates.jsonl` transcript if it exists, else `None`.
     /// `pub(crate)` so the `Transcript`-mode dispatch in `compaction_segments`
     /// and transcript-location pointers can both reuse it.
@@ -565,7 +1025,11 @@ impl SessionActor {
         user_context: Option<String>,
     ) -> Result<(), acp::Error> {
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
+        let strategy_override = configured_codex_compaction_strategy();
         self.record_compaction_variant();
+        // Manual compaction runs between prompt turns and therefore receives
+        // its own routing scope instead of replaying the previous turn's state.
+        self.chat_state_handle.begin_turn_routing_scope();
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", total_tokens as i64);
         let sampling_config = self.chat_state_handle.get_sampling_config().await;
@@ -580,6 +1044,7 @@ impl SessionActor {
                 user_context,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Manual,
+                strategy_override.as_override(),
             )
             .await
         {
@@ -615,12 +1080,26 @@ impl SessionActor {
     /// Suppress AUTO compaction after a deterministic failure. Scope depends on
     /// the reason (see [`SuppressReason::suppress_state`]): size/schema sticky,
     /// credit until 200, auth until credentials recover, other clears next turn.
-    /// Telemetry + one notification per transition; manual `/compact` exempt.
+    /// Manual `/compact` is exempt.
     async fn suppress_auto_compaction(
         &self,
         reason: SuppressReason,
         estimated_tokens: u64,
         context_window: u64,
+    ) {
+        self.suppress_auto_compaction_with_error(reason, estimated_tokens, context_window, None)
+            .await;
+    }
+
+    /// Production suppression path. Adds the original provider/client failure
+    /// to the reason-specific guidance so `AutoCompactFailed.error` is useful
+    /// without emitting a duplicate notification from the outer lifecycle.
+    async fn suppress_auto_compaction_with_error(
+        &self,
+        reason: SuppressReason,
+        estimated_tokens: u64,
+        context_window: u64,
+        error_detail: Option<&str>,
     ) {
         let new_state = reason.suppress_state();
         if self
@@ -647,7 +1126,7 @@ impl SessionActor {
                     context_window,
                 },
             );
-            let message = match reason {
+            let guidance = match reason {
                 SuppressReason::CreditBlock => {
                     "out of credits or over your spending limit. Add credits and retry."
                 }
@@ -657,13 +1136,18 @@ impl SessionActor {
                 SuppressReason::Size => "this conversation is too large to compact.",
                 SuppressReason::Schema => "this conversation can't be summarized.",
                 SuppressReason::Other => {
-                    "it'll retry on the next turn, or start a new session using /new."
+                    "automatic retry is paused; use /compact manually or start a new session using /new."
                 }
             };
-            self.send_xai_notification(
-                crate::extensions::notification::SessionUpdate::AutoCompactFailed {
-                    error: message.to_string(),
+            let error = error_detail.map_or_else(
+                || guidance.to_string(),
+                |detail| {
+                    let detail = detail.chars().take(500).collect::<String>();
+                    format!("{guidance} Provider error: {detail}")
                 },
+            );
+            self.send_xai_notification(
+                crate::extensions::notification::SessionUpdate::AutoCompactFailed { error },
             )
             .await;
         }
@@ -683,11 +1167,95 @@ impl SessionActor {
             SuppressReason::Size
         } else if m.contains("status 401") || m.contains("unauthorized") {
             SuppressReason::Auth
-        } else if m.contains("invalid_request_error") {
+        } else if m.contains("invalid_request_error")
+            || m.contains("native compact response invalid")
+            || m.contains("cannot be replayed exactly")
+            || m.contains("serialization error")
+        {
             SuppressReason::Schema
         } else {
             SuppressReason::Other
         }
+    }
+
+    fn current_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX - 1)) as u64
+    }
+
+    fn clear_auto_compact_retry_gate(&self) {
+        self.compaction.auto_compact_retry_not_before_ms.store(
+            AUTO_COMPACT_RETRY_READY,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn auto_compact_failure_disposition(error: &acp::Error) -> AutoCompactFailureDisposition {
+        let reason = Self::classify_suppress_reason(&Self::acp_error_message(error));
+        if reason.suppress_state() == SUPPRESS_STICKY {
+            AutoCompactFailureDisposition::RetryAfterReset
+        } else {
+            AutoCompactFailureDisposition::Cooldown
+        }
+    }
+
+    /// Record a terminal automatic-compaction failure after its internal retry
+    /// budget is exhausted. The disposition belongs to the current lifecycle;
+    /// persistent suppression may describe an earlier successful soft overshoot.
+    fn record_auto_compact_retry_gate(&self, disposition: AutoCompactFailureDisposition) {
+        let retry_not_before_ms = match disposition {
+            AutoCompactFailureDisposition::RetryAfterReset => AUTO_COMPACT_RETRY_AFTER_RESET,
+            AutoCompactFailureDisposition::Cooldown => {
+                Self::current_epoch_ms().saturating_add(AUTO_COMPACT_FAILURE_COOLDOWN_MS)
+            }
+        };
+        self.compaction
+            .auto_compact_retry_not_before_ms
+            .store(retry_not_before_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return an error when a previous automatic-compaction lifecycle has
+    /// already established that another immediate network request is unsafe or
+    /// wasteful. The Codex hard gate still calls this method and surfaces the
+    /// error, so sampling never proceeds past its provider safety limit.
+    fn auto_compact_retry_gate_error(&self) -> Option<acp::Error> {
+        let retry_not_before_ms = self
+            .compaction
+            .auto_compact_retry_not_before_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if retry_not_before_ms == AUTO_COMPACT_RETRY_READY {
+            return None;
+        }
+        if retry_not_before_ms == AUTO_COMPACT_RETRY_AFTER_RESET {
+            return Some(acp::Error::internal_error().data(
+                "automatic compaction previously failed deterministically; change the model or context, rewind, or run /compact manually before retrying",
+            ));
+        }
+
+        let now_ms = Self::current_epoch_ms();
+        if now_ms >= retry_not_before_ms {
+            let _ = self
+                .compaction
+                .auto_compact_retry_not_before_ms
+                .compare_exchange(
+                    retry_not_before_ms,
+                    AUTO_COMPACT_RETRY_READY,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            return None;
+        }
+
+        let remaining_secs = retry_not_before_ms
+            .saturating_sub(now_ms)
+            .saturating_add(999)
+            / 1_000;
+        Some(acp::Error::internal_error().data(format!(
+            "automatic compaction is cooling down after a failed lifecycle; retry in {remaining_secs}s"
+        )))
     }
     /// ACP error payload string (plain string or `{message, ...}`).
     fn acp_error_message(err: &acp::Error) -> String {
@@ -748,12 +1316,19 @@ impl SessionActor {
     }
     /// Clear [`SUPPRESS_AUTH`] on login/token refresh (credit suppress waits for a 200).
     pub(crate) fn clear_auth_compact_suppression(&self) {
-        let _ = self.compaction.auto_compact_suppressed.compare_exchange(
-            SUPPRESS_AUTH,
-            SUPPRESS_NONE,
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        if self
+            .compaction
+            .auto_compact_suppressed
+            .compare_exchange(
+                SUPPRESS_AUTH,
+                SUPPRESS_NONE,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.clear_auto_compact_retry_gate();
+        }
     }
     /// Credit or auth suppress — a model switch cannot clear these.
     fn is_account_state_suppressed(&self) -> bool {
@@ -846,6 +1421,7 @@ impl SessionActor {
             compaction_trigger_pct = tracing::field::Empty,
             compaction_threshold_pct = tracing::field::Empty,
             compaction_outcome = tracing::field::Empty,
+            compaction_strategy = tracing::field::Empty,
             compaction_stop_reason = tracing::field::Empty,
             compaction_ttft_ms = tracing::field::Empty,
             compaction_stream_ms = tracing::field::Empty,
@@ -864,6 +1440,7 @@ impl SessionActor {
         user_context: Option<String>,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         trigger: xai_grok_telemetry::events::CompactionTrigger,
+        strategy_override: CompactionStrategyOverride<'_>,
     ) -> Result<(), acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
@@ -928,8 +1505,11 @@ impl SessionActor {
         } else {
             Vec::new()
         };
-        const SUMMARY_BUDGET_RESERVE_TOKENS: u64 = 32_768;
         let verbatim_input_enabled = self.compaction.verbatim_input;
+        // Native receives this exact source history (system is normalized into
+        // `instructions` at the sampling boundary). Local summary variants use
+        // their existing verbatim/lossy preparation below.
+        let native_source_conversation = full_conversation.clone();
         let simplified_messages = if verbatim_input_enabled {
             xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                 full_conversation,
@@ -984,6 +1564,11 @@ impl SessionActor {
                 .data("Compaction failed: no system message in simplified conversation"));
         }
         let sampling_config = self.reconstruct_full_config().await;
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_config.provider_id,
+            sampling_config.api_backend.clone(),
+            &sampling_config.base_url,
+        );
         let sampling_client = self.prepare_chat_completion(false).await?;
         let backend_search_active = self.backend_search_active();
         let effective_tool_defs: Vec<xai_grok_sampling_types::ToolDefinition> = self
@@ -1007,33 +1592,136 @@ impl SessionActor {
             &sampling_config.model,
             &sampling_config.model
         );
-        let mut last_error: Option<acp::Error> = None;
-        let mut last_failure_outcome = CompactionOutcome::Failed;
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        enum InputStage {
-            Verbatim,
-            VerbatimFitted,
-            Lossy,
+        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
+        let mut strategy = select_compaction_strategy(
+            provider.capabilities(),
+            strategy_override,
+            user_context.is_some(),
+        );
+        if user_context.is_some() && strategy == CompactionStrategy::LocalSummary {
+            tracing::info!("using local summary because manual compaction supplied user context");
         }
-        impl InputStage {
-            fn as_str(self) -> &'static str {
-                match self {
-                    Self::Verbatim => "verbatim",
-                    Self::VerbatimFitted => "verbatim_fitted",
-                    Self::Lossy => "lossy",
+        let mut product: Option<CompactionProduct> = None;
+        let mut native_counters = NativeCompactionCounters::default();
+        let mut native_remote_fallback = false;
+        if strategy == CompactionStrategy::NativeCodex {
+            let turn_routing_state = self.chat_state_handle.get_turn_routing_state().await;
+            let sampling_identity =
+                sampling_client.sampling_identity_for_model(&sampling_config.model);
+            let native_outcome = run_native_compaction(
+                CodexCompactionInput {
+                    source_conversation: native_source_conversation,
+                    canonical_system_message: system_message.clone(),
+                    tools: compaction_tools.clone(),
+                    hosted_tools: compaction_hosted_tools.clone(),
+                    sampling_identity,
+                    reasoning_effort: sampling_config.reasoning_effort,
+                    session_id: self.session_info.id.to_string(),
+                    turn_routing_state,
+                    context_window,
+                    tool_tokens: compaction_tool_tokens,
+                },
+                &sampling_client,
+            )
+            .await;
+            match native_outcome {
+                NativeCompactionOutcome::Success {
+                    replacement_history,
+                    output,
+                    counters,
+                } => {
+                    native_counters = counters;
+                    product = Some(CompactionProduct::NativeCodex {
+                        replacement_history,
+                        output: CompactOutput {
+                            content: String::new(),
+                            stop_reason: Some(output.stop_reason),
+                            truncated: output.truncated,
+                            ttft_ms: output.ttft_ms,
+                            stream_ms: output.stream_ms,
+                            delta_count: output.delta_count,
+                            itl_max_ms: output.itl_max_ms,
+                        },
+                    });
+                }
+                NativeCompactionOutcome::LocalFallback { reason, counters } => {
+                    native_counters = counters;
+                    strategy = CompactionStrategy::LocalSummary;
+                    native_remote_fallback =
+                        reason != NativeCompactionFallbackReason::StructuralMinimumTooLarge;
+                }
+                NativeCompactionOutcome::HardFailure {
+                    source,
+                    counters,
+                    estimated_input_tokens,
+                } => {
+                    let suppress_auto = source.suppresses_auto_compaction();
+                    let message = source.message();
+                    let span = tracing::Span::current();
+                    span.record(
+                        "compaction_strategy",
+                        CompactionStrategy::NativeCodex.as_str(),
+                    );
+                    span.record("compaction_attempts", counters.attempts as i64);
+                    span.record(
+                        "compaction_transient_rejections",
+                        counters.transient_rejections as i64,
+                    );
+                    span.record("compaction_outcome", CompactionOutcome::Failed.as_str());
+                    if auto_trigger && suppress_auto {
+                        self.suppress_auto_compaction_with_error(
+                            Self::classify_suppress_reason(&message),
+                            estimated_input_tokens,
+                            context_window,
+                            Some(&message),
+                        )
+                        .await;
+                    }
+                    return Err(acp::Error::internal_error().data(message));
                 }
             }
         }
-        let mut input_stage = if verbatim_input_enabled {
-            InputStage::Verbatim
-        } else {
-            InputStage::Lossy
-        };
+        tracing::Span::current().record(
+            "compaction_strategy",
+            if native_remote_fallback {
+                "local_summary_fallback"
+            } else {
+                strategy.as_str()
+            },
+        );
+        let mut last_error: Option<acp::Error> = None;
+        let mut last_failure_outcome = CompactionOutcome::Failed;
         let use_short_prompt = false;
         let started_at = chrono::Utc::now().to_rfc3339();
         let estimated_input_tokens =
             xai_chat_state::estimate_conversation_tokens(&simplified_messages);
-        let auto_trigger = matches!(trigger, xai_grok_telemetry::events::CompactionTrigger::Auto);
+        let summary_prompt_tokens =
+            xai_chat_state::estimate_conversation_tokens(&[ConversationItem::user(
+                build_compaction_prompt(user_context.as_deref(), use_short_prompt),
+            )]);
+        let fitted_history_budget = fitted_compaction_history_budget(
+            context_window,
+            compaction_tool_tokens,
+            summary_prompt_tokens,
+        );
+        let mut input_stage = if strategy.uses_local_summary_pipeline() {
+            initial_compaction_input_stage(
+                verbatim_input_enabled,
+                auto_trigger,
+                provider.capabilities(),
+                estimated_input_tokens,
+                context_window,
+                compaction_tool_tokens,
+                summary_prompt_tokens,
+            )
+        } else {
+            // Native compaction has already completed above. Its request used
+            // the exact source transcript and never enters the local
+            // verbatim-fit-lossy ladder.
+            CompactionInputStage::Verbatim
+        };
+        let prefit_first_request = strategy.uses_local_summary_pipeline()
+            && input_stage == CompactionInputStage::VerbatimFitted;
         let wall_clock_budget_secs = self
             .agent
             .borrow()
@@ -1067,149 +1755,215 @@ impl SessionActor {
             retry_delay_secs,
             sampling_timeout_secs: 0,
         };
-        let mut request_turns = simplified_messages.clone();
+        let mut request_turns = if prefit_first_request {
+            let fitted = xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                simplified_messages.clone(),
+                fitted_history_budget,
+            );
+            let fitted_tokens = xai_chat_state::estimate_conversation_tokens(&fitted);
+            let fits_budget = fitted_tokens <= fitted_history_budget;
+            if !fits_budget {
+                tracing::warn!(
+                    session_id = %self.session_info.id.0,
+                    fitted_tokens,
+                    fitted_history_budget,
+                    "Automatic Codex compaction retained a structural minimum larger than the calculated history budget"
+                );
+            }
+            tracing::info!(
+                session_id = %self.session_info.id.0,
+                original_items = simplified_messages.len(),
+                fitted_items = fitted.len(),
+                estimated_input_tokens,
+                fitted_tokens,
+                fitted_history_budget,
+                fits_budget,
+                context_window,
+                summary_reserve_tokens = SUMMARY_BUDGET_RESERVE_TOKENS,
+                summary_prompt_tokens,
+                compaction_tool_tokens,
+                "Pre-fitting first automatic Codex compaction request"
+            );
+            fitted
+        } else {
+            simplified_messages.clone()
+        };
         let mut input_overflow_rejections: u32 = 0;
-        let two_pass_output = self
-            .try_two_pass_pass2_apply(user_context.as_deref(), summary_strips_reasoning)
-            .await;
-        let mut compact_summary: Option<String> =
-            two_pass_output.as_ref().map(|o| o.content.clone());
-        while compact_summary.is_none() {
-            match xai_grok_compaction::sample_full_replace_summary(
-                &sampler,
-                &request_turns,
-                user_context.as_deref(),
-                &fr_config,
-                &observer,
-            )
-            .await
-            {
-                Ok(summary) => {
-                    compact_summary = Some(summary.summary);
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
-                    last_error = Some(
-                        acp::Error::internal_error().data("compact failed: nothing to compact"),
-                    );
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::EmptyResponse) => {
-                    last_failure_outcome = if observer.degenerate_seen() {
-                        CompactionOutcome::Degenerate
-                    } else {
-                        CompactionOutcome::Transient
-                    };
-                    last_error = Some(acp::Error::internal_error().data(
-                        observer.last_error_message().unwrap_or_else(|| {
-                            "compact failed: model returned empty response".to_string()
-                        }),
-                    ));
-                    break;
-                }
-                Err(xai_grok_compaction::FullReplaceError::Sampler {
-                    message,
-                    deterministic,
-                    context_overflow,
-                }) => {
-                    if cancel.is_cancelled()
-                        || message.contains(
-                            crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
-                        )
+        let two_pass_enabled = self.two_pass_active();
+        let two_pass_output = if strategy.uses_local_summary_pipeline()
+            && two_pass_allowed_for_initial_stage(two_pass_enabled, input_stage)
+        {
+            self.try_two_pass_pass2_apply(user_context.as_deref(), summary_strips_reasoning)
+                .await
+        } else {
+            if two_pass_enabled {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    strategy = strategy.as_str(),
+                    input_stage = input_stage.as_str(),
+                    "Bypassing two-pass apply for native or pre-fitted compaction"
+                );
+            }
+            None
+        };
+        let mut used_two_pass = false;
+        if product.is_none() {
+            if let Some(output) = two_pass_output {
+                used_two_pass = true;
+                product = Some(CompactionProduct::LocalSummary {
+                    summary: output.content.clone(),
+                    output,
+                });
+            } else {
+                while product.is_none() {
+                    match xai_grok_compaction::sample_full_replace_summary(
+                        &sampler,
+                        &request_turns,
+                        user_context.as_deref(),
+                        &fr_config,
+                        &observer,
+                    )
+                    .await
                     {
-                        return self.emit_compact_cancelled(auto_trigger).await;
-                    }
-                    if context_overflow {
-                        let next_stage = match input_stage {
-                            InputStage::Verbatim => Some(InputStage::VerbatimFitted),
-                            InputStage::VerbatimFitted => Some(InputStage::Lossy),
-                            InputStage::Lossy => None,
-                        };
-                        if let Some(stage) = next_stage {
-                            input_overflow_rejections += 1;
-                            xai_grok_telemetry::session_ctx::log_event(
-                                xai_grok_telemetry::events::CompactionRetryDegraded {
-                                    trigger,
-                                    reason: "input_overflow",
-                                    from_stage: Some(input_stage.as_str()),
-                                    to_stage: Some(stage.as_str()),
-                                    summary_chars: None,
-                                    attempt: observer.attempt_count(),
-                                    context_window,
-                                    compaction_id: compaction.compaction_id.clone(),
-                                },
+                        Ok(summary) => {
+                            let output = sampler.take_last_success().expect(
+                                "a successful local full-replace sample stashes its CompactOutput",
                             );
-                            tracing::warn!(
-                                session_id = %self.session_info.id.0,
-                                ?stage,
-                                error = %message,
-                                "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
+                            product = Some(CompactionProduct::LocalSummary {
+                                summary: summary.summary,
+                                output,
+                            });
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::NothingToCompact) => {
+                            last_error = Some(
+                                acp::Error::internal_error()
+                                    .data("compact failed: nothing to compact"),
                             );
-                            let conv = self.chat_state_handle.get_conversation().await;
-                            request_turns = match stage {
-                                InputStage::VerbatimFitted => {
-                                    let budget = context_window
-                                        .saturating_sub(SUMMARY_BUDGET_RESERVE_TOKENS)
-                                        .saturating_sub(compaction_tool_tokens);
-                                    let verbatim = xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::EmptyResponse) => {
+                            last_failure_outcome = if observer.degenerate_seen() {
+                                CompactionOutcome::Degenerate
+                            } else {
+                                CompactionOutcome::Transient
+                            };
+                            last_error = Some(acp::Error::internal_error().data(
+                                observer.last_error_message().unwrap_or_else(|| {
+                                    "compact failed: model returned empty response".to_string()
+                                }),
+                            ));
+                            break;
+                        }
+                        Err(xai_grok_compaction::FullReplaceError::Sampler {
+                            message,
+                            deterministic,
+                            context_overflow,
+                        }) => {
+                            if cancel.is_cancelled()
+                                || message.contains(
+                                    crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG,
+                                )
+                            {
+                                return self.emit_compact_cancelled(auto_trigger).await;
+                            }
+                            if context_overflow {
+                                let next_stage = input_stage.after_context_overflow();
+                                if let Some(stage) = next_stage {
+                                    input_overflow_rejections += 1;
+                                    xai_grok_telemetry::session_ctx::log_event(
+                                        xai_grok_telemetry::events::CompactionRetryDegraded {
+                                            trigger,
+                                            reason: "input_overflow",
+                                            from_stage: Some(input_stage.as_str()),
+                                            to_stage: Some(stage.as_str()),
+                                            summary_chars: None,
+                                            attempt: observer.attempt_count(),
+                                            context_window,
+                                            compaction_id: compaction.compaction_id.clone(),
+                                        },
+                                    );
+                                    tracing::warn!(
+                                        session_id = %self.session_info.id.0,
+                                        ?stage,
+                                        error = %message,
+                                        "Compaction input overflowed deterministically; stepping down the input ladder to avoid an incompactable state"
+                                    );
+                                    let conv = self.chat_state_handle.get_conversation().await;
+                                    request_turns = match stage {
+                                        CompactionInputStage::VerbatimFitted => {
+                                            let verbatim = xai_chat_state::compaction_utils::prepare_conversation_for_verbatim_summarization(
                                         conv,
                                         summary_strips_reasoning,
                                     );
-                                    xai_chat_state::compaction_utils::fit_conversation_to_budget(
-                                        verbatim, budget,
+                                            xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                                        verbatim,
+                                        fitted_history_budget,
                                     )
-                                }
-                                InputStage::Lossy => {
-                                    let lossy_budget = (context_window.saturating_mul(7) / 10)
-                                        .saturating_sub(compaction_tool_tokens);
-                                    xai_chat_state::compaction_utils::fit_conversation_to_budget(
+                                        }
+                                        CompactionInputStage::Lossy => {
+                                            let lossy_budget = (context_window.saturating_mul(7)
+                                                / 10)
+                                                .saturating_sub(compaction_tool_tokens);
+                                            xai_chat_state::compaction_utils::fit_conversation_to_budget(
                                         xai_chat_state::compaction_utils::prepare_conversation_for_summarization(
                                             conv,
                                         ),
                                         lossy_budget,
                                     )
+                                        }
+                                        CompactionInputStage::Verbatim => {
+                                            unreachable!("ladder only steps forward")
+                                        }
+                                    };
+                                    input_stage = stage;
+                                    continue;
                                 }
-                                InputStage::Verbatim => {
-                                    unreachable!("ladder only steps forward")
+                                last_failure_outcome = CompactionOutcome::Deterministic;
+                                if auto_trigger {
+                                    self.suppress_auto_compaction_with_error(
+                                        SuppressReason::Size,
+                                        estimated_input_tokens,
+                                        context_window,
+                                        Some(&message),
+                                    )
+                                    .await;
                                 }
-                            };
-                            input_stage = stage;
-                            continue;
+                                last_error = Some(acp::Error::internal_error().data(message));
+                                break;
+                            }
+                            if deterministic {
+                                last_failure_outcome = CompactionOutcome::Deterministic;
+                                if auto_trigger {
+                                    let reason = Self::classify_suppress_reason(&message);
+                                    self.suppress_auto_compaction_with_error(
+                                        reason,
+                                        estimated_input_tokens,
+                                        context_window,
+                                        Some(&message),
+                                    )
+                                    .await;
+                                }
+                                last_error = Some(acp::Error::internal_error().data(message));
+                                break;
+                            }
+                            last_failure_outcome = CompactionOutcome::Transient;
+                            last_error = Some(acp::Error::internal_error().data(message));
+                            break;
                         }
-                        last_failure_outcome = CompactionOutcome::Deterministic;
-                        if auto_trigger {
-                            self.suppress_auto_compaction(
-                                SuppressReason::Size,
-                                estimated_input_tokens,
-                                context_window,
-                            )
-                            .await;
-                        }
-                        last_error = Some(acp::Error::internal_error().data(message));
-                        break;
                     }
-                    if deterministic {
-                        last_failure_outcome = CompactionOutcome::Deterministic;
-                        if auto_trigger {
-                            let reason = Self::classify_suppress_reason(&message);
-                            self.suppress_auto_compaction(
-                                reason,
-                                estimated_input_tokens,
-                                context_window,
-                            )
-                            .await;
-                        }
-                        last_error = Some(acp::Error::internal_error().data(message));
-                        break;
-                    }
-                    last_failure_outcome = CompactionOutcome::Transient;
-                    last_error = Some(acp::Error::internal_error().data(message));
-                    break;
                 }
             }
         }
         let telemetry = observer.into_telemetry();
-        if two_pass_output.is_none()
+        // Native retries and an endpoint-unavailable probe followed by local
+        // fallback are part of the same compaction lifecycle.
+        let total_attempts = native_counters.attempts.saturating_add(telemetry.attempts);
+        let total_transient_rejections = native_counters
+            .transient_rejections
+            .saturating_add(telemetry.transient_rejections);
+        if strategy.uses_local_summary_pipeline()
+            && !used_two_pass
             && let Some(request_chat_history) = sampler.take_last_attempted_items()
         {
             self.persist_compaction_request_artifact(
@@ -1219,8 +1973,9 @@ impl SessionActor {
                 use_short_prompt,
                 &sampling_config.model,
                 trigger,
-                compact_summary
-                    .as_deref()
+                product
+                    .as_ref()
+                    .and_then(CompactionProduct::local_summary)
                     .or(telemetry.last_rejected_summary.as_deref()),
                 last_error.as_ref(),
                 telemetry.attempts,
@@ -1228,16 +1983,11 @@ impl SessionActor {
                 started_at,
             );
         }
-        let compact_output = match compact_summary {
-            Some(_) => match two_pass_output {
-                Some(tp) => tp,
-                None => sampler
-                    .take_last_success()
-                    .expect("a successful full-replace sample stashes its CompactOutput"),
-            },
+        let product = match product {
+            Some(product) => product,
             None => {
                 let span = tracing::Span::current();
-                span.record("compaction_attempts", telemetry.attempts as i64);
+                span.record("compaction_attempts", total_attempts as i64);
                 span.record(
                     "compaction_degenerate_rejections",
                     telemetry.degenerate_rejections as i64,
@@ -1252,7 +2002,7 @@ impl SessionActor {
                 );
                 span.record(
                     "compaction_transient_rejections",
-                    telemetry.transient_rejections as i64,
+                    total_transient_rejections as i64,
                 );
                 span.record("compaction_outcome", last_failure_outcome.as_str());
                 return Err(last_error.unwrap_or_else(|| {
@@ -1260,7 +2010,7 @@ impl SessionActor {
                 }));
             }
         };
-        let generate_session_compact = compact_output.content.clone();
+        let (replacement, compact_output) = product.into_parts();
         let user_message_prefix = self.build_user_message_prefix().await;
         let conversation = self.chat_state_handle.get_conversation().await;
         let (discovered_agents_md, all_skills_for_compaction, _agent_edited_paths, state_context) =
@@ -1553,59 +2303,75 @@ impl SessionActor {
                 );
             }
         }
+        if cancel.is_cancelled() {
+            return self.emit_compact_cancelled(auto_trigger).await;
+        }
         let agents_md_reminder = self.agent.borrow().agents_md_user_reminder();
         let compaction_context = state_context.for_compaction();
         let compaction_state_context: &CompactionStateContext = &compaction_context;
+        if let CompactionReplacement::LocalSummary(summary) = &replacement {
+            self.persist_compaction_segment(&segment_messages, summary);
+        }
         let transcript_hint = self.transcript_hint();
         let summary_count = self
             .compaction
             .count
             .load(std::sync::atomic::Ordering::Relaxed);
-        let raw_compacted = build_compacted_history(CompactedHistoryInput {
-            system_message: system_message.clone(),
-            user_message_prefix: user_message_prefix.clone(),
-            agents_md_reminder: agents_md_reminder.clone(),
-            state_context: compaction_state_context,
-            compaction_summary: generate_session_compact.clone(),
-            system_reminder: system_reminder.clone(),
-            summary_before_recent: use_short_prompt,
-            transcript_hint: transcript_hint.clone(),
-            summary_count,
-        });
-        let sanitize_result = sanitize_compacted_history(raw_compacted);
-        let compacted_history = if sanitize_result.stripped_tool_call_ids.is_empty() {
-            sanitize_result.items
-        } else {
-            tracing::warn!(
-                session_id = %self.session_info.id,
-                stripped_count = sanitize_result.stripped_tool_call_ids.len(),
-                stripped_ids = ?sanitize_result.stripped_tool_call_ids,
-                "compaction: stripped orphaned ToolResults from compacted history"
-            );
-            sanitize_result.items
-        };
-        let remaining_violations = validate_compacted_history(&compacted_history);
-        let compacted_history = if remaining_violations.is_empty() {
-            compacted_history
-        } else {
-            tracing::error!(
-                session_id = %self.session_info.id,
-                violation_count = remaining_violations.len(),
-                violation_ids = ?remaining_violations,
-                "compaction: sanitized history still has invalid ToolResults -- \
-                 falling back to minimal compacted history (no recent_messages)"
-            );
-            build_compacted_history(CompactedHistoryInput {
-                system_message,
-                user_message_prefix,
-                agents_md_reminder,
-                state_context: &state_context.for_compaction(),
-                compaction_summary: generate_session_compact.clone(),
-                system_reminder,
-                summary_before_recent: use_short_prompt,
-                transcript_hint,
-                summary_count,
-            })
+        let compacted_history = match replacement {
+            CompactionReplacement::NativeCodex(replacement) => {
+                // Install provider-authored structured history verbatim (apart
+                // from the canonical System item restored by the adapter). Do
+                // not route it through local reconstruction or sanitization.
+                replacement
+            }
+            CompactionReplacement::LocalSummary(generate_session_compact) => {
+                let raw_compacted = build_compacted_history(CompactedHistoryInput {
+                    system_message: system_message.clone(),
+                    user_message_prefix: user_message_prefix.clone(),
+                    agents_md_reminder: agents_md_reminder.clone(),
+                    state_context: compaction_state_context,
+                    compaction_summary: generate_session_compact.clone(),
+                    system_reminder: system_reminder.clone(),
+                    summary_before_recent: use_short_prompt,
+                    transcript_hint: transcript_hint.clone(),
+                    summary_count,
+                });
+                let sanitize_result = sanitize_compacted_history(raw_compacted);
+                let compacted_history = if sanitize_result.stripped_tool_call_ids.is_empty() {
+                    sanitize_result.items
+                } else {
+                    tracing::warn!(
+                        session_id = %self.session_info.id,
+                        stripped_count = sanitize_result.stripped_tool_call_ids.len(),
+                        stripped_ids = ?sanitize_result.stripped_tool_call_ids,
+                        "compaction: stripped orphaned ToolResults from compacted history"
+                    );
+                    sanitize_result.items
+                };
+                let remaining_violations = validate_compacted_history(&compacted_history);
+                if remaining_violations.is_empty() {
+                    compacted_history
+                } else {
+                    tracing::error!(
+                        session_id = %self.session_info.id,
+                        violation_count = remaining_violations.len(),
+                        violation_ids = ?remaining_violations,
+                        "compaction: sanitized history still has invalid ToolResults -- \
+                         falling back to minimal compacted history (no recent_messages)"
+                    );
+                    build_compacted_history(CompactedHistoryInput {
+                        system_message,
+                        user_message_prefix,
+                        agents_md_reminder,
+                        state_context: &state_context.for_compaction(),
+                        compaction_summary: generate_session_compact,
+                        system_reminder,
+                        summary_before_recent: use_short_prompt,
+                        transcript_hint,
+                        summary_count,
+                    })
+                }
+            }
         };
         let prompt_index_at_compaction = self.chat_state_handle.get_prompt_index().await;
         let original_user_info = self
@@ -1623,22 +2389,18 @@ impl SessionActor {
                 }
                 _ => None,
             });
-        if cancel.is_cancelled() {
-            return self.emit_compact_cancelled(auto_trigger).await;
-        }
-        self.persist_compaction_segment(&segment_messages, &generate_session_compact);
-        self.chat_state_handle
-            .record_compaction_at(prompt_index_at_compaction);
-        self.persist_compaction_checkpoint(
-            &compacted_history,
-            prompt_index_at_compaction,
-            auto_continue,
-            original_user_info,
-        );
-        let prefix_len = if self
-            .compaction
-            .prefix_released
-            .load(std::sync::atomic::Ordering::Relaxed)
+        let commit_kind = match strategy {
+            CompactionStrategy::NativeCodex => CompactionCommitKind::NativeCodex,
+            CompactionStrategy::LocalSummary => CompactionCommitKind::LocalSummary,
+        };
+        // Resolve the exact final replacement before the durable transaction so
+        // checkpoint, cache, lost-ack verify, and live install share one history.
+        // Native Codex never preserves an inherited fork prefix.
+        let prefix_len = if strategy == CompactionStrategy::NativeCodex
+            || self
+                .compaction
+                .prefix_released
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             0
         } else {
@@ -1655,34 +2417,53 @@ impl SessionActor {
             )
             .await
         };
+        if cancel.is_cancelled() {
+            return self.emit_compact_cancelled(auto_trigger).await;
+        }
+        self.persist_compaction_install(
+            &compacted_history,
+            prompt_index_at_compaction,
+            auto_continue.clone(),
+            original_user_info.clone(),
+            commit_kind,
+        )
+        .await?;
         let new_len = compacted_history.len();
         self.chat_state_handle
-            .replace_conversation_for_compaction(compacted_history);
-        if self.startup_hints.inherited_prefix_len.is_some() {
-            let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
-            if xai_token_estimation::exceeds_threshold(
+            .install_persisted_compaction(compacted_history)
+            .await
+            .ok_or_else(|| {
+                self.compaction.reconciliation_required.store(
+                    true,
+                    std::sync::atomic::Ordering::Release,
+                );
+                acp::Error::internal_error().data(
+                    "compaction was persisted but could not be installed in live chat state; reload required",
+                )
+            })?;
+        self.chat_state_handle
+            .record_compaction_at(prompt_index_at_compaction);
+        let post_replace_tokens = self.chat_state_handle.get_total_tokens().await;
+        if xai_token_estimation::exceeds_threshold(
+            post_replace_tokens,
+            context_window,
+            self.compaction.threshold_percent.get(),
+        ) {
+            self.compaction
+                .auto_compact_suppressed
+                .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                session_id = %self.session_info.id.0,
                 post_replace_tokens,
                 context_window,
-                self.compaction.threshold_percent.get(),
-            ) {
-                self.compaction
-                    .auto_compact_suppressed
-                    .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(
-                    session_id = %self.session_info.id.0,
-                    post_replace_tokens,
-                    context_window,
-                    "compaction: released history still over threshold; suppressing AUTO to avoid a re-loop"
-                );
-            } else {
-                self.compaction
-                    .auto_compact_suppressed
-                    .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
-            }
+                inherited_prefix = self.startup_hints.inherited_prefix_len.is_some(),
+                "compaction: replacement history still over threshold; suppressing AUTO to avoid an immediate re-loop"
+            );
         } else {
             self.compaction
                 .auto_compact_suppressed
                 .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
+            self.clear_auto_compact_retry_gate();
         }
         self.last_idle_flush_conversation_len
             .store(new_len, std::sync::atomic::Ordering::Relaxed);
@@ -1728,7 +2509,7 @@ impl SessionActor {
                 "compaction_summary_chars",
                 compact_output.content.chars().count() as i64,
             );
-            span.record("compaction_attempts", telemetry.attempts as i64);
+            span.record("compaction_attempts", total_attempts as i64);
             span.record(
                 "compaction_degenerate_rejections",
                 telemetry.degenerate_rejections as i64,
@@ -1743,7 +2524,7 @@ impl SessionActor {
             );
             span.record(
                 "compaction_transient_rejections",
-                telemetry.transient_rejections as i64,
+                total_transient_rejections as i64,
             );
             let stop_reason = compact_output.stop_reason.as_deref().unwrap_or("stop");
             span.record("compaction_stop_reason", stop_reason);
@@ -1785,11 +2566,70 @@ impl SessionActor {
                 tokens_used: total_tokens,
                 context_window: cw,
                 percentage,
+                kind: AutoCompactTriggerKind::SoftThreshold,
             })
         } else {
             None
         }
     }
+
+    /// True when `total_tokens` is at/above Codex's non-suppressible safety limit.
+    async fn codex_safety_limit_exceeded(&self, total_tokens: u64) -> bool {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return false;
+        };
+        let configured_limit = self
+            .compaction_at_tokens
+            .get()
+            .and_then(|limit| limit.resolve(cfg.context_window.get(), 90));
+        let safety = xai_grok_sampling_types::resolve_provider(
+            cfg.provider_id,
+            cfg.api_backend.clone(),
+            &cfg.base_url,
+        )
+        .capabilities()
+        .auto_compact_safety();
+        crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+            safety,
+            cfg.context_window,
+            configured_limit,
+        )
+        .is_some_and(|limit| total_tokens >= limit.get())
+    }
+
+    /// Post-install headroom check keyed to the trigger that fired.
+    ///
+    /// - Codex safety compact: only the Codex provider budget must clear.
+    ///   Soft threshold may still be over; sticky suppress already covers that.
+    /// - Soft / forced / preflight: soft threshold must clear, and on Codex
+    ///   backends the provider safety limit must clear too (otherwise the next
+    ///   loop iteration would immediately re-enter via the Codex gate).
+    async fn auto_compaction_would_immediately_retrigger(
+        &self,
+        total_tokens: u64,
+        kind: AutoCompactTriggerKind,
+    ) -> bool {
+        let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return false;
+        };
+        match kind {
+            AutoCompactTriggerKind::CodexSafety => {
+                self.codex_safety_limit_exceeded(total_tokens).await
+            }
+            AutoCompactTriggerKind::SoftThreshold
+            | AutoCompactTriggerKind::Forced
+            | AutoCompactTriggerKind::PreflightOverflow => {
+                if self
+                    .should_auto_compact(total_tokens, cfg.context_window)
+                    .is_some()
+                {
+                    return true;
+                }
+                self.codex_safety_limit_exceeded(total_tokens).await
+            }
+        }
+    }
+
     /// Returns true if the error response indicates tokens exceed the
     /// model's context window. Inspects only the model-metadata
     /// portion of the [`SamplingErrorInfo`] (the `context_window`
@@ -1801,6 +2641,8 @@ impl SessionActor {
         &self,
         err: &xai_grok_sampler::SamplingErrorInfo,
     ) -> bool {
+        // Hard recovery remains active during bounded FINALIZING so a second
+        // cycle hits claim_bounded and fail-closes instead of sampling oversize.
         if self
             .compaction
             .auto_compact_suppressed
@@ -1821,10 +2663,65 @@ impl SessionActor {
         let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
         estimated_total > context_window
     }
+    /// Non-suppressible Codex provider safety gate. Unlike the configurable
+    /// soft threshold, this remains active for budgeted tasks and after a
+    /// previous compaction failure, so a tool loop cannot keep sampling past
+    /// Codex's effective input budget.
+    pub(crate) async fn check_codex_auto_compact_needed(&self) -> Option<AutoCompactTriggerInfo> {
+        // Reminder-token reserve already prevents a finalize-reminder-only re-arm.
+        // Keep this hard provider gate live during FINALIZING so post-compact
+        // refill hits claim_bounded and fail-closes before another model call.
+        let sampling_cfg = self.chat_state_handle.get_sampling_config().await?;
+        let provider = xai_grok_sampling_types::resolve_provider(
+            sampling_cfg.provider_id,
+            sampling_cfg.api_backend.clone(),
+            &sampling_cfg.base_url,
+        );
+        if !provider.capabilities().enforces_auto_compact_safety() {
+            return None;
+        }
+        let context_window = sampling_cfg.context_window;
+        let configured_limit = self
+            .compaction_at_tokens
+            .get()
+            .and_then(|limit| limit.resolve(context_window.get(), 90));
+        let limit = crate::session::compaction_config::resolve_codex_auto_compact_token_limit(
+            provider.capabilities().auto_compact_safety(),
+            context_window,
+            configured_limit,
+        )?
+        .get();
+        let estimated_total = self.chat_state_handle.get_estimated_total_tokens().await;
+        if estimated_total < limit {
+            return None;
+        }
+        let context_window = context_window.get();
+        let percentage = xai_token_estimation::usage_percentage_u8(estimated_total, context_window);
+        tracing::warn!(
+            model = %sampling_cfg.model,
+            estimated_total,
+            codex_auto_compact_token_limit = limit,
+            context_window,
+            "Codex auto-compaction safety limit reached"
+        );
+        Some(AutoCompactTriggerInfo {
+            tokens_used: estimated_total,
+            context_window,
+            percentage,
+            kind: AutoCompactTriggerKind::CodexSafety,
+        })
+    }
+
     /// Pre-sampling compaction check. Uses `get_estimated_total_tokens()`
     /// (exact prior count + byte-estimate of items since last response) so
     /// tool results are accounted for. Returns `None` when `is_flushing`.
     pub(crate) async fn check_auto_compact_needed(&self) -> Option<AutoCompactTriggerInfo> {
+        // Soft threshold stays quiet during bounded FINALIZING; hard gates
+        // (Codex safety / preflight / on-error) remain active so refill cannot
+        // sample past a hard budget.
+        if self.bounded_subagent_must_finalize() {
+            return None;
+        }
         if self
             .memory
             .is_flushing
@@ -1870,6 +2767,7 @@ impl SessionActor {
                 tokens_used: estimated_total,
                 context_window: cw,
                 percentage,
+                kind: AutoCompactTriggerKind::Forced,
             });
         }
         if let Some(trigger_info) = self.should_auto_compact(estimated_total, context_window) {
@@ -1887,6 +2785,7 @@ impl SessionActor {
     /// Returns `Some` when tool call outputs have pushed the estimated token
     /// count past the context window, indicating pre-emptive compaction is needed.
     pub(crate) async fn check_preflight_overflow(&self) -> Option<AutoCompactTriggerInfo> {
+        // Hard context-window gate stays live during FINALIZING (unlike soft).
         if self
             .compaction
             .auto_compact_suppressed
@@ -1915,10 +2814,14 @@ impl SessionActor {
             tokens_used: estimated_total,
             context_window: cw,
             percentage,
+            kind: AutoCompactTriggerKind::PreflightOverflow,
         })
     }
-    /// On model change: clear sticky/other suppress and compact if the window shrank.
-    /// Leaves credit/auth suppress (a switch can't fix those) and short-circuits.
+    /// On a model or context-window change: clear sticky/other suppress and
+    /// compact if the window shrank. Model slug plus context window form the
+    /// transition identity because remote metadata can resize the same model.
+    /// Leaves credit/auth suppress (a model/context change can't fix those) and
+    /// short-circuits.
     /// Auth compact failures abort the turn (same as pre-sampling/preflight).
     pub(crate) async fn maybe_compact_on_model_switch(self: &Arc<Self>) -> Result<(), acp::Error> {
         self.refresh_token_if_expired().await;
@@ -1928,7 +2831,8 @@ impl SessionActor {
         let Some(cfg) = self.chat_state_handle.get_sampling_config().await else {
             return Ok(());
         };
-        if cfg.model == prev.model_slug {
+        let context_window = cfg.context_window.get();
+        if cfg.model == prev.model_slug && context_window == prev.context_window {
             return Ok(());
         }
         if self.is_account_state_suppressed() {
@@ -1937,7 +2841,8 @@ impl SessionActor {
         self.compaction
             .auto_compact_suppressed
             .store(SUPPRESS_NONE, std::sync::atomic::Ordering::Relaxed);
-        if prev.context_window <= cfg.context_window.get() {
+        self.clear_auto_compact_retry_gate();
+        if prev.context_window <= context_window {
             return Ok(());
         }
         let total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
@@ -1945,22 +2850,26 @@ impl SessionActor {
             return Ok(());
         };
         tracing::info!(
-            "Proactive model-switch compact: {} ({}) -> {} ({}), {}% full",
-            prev.model_slug,
-            prev.context_window,
-            cfg.model,
-            cfg.context_window.get(),
-            trigger_info.percentage,
+            previous_model = %prev.model_slug,
+            previous_context_window = prev.context_window,
+            model = %cfg.model,
+            context_window,
+            percentage = trigger_info.percentage,
+            "Proactive model/context-change compact after context-window shrink",
         );
         if let Err(e) = self.run_compact_only(trigger_info).await {
-            tracing::error!(error = %e, "Model-switch compaction failed");
+            tracing::error!(error = %e, "Model/context-change compaction failed");
             if Self::is_auth_compact_error(&e) {
                 return Err(self.surface_compact_auth_failure(e).await);
+            }
+            if self.is_bounded_subagent_task() {
+                return Err(e);
             }
         }
         Ok(())
     }
-    /// Record the current model for model-switch detection on the next turn.
+    /// Record the current model and context budget for transition detection on
+    /// the next turn.
     pub(crate) async fn record_turn_model(&self) {
         if let Some(cfg) = self.chat_state_handle.get_sampling_config().await {
             self.compaction.previous_model.set(Some(
@@ -1993,6 +2902,16 @@ impl SessionActor {
     ) -> Result<(), acp::Error> {
         use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let (_cancel, _cancel_scope) = self.compaction.cancel.enter();
+        let strategy_override = configured_codex_compaction_strategy();
+        if let Some(error) = self.auto_compact_retry_gate_error() {
+            tracing::warn!(
+                trigger = ?trigger_info.kind,
+                error = %error,
+                "automatic compaction retry gate prevented an immediate repeated lifecycle"
+            );
+            return Err(error);
+        }
+        let bounded_claimed = self.claim_bounded_auto_compaction()?;
         self.record_compaction_variant();
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("pre_tokens", tokens_before as i64);
@@ -2021,6 +2940,7 @@ impl SessionActor {
                 None,
                 None,
                 xai_grok_telemetry::events::CompactionTrigger::Auto,
+                strategy_override.as_override(),
             )
             .await;
         let elapsed_ms = compact_start.elapsed().as_millis() as i64;
@@ -2029,6 +2949,77 @@ impl SessionActor {
                 let tokens_after = self.chat_state_handle.get_total_tokens().await;
                 let span = tracing::Span::current();
                 span.record("post_tokens", tokens_after as i64);
+                // Bounded tasks push a finalize reminder after success; reserve
+                // those tokens so headroom reflects the history the next sample
+                // will actually see.
+                let headroom_tokens = if bounded_claimed {
+                    tokens_after.saturating_add(bounded_finalize_reminder_token_reserve())
+                } else {
+                    tokens_after
+                };
+                if self
+                    .auto_compaction_would_immediately_retrigger(headroom_tokens, trigger_info.kind)
+                    .await
+                {
+                    let hard_context_exceeded = headroom_tokens >= trigger_info.context_window;
+                    let codex_still_over = self.codex_safety_limit_exceeded(headroom_tokens).await;
+                    // Soft-only overshoot (under the hard context window, and
+                    // under any provider safety limit) is sticky-suppressed by
+                    // `run_compact_inner`. Treat that as usable installed
+                    // history so callers do not see failure after a durable
+                    // install. History still at/above the hard window — or
+                    // still over Codex safety — must fail terminally.
+                    if !hard_context_exceeded && !codex_still_over {
+                        tracing::warn!(
+                            session_id = %self.session_info.id.0,
+                            tokens_after,
+                            headroom_tokens,
+                            context_window = trigger_info.context_window,
+                            trigger = ?trigger_info.kind,
+                            "automatic compaction installed history still over soft threshold; continuing with sticky suppress"
+                        );
+                        // Reminder-token reserve can tip soft headroom even when
+                        // `run_compact_inner` saw post-install tokens under soft.
+                        self.compaction
+                            .auto_compact_suppressed
+                            .store(SUPPRESS_STICKY, std::sync::atomic::Ordering::Relaxed);
+                        if bounded_claimed {
+                            self.finish_bounded_auto_compaction(true);
+                            self.push_system_reminder(BOUNDED_SUBAGENT_FINALIZE_REMINDER);
+                        }
+                        span.record("success", true);
+                        self.send_xai_notification(XaiSessionUpdate::AutoCompactCompleted {
+                            tokens_before: Some(trigger_info.tokens_used),
+                            tokens_after,
+                            elapsed_ms: Some(elapsed_ms),
+                            summary_preview: None,
+                        })
+                        .await;
+                        return Ok(());
+                    }
+                    let message = format!(
+                        "automatic compaction installed replacement history with insufficient headroom ({tokens_after}/{} tokens); stopping to avoid an immediate compaction loop",
+                        trigger_info.context_window
+                    );
+                    span.record("success", false);
+                    span.record("error", message.as_str());
+                    if bounded_claimed {
+                        self.finish_bounded_auto_compaction(false);
+                    }
+                    self.record_auto_compact_retry_gate(
+                        AutoCompactFailureDisposition::RetryAfterReset,
+                    );
+                    self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
+                        error: message.clone(),
+                    })
+                    .await;
+                    return Err(acp::Error::internal_error().data(message));
+                }
+                if bounded_claimed {
+                    self.finish_bounded_auto_compaction(true);
+                    self.push_system_reminder(BOUNDED_SUBAGENT_FINALIZE_REMINDER);
+                }
+                self.clear_auto_compact_retry_gate();
                 span.record("success", true);
                 self.send_xai_notification(XaiSessionUpdate::AutoCompactCompleted {
                     tokens_before: Some(trigger_info.tokens_used),
@@ -2040,6 +3031,9 @@ impl SessionActor {
                 Ok(())
             }
             Err(e) => {
+                if bounded_claimed {
+                    self.finish_bounded_auto_compaction(false);
+                }
                 let span = tracing::Span::current();
                 span.record("success", false);
                 span.record("error", e.to_string().as_str());
@@ -2047,6 +3041,9 @@ impl SessionActor {
                     || e.data.as_ref().and_then(|d| d.as_str()).is_some_and(|s| {
                         s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
                     });
+                if !cancelled {
+                    self.record_auto_compact_retry_gate(Self::auto_compact_failure_disposition(&e));
+                }
                 if !cancelled
                     && self
                         .compaction
@@ -2054,10 +3051,9 @@ impl SessionActor {
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == SUPPRESS_NONE
                 {
-                    self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
-                        error: String::new(),
-                    })
-                    .await;
+                    let error = Self::acp_error_message(&e);
+                    self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed { error })
+                        .await;
                 }
                 Err(e)
             }
@@ -2138,54 +3134,93 @@ impl SessionActor {
             );
         }
     }
-    /// Persist a compaction checkpoint: writes the compacted history to a separate file
-    /// and records a `CompactionCheckpoint` marker in `updates.jsonl`.
-    ///
-    /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
-    /// and an auto-continue prompt will follow.
-    fn persist_compaction_checkpoint(
+    /// Persist compaction via the shared marker→ack→install protocol used by
+    /// rewind and both local/native strategies. Live chat is not mutated here;
+    /// the caller installs only after this returns successfully.
+    async fn persist_compaction_install(
         &self,
         compacted_history: &[ConversationItem],
         prompt_index_at_compaction: usize,
         auto_continue: Option<crate::extensions::notification::AutoContinueInfo>,
         original_user_info: Option<String>,
-    ) {
+        commit_kind: CompactionCommitKind,
+    ) -> Result<(), acp::Error> {
         use crate::extensions::notification::{
-            CompactionCheckpointFile, CompactionCheckpointInfo, SessionUpdate as XaiSessionUpdate,
+            CompactionCheckpointFile, CompactionCheckpointInfo,
+            FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION, SessionNotification,
+            SessionUpdate as XaiSessionUpdate,
+        };
+        use crate::session::helpers::timeline_transaction::{
+            await_timeline_transaction, ensure_timeline_committed,
+        };
+        let op_name = match commit_kind {
+            CompactionCommitKind::NativeCodex => "native compaction",
+            CompactionCommitKind::LocalSummary => "local compaction",
         };
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
         let checkpoint_file = format!("compaction_checkpoints/{checkpoint_id}.json");
         let created_at = chrono::Utc::now().to_rfc3339();
-        let file_data = CompactionCheckpointFile {
+        let checkpoint = CompactionCheckpointFile {
             checkpoint_id: checkpoint_id.clone(),
             prompt_index_at_compaction,
             compacted_history: compacted_history.to_vec(),
-            schema_version: 1,
+            schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
             created_at: created_at.clone(),
             original_user_info,
             reread_file_paths: vec![],
         };
-        if self
-            .notifications
+        let marker = crate::session::storage::SessionUpdate::Xai(Box::new(SessionNotification {
+            session_id: self.session_info.id.clone(),
+            update: XaiSessionUpdate::CompactionCheckpoint(Box::new(CompactionCheckpointInfo {
+                checkpoint_id,
+                prompt_index_at_compaction,
+                checkpoint_file,
+                auto_continue,
+                schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+                created_at,
+            })),
+            meta: Some(self.build_notification_meta()),
+        }));
+        let verification_checkpoint = checkpoint.clone();
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        self.notifications
             .persistence_tx
-            .send(PersistenceMsg::CompactionCheckpoint(file_data))
-            .is_err()
-        {
-            tracing::warn!("Failed to send compaction checkpoint file to persistence channel");
-        }
-        let info = CompactionCheckpointInfo {
-            checkpoint_id,
-            prompt_index_at_compaction,
-            checkpoint_file,
-            auto_continue,
-            schema_version: 1,
-            created_at,
-        };
-        self.persist_xai_update_only(XaiSessionUpdate::CompactionCheckpoint(Box::new(info)));
+            .send(PersistenceMsg::InstallCompactionAndAck {
+                checkpoint,
+                marker,
+                replacement: compacted_history.to_vec(),
+                respond_to,
+            })
+            .map_err(|_| {
+                acp::Error::internal_error().data(format!(
+                    "{op_name} persistence channel closed before install; original history remains live"
+                ))
+            })?;
+        let session_dir = crate::session::persistence::session_dir(&self.session_info);
+        let outcome = await_timeline_transaction(response, op_name, move || {
+            crate::session::helpers::replay::verify_compaction_commit(
+                &session_dir,
+                &verification_checkpoint,
+                commit_kind,
+            )
+        })
+        .await
+        .map_err(|error| {
+            if error.requires_reconciliation() {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            acp::Error::internal_error().data(error.message().to_owned())
+        })?;
+        ensure_timeline_committed(outcome, op_name, self.session_info.id.0.as_ref())
+            .map_err(|message| acp::Error::internal_error().data(message))?;
         tracing::info!(
             prompt_index_at_compaction,
-            "Persisted compaction checkpoint"
+            ?commit_kind,
+            "Persisted compaction checkpoint via durable transaction"
         );
+        Ok(())
     }
 }
 #[cfg(test)]

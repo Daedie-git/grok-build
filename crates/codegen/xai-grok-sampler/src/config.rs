@@ -9,7 +9,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
-    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ReasoningEffort,
+    ApiBackend, CompactionAtTokens, CompactionsRemaining, DoomLoopRecoveryPolicy, ProviderId,
+    ReasoningEffort,
 };
 
 use crate::attribution::SharedAttributionCallback;
@@ -54,6 +55,11 @@ pub struct SamplerConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub api_backend: ApiBackend,
+    /// Explicit logical provider identity. `None` preserves legacy URL
+    /// inference, allowing old configs to keep working while proxies can opt
+    /// into a provider protocol independently of their transport URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
     #[serde(default)]
     pub auth_scheme: AuthScheme,
     /// Extra request headers applied verbatim. The sampler never inspects
@@ -148,6 +154,7 @@ impl Default for SamplerConfig {
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider_id: None,
             auth_scheme: AuthScheme::default(),
             extra_headers: IndexMap::new(),
             extra_response_includes: Vec::new(),
@@ -192,7 +199,7 @@ pub type SharedHeaderInjector = std::sync::Arc<dyn HeaderInjector>;
 /// Retry knobs for the sampler's internal transport-error retry loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
-    /// Maximum number of retries before giving up.
+    /// Maximum number of total request attempts, including the initial request.
     pub max_retries: u32,
     /// After this many rate-limit (429) retries, escalate to the caller.
     /// Lower than `max_retries` because rate-limit waits can be long.

@@ -4219,6 +4219,51 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::FetchCodexRateLimits {
+            agent_id,
+            silent,
+            generation,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let req = acp::ExtRequest::new(
+                    "x.ai/codex/rate-limits",
+                    serde_json::value::to_raw_value(&serde_json::json!({}))
+                        .expect("serialize codex rate-limits params")
+                        .into(),
+                );
+                let response = match acp_send(req, &tx).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return TaskResult::CodexRateLimitsError {
+                            agent_id,
+                            error: sanitize_user_error(&format!("{error}")),
+                            silent,
+                            generation,
+                        };
+                    }
+                };
+                let wrapper: serde_json::Value =
+                    serde_json::from_str(response.0.get()).unwrap_or_default();
+                let result = wrapper.get("result").unwrap_or(&wrapper);
+                match serde_json::from_value::<
+                    xai_grok_shell::extensions::codex_usage::CodexRateLimits,
+                >(result.clone()) {
+                    Ok(limits) => TaskResult::CodexRateLimitsFetched {
+                        agent_id,
+                        limits,
+                        silent,
+                        generation,
+                    },
+                    Err(error) => TaskResult::CodexRateLimitsError {
+                        agent_id,
+                        error: format!("Parse error: {error}"),
+                        silent,
+                        generation,
+                    },
+                }
+            });
+        }
         Effect::RefreshGate => {
             tasks
                 .spawn(async move {

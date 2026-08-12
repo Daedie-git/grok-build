@@ -24,6 +24,8 @@ impl From<ChatRequestMessage> for ConversationItem {
                     .collect();
                 ConversationItem::User(UserItem {
                     content: parts,
+                    response_item_id: None,
+                    provider_metadata: None,
                     synthetic_reason: None,
                     ..Default::default()
                 })
@@ -46,6 +48,7 @@ impl From<ChatRequestMessage> for ConversationItem {
 
                 ConversationItem::Assistant(AssistantItem {
                     content: Arc::<str>::from(content),
+                    response_item_id: None,
                     tool_calls,
                     model_id,
                     model_fingerprint: None,
@@ -181,6 +184,12 @@ pub fn conversation_item_to_chat_message(item: ConversationItem) -> ChatRequestM
             "conversation_to_chat_messages folds Reasoning siblings; \
                  conversation_item_to_chat_message is never called with one"
         ),
+        ConversationItem::Provider(provider) => {
+            if provider.is_response_output_metadata() {
+                unreachable!("conversation_to_chat_messages filters Responses metadata sidecars")
+            }
+            panic!("opaque native Codex compaction history cannot be projected to Chat Completions")
+        }
     }
 }
 
@@ -194,6 +203,7 @@ pub fn conversation_to_chat_messages(items: Vec<ConversationItem>) -> Vec<ChatRe
 
     for item in items {
         match item {
+            ConversationItem::Provider(provider) if provider.is_response_output_metadata() => {}
             ConversationItem::Reasoning(r) => {
                 let text = reasoning_item_text(&r);
                 if !text.is_empty() {
@@ -241,6 +251,7 @@ impl From<ChatResponseMessage> for ConversationItem {
 
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(content),
+            response_item_id: None,
             tool_calls,
             model_id: None,
             model_fingerprint: None,

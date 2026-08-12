@@ -225,6 +225,7 @@ pub(crate) async fn create_test_actor_with_terminal(
         pending_inputs: VecDeque::new(),
         edit_holds: HashMap::new(),
         pending_notifications: Vec::new(),
+        consumed_completion_tombstones: VecDeque::new(),
         notifications_suppressed: false,
         rewindable: false,
         front_message_committed: false,
@@ -241,6 +242,7 @@ pub(crate) async fn create_test_actor_with_terminal(
             temperature: None,
             top_p: None,
             api_backend: Default::default(),
+            provider_id: None,
             extra_headers: Default::default(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
@@ -302,12 +304,15 @@ pub(crate) async fn create_test_actor_with_terminal(
             context_window_override: None,
             count: std::sync::atomic::AtomicU64::new(0),
             auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
+            auto_compact_retry_not_before_ms: std::sync::atomic::AtomicU64::new(0),
+            bounded_auto_compact_state: std::sync::atomic::AtomicU8::new(0),
             previous_model: std::cell::Cell::new(None),
             compaction_mode: xai_chat_state::CompactionMode::Transcript,
             verbatim_input: true,
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            reconciliation_required: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
@@ -455,7 +460,57 @@ pub(crate) async fn create_test_actor_with_terminal(
     }
     (actor, event_rx)
 }
+/// Persistence sender that acknowledges timeline transactions (rewind +
+/// compaction) as successfully committed. Required for any test that awaits
+/// `InstallRewindAndAck` / `InstallCompactionAndAck`.
 #[cfg(test)]
+pub(crate) fn successful_timeline_persistence()
+-> tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg> {
+    successful_timeline_persistence_with_messages().0
+}
+
+/// Acknowledging persistence fixture that also exposes every non-transaction
+/// message for tests that need to inspect notifications.
+#[cfg(test)]
+pub(crate) fn successful_timeline_persistence_with_messages() -> (
+    tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::session::persistence::PersistenceMsg>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                crate::session::persistence::PersistenceMsg::InstallRewindAndAck {
+                    respond_to,
+                    ..
+                }
+                | crate::session::persistence::PersistenceMsg::InstallCompactionAndAck {
+                    respond_to,
+                    ..
+                } => {
+                    let _ = respond_to.send(
+                        crate::session::persistence::TimelineTransactionOutcome::Committed {
+                            marker_bookkeeping_error: None,
+                            cache_status: crate::session::persistence::TimelineCacheStatus::Current,
+                        },
+                    );
+                }
+                message => {
+                    let _ = messages_tx.send(message);
+                }
+            }
+        }
+    });
+    (tx, messages_rx)
+}
+
+#[cfg(test)]
+pub(crate) fn successful_rewind_persistence()
+-> tokio::sync::mpsc::UnboundedSender<crate::session::persistence::PersistenceMsg> {
+    successful_timeline_persistence()
+}
+
 pub(crate) async fn create_test_actor(
     total_tokens: u64,
     context_window: u64,

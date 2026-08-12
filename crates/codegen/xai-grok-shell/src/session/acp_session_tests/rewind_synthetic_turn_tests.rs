@@ -6,10 +6,232 @@
 //! truncation that counts only non-synthetic `User` items therefore leaves
 //! the "rewound" turn in the model's context.
 
-use super::support::create_test_actor;
+use super::support::{create_test_actor, successful_rewind_persistence};
 
 use crate::sampling::ConversationItem;
 use crate::session::{RewindMode, RewindRequest};
+
+#[tokio::test(flavor = "current_thread")]
+async fn rewind_not_committed_keeps_prepared_snapshot_out_of_live_state() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+            let mut snapshot = actor.chat_state_handle.snapshot().await.unwrap();
+            snapshot.conversation = vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("user info"),
+                ConversationItem::user("prompt zero"),
+                ConversationItem::assistant("answer zero"),
+                ConversationItem::user("dead prompt"),
+                ConversationItem::assistant("dead answer"),
+            ];
+            snapshot.prompt_index = 2;
+            snapshot.prompt_texts = vec!["prompt zero".into(), "dead prompt".into()];
+            actor.chat_state_handle.restore_snapshot(snapshot.clone());
+
+            let rewind = actor.handle_rewind(RewindRequest {
+                target_prompt_index: 1,
+                force: true,
+                mode: RewindMode::ConversationOnly,
+            });
+            tokio::pin!(rewind);
+            let message = tokio::select! {
+                message = persistence_rx.recv() => message.unwrap(),
+                result = &mut rewind => panic!("rewind completed before marker outcome: {result:?}"),
+            };
+            let crate::session::persistence::PersistenceMsg::InstallRewindAndAck {
+                replacement,
+                respond_to,
+                ..
+            } = message
+            else {
+                panic!("expected rewind transaction")
+            };
+            assert_eq!(replacement.len(), 4);
+            let still_live = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(still_live.prompt_index, 2);
+            assert_eq!(still_live.conversation.len(), 6);
+            respond_to
+                .send(crate::session::persistence::TimelineTransactionOutcome::NotCommitted(
+                    std::io::Error::other("injected marker failure"),
+                ))
+                .unwrap();
+            let error = rewind.await.expect_err("NotCommitted must fail the API call");
+            assert!(error.to_string().contains("not committed"));
+            let after = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(after.prompt_index, 2);
+            assert_eq!(after.conversation.len(), 6);
+        })
+        .await;
+}
+
+/// Conversation+files rewind must not touch the working tree when the durable
+/// marker fails to commit — same fail-closed authority as chat history.
+#[tokio::test(flavor = "current_thread")]
+async fn rewind_all_not_committed_leaves_chat_and_files_untouched() {
+    use std::path::Path;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+
+            let cwd = Path::new("/tmp");
+            let edited = Path::new("/tmp/edited.rs");
+            // Live disk is the post-prompt-1 edit; rewind would restore BEFORE.
+            actor
+                .tool_context
+                .fs
+                .write_file(edited, b"AFTER_EDIT")
+                .await
+                .expect("seed live file");
+            actor
+                .file_state_tracker
+                .add_before_snapshot_for_prompt(
+                    1,
+                    edited,
+                    cwd,
+                    Some("BEFORE_EDIT".into()),
+                )
+                .await;
+
+            let mut snapshot = actor.chat_state_handle.snapshot().await.unwrap();
+            snapshot.conversation = vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("user info"),
+                ConversationItem::user("prompt zero"),
+                ConversationItem::assistant("answer zero"),
+                ConversationItem::user("prompt one edited the file"),
+                ConversationItem::assistant("done"),
+            ];
+            snapshot.prompt_index = 2;
+            snapshot.prompt_texts = vec!["prompt zero".into(), "prompt one edited the file".into()];
+            actor.chat_state_handle.restore_snapshot(snapshot);
+
+            let rewind = actor.handle_rewind(RewindRequest {
+                target_prompt_index: 1,
+                force: true,
+                mode: RewindMode::All,
+            });
+            tokio::pin!(rewind);
+            let message = tokio::select! {
+                message = persistence_rx.recv() => message.unwrap(),
+                result = &mut rewind => panic!("rewind completed before marker outcome: {result:?}"),
+            };
+            let crate::session::persistence::PersistenceMsg::InstallRewindAndAck {
+                respond_to,
+                ..
+            } = message
+            else {
+                panic!("expected rewind transaction before any file mutation")
+            };
+
+            // Marker not yet acked: live chat and disk must still be the pre-rewind world.
+            let mid = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(mid.prompt_index, 2);
+            assert_eq!(mid.conversation.len(), 6);
+            let mid_file = actor
+                .tool_context
+                .fs
+                .try_read_to_string(edited)
+                .await
+                .expect("read")
+                .expect("file present");
+            assert_eq!(mid_file, "AFTER_EDIT");
+
+            respond_to
+                .send(crate::session::persistence::TimelineTransactionOutcome::NotCommitted(
+                    std::io::Error::other("injected marker failure"),
+                ))
+                .unwrap();
+            let error = rewind
+                .await
+                .expect_err("NotCommitted All-mode rewind must fail the API call");
+            assert!(
+                error.to_string().contains("not committed"),
+                "unexpected error: {error}"
+            );
+
+            let after = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(after.prompt_index, 2, "chat must stay unrewound");
+            assert_eq!(after.conversation.len(), 6);
+            let after_file = actor
+                .tool_context
+                .fs
+                .try_read_to_string(edited)
+                .await
+                .expect("read")
+                .expect("file present");
+            assert_eq!(
+                after_file, "AFTER_EDIT",
+                "working tree must not revert when the rewind marker was NotCommitted"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn committed_rewind_installs_full_snapshot_without_losing_actor_state() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
+            let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+            let mut snapshot = actor.chat_state_handle.snapshot().await.unwrap();
+            snapshot.conversation = vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("user info"),
+                ConversationItem::user("kept"),
+                ConversationItem::assistant("kept answer"),
+                ConversationItem::user("removed"),
+                ConversationItem::assistant("removed answer"),
+            ];
+            snapshot.prompt_index = 2;
+            snapshot.prompt_texts = vec!["kept".into(), "removed".into()];
+            snapshot.total_tokens = 4_321;
+            snapshot.estimate_at_last_response = 4_000;
+            snapshot.agent_edited_paths.insert("src/lib.rs".into());
+            snapshot.credentials.api_key = Some("secret".into());
+            actor.chat_state_handle.restore_snapshot(snapshot);
+            actor.chat_state_handle.begin_turn_capture();
+
+            let response = actor
+                .handle_rewind(RewindRequest {
+                    target_prompt_index: 1,
+                    force: true,
+                    mode: RewindMode::ConversationOnly,
+                })
+                .await
+                .unwrap();
+            assert!(response.success);
+            let installed = actor.chat_state_handle.snapshot().await.unwrap();
+            assert_eq!(installed.prompt_index, 1);
+            assert_eq!(installed.conversation.len(), 4);
+            assert_eq!(installed.total_tokens, 4_321);
+            assert_eq!(installed.estimate_at_last_response, 4_000);
+            assert!(installed.agent_edited_paths.contains("src/lib.rs"));
+            assert_eq!(installed.credentials.api_key.as_deref(), Some("secret"));
+
+            actor
+                .chat_state_handle
+                .push_assistant_response(ConversationItem::assistant("after rewind"));
+            let capture = actor
+                .chat_state_handle
+                .take_turn_messages()
+                .await
+                .expect("turn capture must survive rewind install");
+            assert_eq!(
+                capture.messages.last().map(ConversationItem::text_content),
+                Some("after rewind".into())
+            );
+        })
+        .await;
+}
 
 /// Build the canonical bugged-session shape:
 ///
@@ -49,7 +271,7 @@ fn seed_conversation(mark_turn_starts: bool) -> Vec<ConversationItem> {
 
 async fn run_rewind_over_synthetic_turn(mark_turn_starts: bool) {
     let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+    let persistence_tx = successful_rewind_persistence();
     let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
     let mut snap = actor
@@ -127,7 +349,7 @@ async fn rewind_with_no_prompts_lists_no_points_and_rejects_execute() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let points = actor.get_rewind_points().await;
@@ -165,7 +387,7 @@ async fn rewind_to_start_keeps_only_preamble() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut conversation = seed_conversation(true);
@@ -230,7 +452,7 @@ async fn rewind_twice_narrows_history_each_time() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             // 5 turns: real, wake, real, wake, real.
@@ -343,7 +565,7 @@ async fn rewind_to_midpoint_with_synthetic_turns_on_both_sides() {
         .run_until(async {
             for mark_turn_starts in [false, true] {
                 let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+                let persistence_tx = successful_rewind_persistence();
                 let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
                 let user = |text: &str, idx: usize| {
@@ -428,7 +650,7 @@ async fn rewind_to_synthetic_auto_wake_turn_cuts_at_the_wake() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
             let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
 
             let mut snap = actor

@@ -270,6 +270,11 @@ pub fn build_messages_request(req: &ConversationRequest) -> crate::messages::Mes
                     });
                 }
             }
+            ConversationItem::Provider(provider) => {
+                if !provider.is_response_output_metadata() {
+                    panic!("opaque native Codex compaction history cannot be projected to Messages")
+                }
+            }
         }
     }
 
@@ -390,6 +395,7 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
 
         ConversationItem::Assistant(AssistantItem {
             content: Arc::<str>::from(content),
+            response_item_id: None,
             tool_calls,
             model_id: Some(resp.model),
             model_fingerprint: None,

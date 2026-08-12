@@ -50,10 +50,10 @@ use xai_grok_sampling_types::{SamplingError, is_retryable_api_status};
 /// no point burning a long backoff just to be rate-limited again.
 pub const RATE_LIMIT_RETRY_THRESHOLD: u32 = 2;
 
-/// Default retry budget when no env or model override is set: at most 14
-/// retries (the attempt reaching this count is fatal). With the 30s cap:
-/// retries 1-4 exponential (2+4+8+16s ≈ 30s), 5-14 flat ~30s (≈ 5 min) —
-/// ≈ 5.5 min total.
+/// Default maximum number of total request attempts when no env or model
+/// override is set. The retry actor counts the initial request in this budget.
+/// Provider/model catalogs may select a lower interactive budget explicitly;
+/// the generic default remains tolerant of longer Grok-side transients.
 pub const DEFAULT_MAX_RETRIES: u32 = 15;
 
 /// Longest single wait on the generic retry path — the exponential-backoff
@@ -512,6 +512,10 @@ mod tests {
 
     #[test]
     fn resolve_max_retries_default() {
+        assert_eq!(
+            DEFAULT_MAX_RETRIES, 15,
+            "the generic retry policy must retain Grok's transient-failure tolerance"
+        );
         assert_eq!(
             resolve_max_retries_with_env(None, None),
             DEFAULT_MAX_RETRIES

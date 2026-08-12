@@ -4599,6 +4599,7 @@ fn dashboard_action_for_id(
         | ActionId::ToggleRaw
         | ActionId::ToggleMouseCapture
         | ActionId::NextModel
+        | ActionId::CycleEffort
         | ActionId::CancelTurn
         | ActionId::ToggleYolo
         | ActionId::ToggleMultiline

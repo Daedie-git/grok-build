@@ -52,6 +52,10 @@ fn sanitize_tool_arguments(id: &str, name: &str, arguments: Arc<str>) -> Arc<str
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider_history::{
+    LegacyProviderItemRef, NativeCompactionCompatibility, ProviderItem, ResponseOutputItemMetadata,
+    UserMessageProviderMetadata,
+};
 use crate::rs;
 use crate::tool_overrides::{ToolOverrides, WebSearchOptions, XSearchOptions, drop_empty};
 use crate::types::{
@@ -65,8 +69,7 @@ use crate::types::{
 // ============================================================================
 
 /// A single item in a conversation - the unified internal representation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum ConversationItem {
     /// System instructions/prompt
     System(SystemItem),
@@ -84,6 +87,9 @@ pub enum ConversationItem {
     /// 2. Sent back to the Responses API as input items for context continuity
     /// 3. Rendered by the pager (search queries, sources, etc.)
     BackendToolCall(BackendToolCallItem),
+    /// Provider-owned durable history. The sealed envelope keeps neutral
+    /// consumers independent of provider-specific payload variants.
+    Provider(ProviderItem),
     /// A reasoning item from the Responses API, stored as a sibling of the
     /// assistant message so that:
     ///
@@ -97,6 +103,96 @@ pub enum ConversationItem {
     /// wrapping `rs::WebSearchToolCall` etc.) so no field is dropped on the
     /// way through.
     Reasoning(rs::ReasoningItem),
+}
+
+/// Stable persisted representation of a conversation item.
+///
+/// Provider-owned items remain sealed in memory, but Codex items keep their
+/// legacy top-level JSON tags for downgrade compatibility. The deserializer
+/// accepts both this encoding and the newer `type = "provider"` envelope.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConversationItemSerialize<'a> {
+    System(&'a SystemItem),
+    User(&'a UserItem),
+    Assistant(&'a AssistantItem),
+    ToolResult(&'a ToolResultItem),
+    BackendToolCall(&'a BackendToolCallItem),
+    Reasoning(&'a rs::ReasoningItem),
+    ResponseOutputMetadata(&'a ResponseOutputItemMetadata),
+    NativeCompactionMetadata(&'a NativeCompactionCompatibility),
+    Compaction(&'a rs::CompactionSummaryItemParam),
+}
+
+impl Serialize for ConversationItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let persisted = match self {
+            Self::System(item) => ConversationItemSerialize::System(item),
+            Self::User(item) => ConversationItemSerialize::User(item),
+            Self::Assistant(item) => ConversationItemSerialize::Assistant(item),
+            Self::ToolResult(item) => ConversationItemSerialize::ToolResult(item),
+            Self::BackendToolCall(item) => ConversationItemSerialize::BackendToolCall(item),
+            Self::Reasoning(item) => ConversationItemSerialize::Reasoning(item),
+            Self::Provider(provider) => match provider.legacy_persistence_projection() {
+                LegacyProviderItemRef::ResponseOutputMetadata(item) => {
+                    ConversationItemSerialize::ResponseOutputMetadata(item)
+                }
+                LegacyProviderItemRef::NativeCompactionMetadata(item) => {
+                    ConversationItemSerialize::NativeCompactionMetadata(item)
+                }
+                LegacyProviderItemRef::EncryptedCompaction(item) => {
+                    ConversationItemSerialize::Compaction(item)
+                }
+            },
+        };
+        persisted.serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConversationItemDeserialize {
+    System(SystemItem),
+    User(UserItem),
+    Assistant(AssistantItem),
+    ToolResult(ToolResultItem),
+    BackendToolCall(BackendToolCallItem),
+    Provider(ProviderItem),
+    Reasoning(rs::ReasoningItem),
+    ResponseOutputMetadata(ResponseOutputItemMetadata),
+    NativeCompactionMetadata(NativeCompactionCompatibility),
+    Compaction(rs::CompactionSummaryItemParam),
+}
+
+impl<'de> Deserialize<'de> for ConversationItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match ConversationItemDeserialize::deserialize(deserializer)? {
+                ConversationItemDeserialize::System(item) => Self::System(item),
+                ConversationItemDeserialize::User(item) => Self::User(item),
+                ConversationItemDeserialize::Assistant(item) => Self::Assistant(item),
+                ConversationItemDeserialize::ToolResult(item) => Self::ToolResult(item),
+                ConversationItemDeserialize::BackendToolCall(item) => Self::BackendToolCall(item),
+                ConversationItemDeserialize::Provider(item) => Self::Provider(item),
+                ConversationItemDeserialize::Reasoning(item) => Self::Reasoning(item),
+                ConversationItemDeserialize::ResponseOutputMetadata(item) => {
+                    Self::Provider(ProviderItem::response_output_metadata(item))
+                }
+                ConversationItemDeserialize::NativeCompactionMetadata(item) => {
+                    Self::Provider(ProviderItem::native_compaction_metadata(item))
+                }
+                ConversationItemDeserialize::Compaction(item) => {
+                    Self::Provider(ProviderItem::encrypted_compaction(item))
+                }
+            },
+        )
+    }
 }
 
 /// System message content
@@ -238,6 +334,12 @@ pub enum PriorTurnInterrupt {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserItem {
     pub content: Vec<ContentPart>,
+    /// Provider-assigned Responses item ID retained by native compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_item_id: Option<String>,
+    /// Provider-owned fields retained with a native-compacted user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<UserMessageProviderMetadata>,
     /// Set when this item was synthesized by the runtime rather than typed by
     /// a real user.  `None` for all genuine user messages.
     ///
@@ -287,6 +389,9 @@ pub struct UserItem {
 pub struct AssistantItem {
     /// Text content of the response
     pub content: Arc<str>,
+    /// Provider-assigned Responses item ID retained by native compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_item_id: Option<String>,
     /// Tool calls made by the assistant (client must execute these locally)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -587,6 +692,48 @@ impl From<ToolDefinition> for ToolSpec {
 // Conversation Request
 // ============================================================================
 
+/// Shared process-local routing state for one prompt turn.
+///
+/// Clones share the same first-value-wins scope so retries, compaction, and
+/// continuations can replay routing metadata captured from the first response.
+/// The opaque state is deliberately not serializable.
+pub struct TurnRoutingState(Arc<std::sync::OnceLock<String>>);
+
+impl TurnRoutingState {
+    pub fn fresh() -> Self {
+        Self(Arc::new(std::sync::OnceLock::new()))
+    }
+
+    pub fn capture_first(&self, value: String) -> bool {
+        self.0.set(value).is_ok()
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+}
+
+impl Clone for TurnRoutingState {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Default for TurnRoutingState {
+    fn default() -> Self {
+        Self::fresh()
+    }
+}
+
+impl std::fmt::Debug for TurnRoutingState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRoutingState")
+            .field("captured", &self.value().is_some())
+            .finish()
+    }
+}
+
 /// A complete conversation request that can be sent to either API.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRequest {
@@ -624,6 +771,8 @@ pub struct ConversationRequest {
     pub json_schema: Option<serde_json::Value>,
     /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id` for routing.
     pub prompt_cache_key: Option<String>,
+    /// Process-local routing scope for one prompt turn. Never persisted.
+    pub turn_routing_state: Option<TurnRoutingState>,
 }
 
 impl ConversationRequest {
@@ -687,7 +836,8 @@ fn strip_images_where(
             ConversationItem::System(_)
             | ConversationItem::Assistant(_)
             | ConversationItem::BackendToolCall(_)
-            | ConversationItem::Reasoning(_) => {}
+            | ConversationItem::Reasoning(_)
+            | ConversationItem::Provider(_) => {}
         }
     }
     stripped
@@ -968,6 +1118,21 @@ impl ConversationResponse {
 // ============================================================================
 
 impl ConversationItem {
+    /// Create ordinary provider response metadata.
+    pub fn response_output_metadata(metadata: ResponseOutputItemMetadata) -> Self {
+        Self::Provider(ProviderItem::response_output_metadata(metadata))
+    }
+
+    /// Create native compaction compatibility metadata.
+    pub fn native_compaction_metadata(metadata: NativeCompactionCompatibility) -> Self {
+        Self::Provider(ProviderItem::native_compaction_metadata(metadata))
+    }
+
+    /// Create an encrypted native compaction replay payload.
+    pub fn encrypted_compaction(item: rs::CompactionSummaryItemParam) -> Self {
+        Self::Provider(ProviderItem::encrypted_compaction(item))
+    }
+
     /// Create a system message
     pub fn system(content: impl Into<String>) -> Self {
         Self::System(SystemItem {
@@ -985,6 +1150,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -998,6 +1165,8 @@ impl ConversationItem {
     pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
         Self::User(UserItem {
             content: parts,
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: None,
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1015,6 +1184,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::CompactionMeta),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1033,6 +1204,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SystemReminder),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1062,6 +1235,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::ProjectInstructions),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1075,6 +1250,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::WorkingDirectorySwitch),
             cwd_generation: Some(cwd_generation),
             prior_turn_interrupt: None,
@@ -1092,6 +1269,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::AutoContinue),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1109,6 +1288,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::AutoRecovery),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1127,6 +1308,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::Interjection),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1140,6 +1323,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::TaskCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1153,6 +1338,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SubagentCompleted),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1166,6 +1353,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::NotificationDrain),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1179,6 +1368,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::GoalSummary),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1196,6 +1387,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::GoalClassifierNudge),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1209,6 +1402,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::SchedulerFired),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1222,6 +1417,8 @@ impl ConversationItem {
             content: vec![ContentPart::Text {
                 text: Arc::<str>::from(content.into()),
             }],
+            response_item_id: None,
+            provider_metadata: None,
             synthetic_reason: Some(SyntheticReason::StopHookFeedback),
             cwd_generation: None,
             prior_turn_interrupt: None,
@@ -1233,6 +1430,7 @@ impl ConversationItem {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(content.into()),
+            response_item_id: None,
             tool_calls: Vec::new(),
             model_id: None,
             model_fingerprint: None,
@@ -1248,6 +1446,7 @@ impl ConversationItem {
     pub fn assistant_with_model(content: impl Into<String>, model_id: impl Into<String>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(content.into()),
+            response_item_id: None,
             tool_calls: Vec::new(),
             model_id: Some(model_id.into()),
             model_fingerprint: None,
@@ -1259,6 +1458,7 @@ impl ConversationItem {
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant(AssistantItem {
             content: Arc::<str>::from(""),
+            response_item_id: None,
             tool_calls,
             model_id: None,
             model_fingerprint: None,
@@ -1299,8 +1499,9 @@ impl ConversationItem {
             Self::Assistant(_) => Role::Assistant,
             Self::ToolResult(_) => Role::Tool,
             Self::BackendToolCall(_) => Role::Assistant,
-            // Reasoning is semantically part of the assistant's turn.
-            Self::Reasoning(_) => Role::Assistant,
+            // Provider metadata, reasoning, and native compaction are
+            // semantically part of the assistant's turn.
+            Self::Provider(_) | Self::Reasoning(_) => Role::Assistant,
         }
     }
 
@@ -1330,6 +1531,8 @@ impl ConversationItem {
             Self::ToolResult(t) => t.content.as_ref().to_owned(),
             Self::BackendToolCall(b) => b.text_summary(),
             Self::Reasoning(r) => reasoning_item_text(r),
+            // Transport/native metadata and payload are intentionally opaque.
+            Self::Provider(_) => String::new(),
         }
     }
 }
@@ -1995,6 +2198,8 @@ pub fn transform_conversation_cwd(
             }
             // Backend tool calls don't contain workspace paths — no-op.
             ConversationItem::BackendToolCall(_) => {}
+            // Provider/native metadata and encrypted content are immutable.
+            ConversationItem::Provider(_) => {}
             // Reasoning items rarely reference CWD paths, but they can —
             // patch both summary parts and content blocks defensively.
             ConversationItem::Reasoning(r) => {
@@ -2053,6 +2258,16 @@ pub enum DanglingToolCallReason {
     HarnessHalted { class: &'static str },
 }
 
+/// Whether an item may sit between a tool-owning assistant and its following
+/// tool-result run without ending that assistant turn.
+pub fn is_tool_result_run_transparent(item: &ConversationItem) -> bool {
+    match item {
+        ConversationItem::Reasoning(_) => true,
+        ConversationItem::Provider(provider) => provider.is_response_output_metadata(),
+        _ => false,
+    }
+}
+
 /// Insert synthetic `ToolResult` items for any tool calls that lack a result.
 ///
 /// When a turn is cancelled mid-tool-execution, the conversation can have an
@@ -2096,6 +2311,8 @@ pub fn repair_dangling_tool_calls(
             while j < conversation.len() {
                 if let ConversationItem::ToolResult(tr) = &conversation[j] {
                     answered.insert(tr.tool_call_id.clone());
+                    j += 1;
+                } else if is_tool_result_run_transparent(&conversation[j]) {
                     j += 1;
                 } else {
                     break;
@@ -2152,6 +2369,8 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
             while j < conversation.len() {
                 if let ConversationItem::ToolResult(tr) = &conversation[j] {
                     answered.insert(tr.tool_call_id.clone());
+                    j += 1;
+                } else if is_tool_result_run_transparent(&conversation[j]) {
                     j += 1;
                 } else {
                     break;
@@ -2210,7 +2429,9 @@ pub fn dedup_duplicate_tool_results(conversation: &mut Vec<ConversationItem>) ->
             let start = i + 1;
             let mut end = start;
             while end < conversation.len() {
-                if matches!(&conversation[end], ConversationItem::ToolResult(_)) {
+                if matches!(&conversation[end], ConversationItem::ToolResult(_))
+                    || is_tool_result_run_transparent(&conversation[end])
+                {
                     end += 1;
                 } else {
                     break;
@@ -3307,6 +3528,7 @@ mod tests {
 
         let mut items = vec![ConversationItem::Assistant(AssistantItem {
             content: format!("I'll read the file at {worktree}/src/main.rs").into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "call_1".into(),
@@ -3399,6 +3621,7 @@ mod tests {
             // Assistant with tool calls for the fix
             ConversationItem::Assistant(AssistantItem {
                 content: format!("I'll fix the bug in {worktree}/src/main.rs").into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_2".into(),
                     name: "search_replace".to_string(),
@@ -3452,6 +3675,7 @@ mod tests {
             ConversationItem::system(format!("Working in {root}.")),
             ConversationItem::Assistant(AssistantItem {
                 content: format!("I previously edited {root}/src/main.rs").into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -3560,6 +3784,7 @@ mod tests {
         // Tool calls that don't contain any paths should be unaffected
         let mut items = vec![ConversationItem::Assistant(AssistantItem {
             content: "Running a command".into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".into(),
                 name: "run_terminal_cmd".to_string(),
@@ -3688,6 +3913,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: Some("test-model".to_string()),
                 model_fingerprint: None,
@@ -3712,6 +3938,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: "Here is my answer.".into(),
+                response_item_id: None,
                 tool_calls: vec![],
                 model_id: None,
                 model_fingerprint: None,
@@ -3736,6 +3963,7 @@ mod tests {
         let response = ConversationResponse {
             items: vec![ConversationItem::Assistant(AssistantItem {
                 content: String::new().into(),
+                response_item_id: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".into(),
                     name: "read_file".to_string(),
@@ -3958,6 +4186,7 @@ mod tests {
     fn test_assistant_item_with_model_id() {
         let item = AssistantItem {
             content: "Hello".into(),
+            response_item_id: None,
             tool_calls: vec![],
             model_id: None,
             model_fingerprint: None,

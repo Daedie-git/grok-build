@@ -5,7 +5,7 @@
 //! [`xai_grok_agent::AgentBuilder::new`]. Both initial session spawn
 //! ([`crate::session::acp_session::spawn_session_actor`]) and zero-turn
 //! harness rebuild
-//! ([`crate::session::acp_session::SessionActor::handle_rebuild_agent_for_definition`])
+//! ([`crate::session::acp_session::SessionActor::prepare_agent_rebuild`])
 //! go through [`AgentRebuildSpec::build_agent`].
 //!
 //! ## Why this exists

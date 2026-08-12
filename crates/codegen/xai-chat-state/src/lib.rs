@@ -48,7 +48,7 @@ pub use events::ChatStateEvent;
 pub use handle::ChatStateHandle;
 pub use persistence::{
     ChatPersistence, MockChatPersistence, MockPersistenceReceiver, NullChatPersistence,
-    PersistenceRecord, StripOutcome,
+    PersistenceRecord, ReplaceHistoryAck, ReplaceHistoryError, StripOutcome,
 };
 pub use types::*;
 pub use usage::{UsageLedger, UsageTotals};

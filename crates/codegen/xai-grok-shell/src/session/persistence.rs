@@ -218,7 +218,8 @@ pub enum PersistenceMsg {
             Result<xai_chat_state::StrictAppendAck, xai_chat_state::StrictAppendError>,
         >,
     },
-    /// Replace the entire chat history (used for compaction)
+    /// Replace the entire chat history (used for legacy best-effort compaction
+    /// installs and tests). Production compaction uses [`Self::InstallCompactionAndAck`].
     ReplaceChatHistory(Vec<ConversationItem>),
     /// Destructive image-strip rewrite: back up the on-disk history first,
     /// and only rewrite if the backup landed: recoverability gates the
@@ -226,6 +227,31 @@ pub enum PersistenceMsg {
     ReplaceChatHistoryForStripAndAck {
         messages: Vec<ConversationItem>,
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+    /// Commit-aware history replacement used by authoritative sampling-state
+    /// transitions. Unlike an actor read barrier, this acknowledges the durable
+    /// cache commit and preserves post-commit bookkeeping warnings.
+    ReplaceChatHistoryAndAck {
+        messages: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<
+            Result<xai_chat_state::ReplaceHistoryAck, xai_chat_state::ReplaceHistoryError>,
+        >,
+    },
+    /// Commit-aware compaction install (local summary and native Codex). The
+    /// durable marker is the commit point; cache/bookkeeping failures after it
+    /// are reported as committed.
+    InstallCompactionAndAck {
+        checkpoint: crate::extensions::notification::CompactionCheckpointFile,
+        marker: SessionUpdate,
+        replacement: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<TimelineTransactionOutcome>,
+    },
+    /// Commit-aware rewind install. The marker is appended durably before the
+    /// derived chat cache is replaced; post-marker failures remain committed.
+    InstallRewindAndAck {
+        marker: SessionUpdate,
+        replacement: Vec<ConversationItem>,
+        respond_to: tokio::sync::oneshot::Sender<TimelineTransactionOutcome>,
     },
     CurrentModel {
         model_id: acp::ModelId,
@@ -1204,6 +1230,110 @@ struct SessionPersistence {
     disk_full_notified: bool,
 }
 
+#[derive(Debug)]
+pub enum TimelineCacheStatus {
+    Current,
+    CurrentWithBookkeepingError(io::Error),
+    RepairRequired(io::Error),
+}
+
+#[derive(Debug)]
+pub enum TimelineTransactionOutcome {
+    NotCommitted(io::Error),
+    Committed {
+        marker_bookkeeping_error: Option<io::Error>,
+        cache_status: TimelineCacheStatus,
+    },
+}
+
+#[async_trait::async_trait]
+trait NativeCompactionStorage: Send + Sync {
+    async fn stage_checkpoint(
+        &self,
+        info: &Info,
+        checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
+    ) -> io::Result<()>;
+    async fn commit_marker(
+        &self,
+        info: &Info,
+        marker: &SessionUpdate,
+    ) -> Result<(), crate::session::storage::AppendUpdateError>;
+    async fn replace_cache(
+        &self,
+        info: &Info,
+        replacement: &[ConversationItem],
+    ) -> Result<(), crate::session::storage::ReplaceChatHistoryError>;
+}
+
+#[async_trait::async_trait]
+impl<T: StorageAdapter + ?Sized> NativeCompactionStorage for T {
+    async fn stage_checkpoint(
+        &self,
+        info: &Info,
+        checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
+    ) -> io::Result<()> {
+        self.write_compaction_checkpoint(info, checkpoint).await
+    }
+
+    async fn commit_marker(
+        &self,
+        info: &Info,
+        marker: &SessionUpdate,
+    ) -> Result<(), crate::session::storage::AppendUpdateError> {
+        self.append_update_durable_commit_aware(info, marker).await
+    }
+
+    async fn replace_cache(
+        &self,
+        info: &Info,
+        replacement: &[ConversationItem],
+    ) -> Result<(), crate::session::storage::ReplaceChatHistoryError> {
+        self.replace_chat_history_commit_aware(info, replacement)
+            .await
+    }
+}
+
+async fn persist_marker_first_transaction(
+    storage: &(impl NativeCompactionStorage + ?Sized),
+    info: &Info,
+    marker: &SessionUpdate,
+    replacement: &[ConversationItem],
+) -> TimelineTransactionOutcome {
+    let marker_bookkeeping_error = match storage.commit_marker(info, marker).await {
+        Ok(()) => None,
+        Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+            return TimelineTransactionOutcome::NotCommitted(error);
+        }
+        Err(crate::session::storage::AppendUpdateError::Committed(error)) => Some(error),
+    };
+    let cache_status = match storage.replace_cache(info, replacement).await {
+        Ok(()) => TimelineCacheStatus::Current,
+        Err(crate::session::storage::ReplaceChatHistoryError::Committed(error)) => {
+            TimelineCacheStatus::CurrentWithBookkeepingError(error)
+        }
+        Err(crate::session::storage::ReplaceChatHistoryError::NotCommitted(error)) => {
+            TimelineCacheStatus::RepairRequired(error)
+        }
+    };
+    TimelineTransactionOutcome::Committed {
+        marker_bookkeeping_error,
+        cache_status,
+    }
+}
+
+async fn persist_native_compaction_transaction(
+    storage: &(impl NativeCompactionStorage + ?Sized),
+    info: &Info,
+    checkpoint: &crate::extensions::notification::CompactionCheckpointFile,
+    marker: &SessionUpdate,
+    replacement: &[ConversationItem],
+) -> TimelineTransactionOutcome {
+    if let Err(error) = storage.stage_checkpoint(info, checkpoint).await {
+        return TimelineTransactionOutcome::NotCommitted(error);
+    }
+    persist_marker_first_transaction(storage, info, marker, replacement).await
+}
+
 impl SessionPersistence {
     fn try_merge_text(prev: &mut acp::ContentBlock, new: &acp::ContentBlock) -> bool {
         match (prev, new) {
@@ -1647,6 +1777,100 @@ impl SessionPersistence {
                     if let Err(e) = &result {
                         tracing::warn!(?e, "image-strip history rewrite failed");
                     }
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::ReplaceChatHistoryAndAck {
+                    messages,
+                    respond_to,
+                } => {
+                    tracing::info!(
+                        num_messages = messages.len(),
+                        "Replacing chat history with commit acknowledgement"
+                    );
+                    let result = self
+                        .storage
+                        .replace_chat_history_commit_aware(&self.info, &messages)
+                        .await
+                        .map(|()| xai_chat_state::ReplaceHistoryAck::Committed)
+                        .or_else(|error| match error {
+                            crate::session::storage::ReplaceChatHistoryError::NotCommitted(error) => {
+                                Err(xai_chat_state::ReplaceHistoryError::NotCommitted(error))
+                            }
+                            crate::session::storage::ReplaceChatHistoryError::Committed(error) => {
+                                Ok(xai_chat_state::ReplaceHistoryAck::CommittedWithBookkeepingWarning(error))
+                            }
+                        });
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::InstallCompactionAndAck {
+                    checkpoint,
+                    marker,
+                    replacement,
+                    respond_to,
+                } => {
+                    let result = match self.drain_pending().await {
+                        Ok(()) => {
+                            persist_native_compaction_transaction(
+                                self.storage.as_ref(),
+                                &self.info,
+                                &checkpoint,
+                                &marker,
+                                &replacement,
+                            )
+                            .await
+                        }
+                        Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                            TimelineTransactionOutcome::NotCommitted(error)
+                        }
+                        Err(crate::session::storage::AppendUpdateError::Committed(error)) => {
+                            tracing::warn!(
+                                %error,
+                                "older update committed with bookkeeping failure before compaction"
+                            );
+                            persist_native_compaction_transaction(
+                                self.storage.as_ref(),
+                                &self.info,
+                                &checkpoint,
+                                &marker,
+                                &replacement,
+                            )
+                            .await
+                        }
+                    };
+                    let _ = respond_to.send(result);
+                }
+                PersistenceMsg::InstallRewindAndAck {
+                    marker,
+                    replacement,
+                    respond_to,
+                } => {
+                    let result = match self.drain_pending().await {
+                        Ok(()) => {
+                            persist_marker_first_transaction(
+                                self.storage.as_ref(),
+                                &self.info,
+                                &marker,
+                                &replacement,
+                            )
+                            .await
+                        }
+                        Err(crate::session::storage::AppendUpdateError::NotCommitted(error)) => {
+                            TimelineTransactionOutcome::NotCommitted(error)
+                        }
+                        Err(crate::session::storage::AppendUpdateError::Committed(error)) => {
+                            tracing::warn!(
+                                %error,
+                                "older update committed with bookkeeping failure before rewind"
+                            );
+                            persist_marker_first_transaction(
+                                self.storage.as_ref(),
+                                &self.info,
+                                &marker,
+                                &replacement,
+                            )
+                            .await
+                        }
+                    };
                     let _ = respond_to.send(result);
                 }
                 PersistenceMsg::CurrentModel {
@@ -2160,6 +2384,10 @@ pub(crate) fn io_error_to_acp(e: &io::Error) -> acp::Error {
         }),
     ))
 }
+
+#[cfg(test)]
+#[path = "persistence_native_compaction_transaction_tests.rs"]
+mod native_compaction_transaction_tests;
 
 #[cfg(test)]
 #[path = "persistence_io_error_to_acp_tests.rs"]

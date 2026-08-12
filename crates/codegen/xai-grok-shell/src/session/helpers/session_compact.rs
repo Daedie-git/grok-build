@@ -75,7 +75,9 @@ pub(crate) use xai_grok_sampling_types::is_context_length_error;
 /// request cannot change the outcome — auth state, config, payload shape,
 /// and stuck-model conditions all persist). 4xx API responses other than
 /// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
-/// transport errors, stream-level blips, and 5xx responses are transient.
+/// transport errors, non-size stream-level blips, and 5xx responses are transient.
+/// Context-window errors are deterministic regardless of whether they arrive
+/// as an HTTP `Api` error or a provider-specific SSE `StreamError`.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
     let deterministic = match &err {
@@ -84,6 +86,10 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
         | SamplingError::Serialization(_)
         | SamplingError::IdleTimeout { .. } => true,
         SamplingError::Api {
+            should_retry: Some(false),
+            ..
+        } => true,
+        SamplingError::Api {
             status, message, ..
         } => {
             is_context_length_error(message)
@@ -91,11 +97,13 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
                     && *status != StatusCode::REQUEST_TIMEOUT
                     && *status != StatusCode::TOO_MANY_REQUESTS)
         }
+        SamplingError::StreamError { message, .. } => {
+            is_context_length_error(message) || !err.is_retryable()
+        }
         SamplingError::MaxTokensTruncation => true,
         // Loops are stochastic at sampling temperature; a retry may differ.
         SamplingError::Http(_)
         | SamplingError::EventStreamError(_)
-        | SamplingError::StreamError { .. }
         | SamplingError::EmptyResponse { .. }
         | SamplingError::DoomLoopDetected { .. } => false,
     };
@@ -556,7 +564,10 @@ pub(crate) async fn generate_session_compact(
                 tools,
                 hosted_tools,
                 model: Some(sampling_config.model.to_owned()),
-                temperature: Some(1.0),
+                // Do not force a sampling value for summaries. In particular,
+                // Codex rejects this field and strips inherited defaults at
+                // its final wire-normalization boundary.
+                temperature: None,
                 x_grok_conv_id: Some(session_id.to_string()),
                 x_grok_req_id: Some(format!("xai-compact-{}", uuid::Uuid::new_v4())),
                 x_grok_session_id: Some(session_id.to_string()),
@@ -574,6 +585,7 @@ pub(crate) async fn generate_session_compact(
             let mut truncated = false;
             let mut stop_reason: Option<String> = None;
             let mut content = String::new();
+            let mut terminal_text = xai_grok_sampling_types::ResponsesStreamAccumulator::default();
             let mut last_progress_at = std::time::Instant::now();
             loop {
                 let idle_remaining = idle_timeout.saturating_sub(last_progress_at.elapsed());
@@ -602,6 +614,26 @@ pub(crate) async fn generate_session_compact(
                 }
                 match chunk_result {
                     Ok(chunk) => {
+                        let chunk = match chunk {
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(
+                                item,
+                            ) => {
+                                terminal_text.note_output_item_added(item);
+                                last_progress_at = std::time::Instant::now();
+                                continue;
+                            }
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemDone(
+                                item,
+                            ) => {
+                                terminal_text.note_captured_output_item_done(item);
+                                last_progress_at = std::time::Instant::now();
+                                continue;
+                            }
+                            xai_grok_sampling_types::DecodedResponseStreamEvent::Event {
+                                event,
+                                ..
+                            } => event,
+                        };
                         if !matches!(
                             &chunk,
                             ResponseStreamEvent::ResponseCreated(_)
@@ -614,6 +646,24 @@ pub(crate) async fn generate_session_compact(
                             ResponseStreamEvent::ResponseOutputTextDelta(text_delta_event) => {
                                 timing.record_delta();
                                 content.push_str(&text_delta_event.delta);
+                                terminal_text.note_indexed_text_delta(
+                                    text_delta_event.output_index,
+                                    &text_delta_event.item_id,
+                                    &text_delta_event.delta,
+                                );
+                            }
+                            ResponseStreamEvent::ResponseOutputTextDone(done_event) => {
+                                terminal_text.note_indexed_text_done(
+                                    done_event.output_index,
+                                    &done_event.item_id,
+                                    &done_event.text,
+                                );
+                            }
+                            ResponseStreamEvent::ResponseOutputItemDone(done_event) => {
+                                terminal_text.note_output_item_done(
+                                    done_event.output_index,
+                                    done_event.item.clone(),
+                                );
                             }
                             ResponseStreamEvent::ResponseFailed(failed_event) => {
                                 let event_error = failed_event.response.error.as_ref();
@@ -661,6 +711,10 @@ pub(crate) async fn generate_session_compact(
                     Err(e) => return Err(classify_sampling_error(e)),
                 }
             }
+            // A finalized output item is authoritative; otherwise use the
+            // accumulated deltas/output-text-done fallback. This handles
+            // Codex terminal forms without appending the same text twice.
+            content = terminal_text.final_text();
             CompactOutput {
                 content,
                 // No incomplete event on a normal completion: treat as a clean stop.

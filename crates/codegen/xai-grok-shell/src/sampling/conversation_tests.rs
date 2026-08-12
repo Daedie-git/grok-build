@@ -38,6 +38,41 @@ fn fork_filter_truncates_at_complete_turn() {
     assert_eq!(items.len(), 3, "should truncate after last complete turn");
     assert!(matches!(items[2], ConversationItem::Assistant(_)));
 }
+
+#[test]
+fn fork_filter_only_carries_ordinary_provider_metadata_through_turn_boundary() {
+    let ordinary = ConversationItem::response_output_metadata(
+        xai_grok_sampling_types::ResponseOutputItemMetadata {
+            response_id: "resp-test".into(),
+            output_items: 0,
+            items: Vec::new(),
+            origin: None,
+        },
+    );
+    let mut ordinary_items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q1"),
+        ConversationItem::assistant("a1"),
+        ordinary,
+    ];
+    fork_filter_chat(&mut ordinary_items);
+    assert_eq!(ordinary_items.len(), 4);
+
+    let native = ConversationItem::encrypted_compaction(
+        xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+            id: Some("cmp-test".into()),
+            encrypted_content: "ciphertext".into(),
+        },
+    );
+    let mut native_items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::user("q1"),
+        ConversationItem::assistant("a1"),
+        native,
+    ];
+    fork_filter_chat(&mut native_items);
+    assert_eq!(native_items.len(), 3);
+}
 #[test]
 fn fork_filter_consecutive_users_with_tool_calls() {
     use xai_grok_sampling_types::conversation::*;
@@ -48,6 +83,7 @@ fn fork_filter_consecutive_users_with_tool_calls() {
         ConversationItem::user("query"),
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "bash".into(),
@@ -75,6 +111,7 @@ fn fork_filter_preserves_complete_tool_turn() {
         ConversationItem::user("q"),
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "bash".into(),
@@ -99,6 +136,7 @@ fn fork_filter_strips_incomplete_tool_turn() {
         ConversationItem::user("q2"),
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
                 name: "bash".into(),
@@ -152,6 +190,7 @@ fn fork_filter_keeps_multi_tool_turn_with_reasoning_between_results() {
         ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item("plan")),
         ConversationItem::Assistant(AssistantItem {
             content: String::new().into(),
+            response_item_id: None,
             tool_calls: vec![
                 ToolCall {
                     id: "tc1".into(),

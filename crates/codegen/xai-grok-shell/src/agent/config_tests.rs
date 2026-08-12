@@ -1024,12 +1024,14 @@ fn test_model_entry(
             temperature: None,
             top_p: None,
             api_backend: ApiBackend::default(),
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
             use_concise: false,
             agent_type: default_agent_type(),
@@ -1111,6 +1113,7 @@ fn sampling_config_uses_fallback_when_no_model_api_key() {
             base_url: model.info().base_url.clone(),
             auth_type: xai_chat_state::AuthType::ApiKey,
             auth_scheme: AuthScheme::Bearer,
+            extra_headers: IndexMap::new(),
         },
         None,
         None,
@@ -1189,12 +1192,40 @@ fn default_models_dual_endpoint_routing() {
                 .unwrap_or(entry.info().base_url.clone()),
             auth_type: xai_chat_state::AuthType::ApiKey,
             auth_scheme: AuthScheme::Bearer,
+            extra_headers: IndexMap::new(),
         };
         assert_eq!(
             api_key_creds.base_url, endpoints.xai_api_base_url,
             "{model_id}: ExternalApiKey must route to api.x.ai"
         );
     }
+}
+#[test]
+fn default_model_retry_budgets_keep_grok_resilient_and_codex_bounded() {
+    let entries = default_model_entries(&EndpointsConfig::default());
+    assert_eq!(entries["grok-4.5"].info.max_retries, None);
+    for model_id in [
+        "codex-gpt-5.6-sol",
+        "codex-gpt-5.6-luna",
+        "codex-gpt-5.3-codex-spark",
+    ] {
+        assert_eq!(entries[model_id].info.max_retries, Some(5), "{model_id}");
+    }
+
+    let mut remote_codex = entries["codex-gpt-5.6-sol"].clone();
+    remote_codex.info.max_retries = None;
+    let resolved = resolve_model_list(
+        &Config::default(),
+        Some(IndexMap::from_iter([(
+            "codex-gpt-5.6-sol".to_string(),
+            remote_codex,
+        )])),
+    );
+    assert_eq!(
+        resolved["codex-gpt-5.6-sol"].info.max_retries,
+        Some(5),
+        "a remote refresh that omits the field must retain the built-in provider policy"
+    );
 }
 #[test]
 fn env_keys_deser_string_or_array() {
@@ -1474,6 +1505,7 @@ fn api_key_creds(base_url: &str) -> ResolvedCredentials {
         base_url: base_url.to_string(),
         auth_type: xai_chat_state::AuthType::ApiKey,
         auth_scheme: Default::default(),
+        extra_headers: IndexMap::new(),
     }
 }
 /// `disable_api_key_auth` kill switch (Claude `forceLoginMethod` parity).
@@ -1603,6 +1635,35 @@ fn has_own_credentials_guards_session_vs_external_key() {
     );
     assert!(config_model.has_own_credentials());
 }
+#[test]
+fn provider_identity_never_redirects_first_party_session_credentials() {
+    let mut proxied_codex = test_model_entry(
+        "proxied-codex",
+        "https://gateway.example/v1",
+        None,
+        None,
+        None,
+    );
+    proxied_codex.info.api_backend = ApiBackend::Responses;
+    proxied_codex.info.provider_id = Some(ProviderId::Codex);
+    let credentials = resolve_credentials(&proxied_codex, Some("grok-session-secret"));
+    assert!(credentials.api_key.is_none());
+    assert_eq!(credentials.auth_type, xai_chat_state::AuthType::ApiKey);
+
+    let mut custom_on_codex = test_model_entry(
+        "custom-on-codex",
+        xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+        None,
+        None,
+        None,
+    );
+    custom_on_codex.info.api_backend = ApiBackend::Responses;
+    custom_on_codex.info.provider_id = Some(ProviderId::Custom);
+    let credentials = resolve_credentials(&custom_on_codex, Some("grok-session-secret"));
+    assert!(credentials.api_key.is_none());
+    assert_eq!(credentials.auth_type, xai_chat_state::AuthType::ApiKey);
+}
+
 /// The `ConfigUnavailable → Unknown` arm matters for safety: a transient
 /// config failure must not read as a definite `NotByok`, which would drive
 /// the live resolver and could overwrite a per-model BYOK key.
@@ -1631,6 +1692,22 @@ fn byok_from_lookup_classifies_all_states() {
     assert_eq!(
         byok_from_lookup(&ModelLookup::Loaded(Some(&session))),
         ModelByok::NotByok,
+    );
+    let codex = test_model_entry(
+        "spark",
+        xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+        None,
+        None,
+        None,
+    );
+    let mut codex = codex;
+    codex.info.provider_id = Some(ProviderId::Codex);
+    codex.info.api_backend = ApiBackend::Responses;
+    assert_eq!(
+        byok_from_lookup(&ModelLookup::Loaded(Some(&codex))),
+        ModelByok::Byok,
+        "Codex backend models resolve credentials from ~/.codex; treat as BYOK \
+         so the session OIDC resolver cannot overwrite ChatGPT tokens",
     );
 }
 #[test]
@@ -2098,10 +2175,12 @@ fn model_info_from_config_propagates_use_concise() {
         api_key: None,
         env_key: None,
         api_backend: ApiBackend::default(),
+        provider_id: None,
         auth_scheme: None,
         extra_headers: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
+        auto_compact_token_limit: None,
         system_prompt_label: None,
         api_base_url: None,
         use_concise: true,
@@ -2257,10 +2336,12 @@ fn model_info_from_config_propagates_agent_type() {
         api_key: None,
         env_key: None,
         api_backend: ApiBackend::default(),
+        provider_id: None,
         auth_scheme: None,
         extra_headers: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
+        auto_compact_token_limit: None,
         system_prompt_label: None,
         api_base_url: None,
         use_concise: false,
@@ -2296,6 +2377,43 @@ fn acp_model_meta_includes_agent_type_when_present() {
     assert_eq!(meta["agentType"], "codex");
     assert_eq!(meta["totalContextTokens"], 256_000);
 }
+#[test]
+fn acp_model_meta_marks_codex_provider_from_resolved_url() {
+    let mut models = IndexMap::new();
+    let entry = test_model_entry(
+        "custom-codex",
+        xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
+        None,
+        None,
+        None,
+    );
+    models.insert("custom-codex".to_string(), entry);
+    let acp_models = to_acp_model_info(&models);
+    let meta = acp_models.values().next().unwrap().meta.as_ref().unwrap();
+    assert_eq!(meta["providerId"], "codex");
+    assert_eq!(meta["providerKind"], "codex");
+}
+
+#[test]
+fn acp_model_meta_preserves_explicit_provider_through_proxy() {
+    let mut models = IndexMap::new();
+    let mut entry = test_model_entry(
+        "proxied-codex",
+        "https://gateway.example/v1",
+        None,
+        None,
+        None,
+    );
+    entry.info.api_backend = ApiBackend::Responses;
+    entry.info.provider_id = Some(ProviderId::Codex);
+    models.insert("proxied-codex".to_string(), entry);
+
+    let acp_models = to_acp_model_info(&models);
+    let meta = acp_models.values().next().unwrap().meta.as_ref().unwrap();
+    assert_eq!(meta["providerId"], "codex");
+    assert_eq!(meta["providerKind"], "codex");
+}
+
 #[test]
 fn acp_model_meta_always_includes_agent_type() {
     let mut models = IndexMap::new();
@@ -2708,10 +2826,12 @@ fn inference_idle_timeout_propagates_to_model_info() {
         api_key: None,
         env_key: None,
         api_backend: ApiBackend::default(),
+        provider_id: None,
         auth_scheme: None,
         extra_headers: IndexMap::new(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         auto_compact_threshold_percent: None,
+        auto_compact_token_limit: None,
         system_prompt_label: None,
         api_base_url: None,
         use_concise: false,
@@ -6562,6 +6682,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             temperature: None,
             top_p: None,
             api_backend,
+            provider_id: None,
             auth_scheme: Default::default(),
             extra_headers: IndexMap::new(),
             query_params: IndexMap::new(),
@@ -6583,6 +6704,7 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
             stream_tool_calls: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
             auto_compact_threshold_percent: None,
+            auto_compact_token_limit: None,
             system_prompt_label: None,
         },
         api_key: None,
@@ -6590,6 +6712,15 @@ fn prefetch_model_entry(slug: &str, context_window: u64, api_backend: ApiBackend
         auth_provider: None,
         api_base_url: None,
     }
+}
+fn is_locally_authenticated_provider_model(entry: &ModelEntry) -> bool {
+    xai_grok_sampling_types::resolve_provider(
+        entry.info.provider_id,
+        entry.info.api_backend.clone(),
+        &entry.info.base_url,
+    )
+    .capabilities()
+    .uses_chatgpt_auth()
 }
 #[test]
 fn global_extra_headers_apply_to_model_without_override() {
@@ -6950,16 +7081,21 @@ fn resolve_model_list_prefetch_visibility_matches_auth_and_server_list() {
         p.insert(dm.to_string(), e);
     }
     let resolved = resolve_model_list(&cfg, Some(p));
-    let sess: Vec<_> = resolved
+    let server_models: Vec<_> = resolved
         .values()
-        .filter(|e| e.visible_for_auth(true))
+        .filter(|entry| !is_locally_authenticated_provider_model(entry))
         .collect();
-    let api: Vec<_> = resolved
-        .values()
-        .filter(|e| e.visible_for_auth(false))
-        .collect();
-    assert_eq!(sess.len(), 1);
-    assert_eq!(api.len(), 1);
+    assert_eq!(server_models.len(), 1);
+    assert!(server_models[0].visible_for_auth(true));
+    assert!(server_models[0].visible_for_auth(false));
+    assert_eq!(
+        resolved
+            .values()
+            .filter(|entry| is_locally_authenticated_provider_model(entry))
+            .count(),
+        3,
+        "remote xAI visibility must not prune the separate local Codex catalog"
+    );
 }
 #[test]
 fn resolve_model_list_keeps_prefetch_only_entries_and_prunes_defaults() {
@@ -6971,9 +7107,15 @@ fn resolve_model_list_keeps_prefetch_only_entries_and_prunes_defaults() {
     let resolved = resolve_model_list(&cfg, Some(p));
     assert!(resolved.contains_key("secret-xyz"));
     assert!(!resolved.contains_key(dm));
+    assert!(
+        resolved
+            .values()
+            .filter(|entry| !is_locally_authenticated_provider_model(entry))
+            .all(|entry| entry.info.model == "secret-xyz")
+    );
 }
 #[test]
-fn resolve_model_list_prefetch_replaces_bundled_entirely() {
+fn resolve_model_list_prefetch_replaces_bundled_xai_models() {
     let cfg = Config::default();
     let dm = crate::models::default_model();
     let mut p = IndexMap::new();
@@ -6984,10 +7126,15 @@ fn resolve_model_list_prefetch_replaces_bundled_entirely() {
     assert!(!resolved.contains_key(dm));
 }
 #[test]
-fn resolve_model_list_empty_prefetch_yields_empty_base() {
+fn resolve_model_list_empty_prefetch_keeps_only_local_provider_catalog() {
     let cfg = Config::default();
     let resolved = resolve_model_list(&cfg, Some(IndexMap::new()));
-    assert!(resolved.is_empty());
+    assert_eq!(resolved.len(), 3);
+    assert!(
+        resolved
+            .values()
+            .all(is_locally_authenticated_provider_model)
+    );
 }
 /// Regression: enterprise managed config overlays env_key on an oauth-only
 /// catalog entry. BYOK must force visibility for API-key users so a

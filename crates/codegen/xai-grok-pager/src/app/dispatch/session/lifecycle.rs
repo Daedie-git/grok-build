@@ -1107,11 +1107,9 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 session_id: session_id_clone.clone(),
             });
         }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: 0,
-        });
+        effects.push(super::super::billing::account_usage_refresh_effect(
+            agent, agent_id, true,
+        ));
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -1215,11 +1213,9 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 session_id: session_id_clone.clone(),
             });
         }
-        effects.push(Effect::FetchBilling {
-            agent_id,
-            silent: true,
-            nonce: 0,
-        });
+        effects.push(super::super::billing::account_usage_refresh_effect(
+            agent, agent_id, true,
+        ));
         if let Some(switch) = deferred {
             effects.push(Effect::SwitchModel {
                 agent_id,
@@ -1415,7 +1411,11 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     .unwrap_or_else(|| model_id.0.to_string());
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
+                let previous_was_codex = agent.session.models.current_model_is_codex();
                 agent.session.models.set_current(model_id.clone(), effort);
+                let provider_changed =
+                    previous_was_codex != agent.session.models.current_model_is_codex();
+                agent.refresh_restricted_commands_for_model();
                 let resolved_effort = agent.session.models.reasoning_effort;
                 let unchanged =
                     prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;
@@ -1427,14 +1427,23 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     };
                     agent.scrollback.push_block(RenderBlock::system(msg));
                 }
-                if unchanged {
+                let mut effects = if unchanged {
                     vec![]
                 } else {
                     vec![Effect::PersistPreferredModel {
                         model_id: model_id.clone(),
                         reasoning_effort: resolved_effort,
                     }]
+                };
+                if provider_changed {
+                    if agent.session.models.current_model_is_codex() {
+                        agent.codex_rate_limits = None;
+                    }
+                    effects.push(super::super::billing::account_usage_refresh_effect(
+                        agent, agent_id, true,
+                    ));
                 }
+                effects
             }
             Err(SwitchModelError::IncompatibleAgent { .. }) => {
                 if let Some(ref prev) = prev_model_id {

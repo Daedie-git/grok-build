@@ -77,7 +77,7 @@ async fn finish_session_exit_feedback(session: &SessionActor) {
     cleanup_session_scratch(session);
 }
 impl SessionActor {
-    /// Serialize terminal task-wake admission with interactive cancellation.
+    /// Serialize terminal task/subagent wake admission with interactive cancellation.
     pub(super) async fn admit_task_completion_wake(
         &self,
         origin: &super::PromptOrigin,
@@ -87,8 +87,10 @@ impl SessionActor {
             respond_to,
             fallback,
         } = admission;
-        let super::PromptOrigin::TaskCompleted { task_id } = origin else {
-            return respond_to.send(true).is_ok().then_some(fallback);
+        let completion_id = match origin {
+            super::PromptOrigin::TaskCompleted { task_id } => task_id,
+            super::PromptOrigin::SubagentCompleted { subagent_id } => subagent_id,
+            _ => return respond_to.send(true).is_ok().then_some(fallback),
         };
         let gate_suppressed = self
             .tool_context
@@ -96,18 +98,37 @@ impl SessionActor {
             .as_ref()
             .is_some_and(|gate| gate.get());
         let mut state = self.state.lock().await;
+        let goal_loop_active = self
+            .tool_context
+            .goal_loop_active_gate
+            .load(std::sync::atomic::Ordering::Relaxed);
         let state_suppressed = state.notifications_suppressed;
-        let admitted = !gate_suppressed && !state_suppressed;
-        if !admitted {
-            Self::push_task_wake_fallback(&mut state, fallback);
+        if state.has_consumed_completion(completion_id) {
             drop(state);
             xai_grok_telemetry::unified_log::info(
                 "shell.task_wake.actor_admission",
                 Some(self.session_info.id.0.as_ref()),
                 Some(serde_json::json!({
-                    "task_id": task_id,
+                    "completion_id": completion_id,
+                    "consumed": true,
+                    "admitted": false,
+                })),
+            );
+            let _ = respond_to.send(false);
+            return None;
+        }
+        let admitted = !gate_suppressed && !state_suppressed && !goal_loop_active;
+        if !admitted {
+            self.push_task_wake_fallback(&mut state, fallback);
+            drop(state);
+            xai_grok_telemetry::unified_log::info(
+                "shell.task_wake.actor_admission",
+                Some(self.session_info.id.0.as_ref()),
+                Some(serde_json::json!({
+                    "completion_id": completion_id,
                     "gate": gate_suppressed,
                     "state": state_suppressed,
+                    "goal_loop_active": goal_loop_active,
                     "admitted": false,
                 })),
             );
@@ -115,7 +136,7 @@ impl SessionActor {
             return None;
         }
         if respond_to.send(true).is_err() {
-            Self::push_task_wake_fallback(&mut state, fallback);
+            self.push_task_wake_fallback(&mut state, fallback);
             return None;
         }
         drop(state);
@@ -123,9 +144,10 @@ impl SessionActor {
             "shell.task_wake.actor_admission",
             Some(self.session_info.id.0.as_ref()),
             Some(serde_json::json!({
-                "task_id": task_id,
+                "completion_id": completion_id,
                 "gate": gate_suppressed,
                 "state": state_suppressed,
+                "goal_loop_active": goal_loop_active,
                 "admitted": true,
             })),
         );
@@ -608,53 +630,15 @@ pub(super) async fn run_session(
                             session.handle_session_mode(session_mode).await;
                             let _ = responds_to.send(());
                         }
-                        SessionCommand::SetSessionModel { sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
-                            let updated_model_id = session.handle_set_session_model(sampling_config, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
+                        SessionCommand::SetSessionModel { sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
+                            let updated_model_id = session.handle_set_session_model(sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
                             let _ = responds_to.send(updated_model_id);
                         }
-                        SessionCommand::RebuildAgentForDefinition { definition, responds_to } => {
-                            let outcome = session.handle_rebuild_agent_for_definition(definition).await;
+                        SessionCommand::OverrideModelName { model_name, extra_headers, context_window, responds_to } => {
+                            let outcome = session
+                                .handle_override_model_name(model_name, extra_headers, context_window)
+                                .await;
                             let _ = responds_to.send(outcome);
-                        }
-                        SessionCommand::OverrideModelName { model_name, extra_headers, context_window } => {
-                            // Update the actor's SamplingConfig model + headers + context window.
-                            if let Some(mut cfg) = session.chat_state_handle.get_sampling_config().await {
-                                tracing::info!(
-                                    target: SESSION_LOG,
-                                    session_id = %session.session_info.id,
-                                    old_model = %cfg.model,
-                                    new_model = %model_name,
-                                    extra_header_count = extra_headers.len(),
-                                    old_context_window = cfg.context_window.get(),
-                                    new_context_window = ?context_window.map(|cw| cw.get()),
-                                    "OVERRIDE_MODEL: changing model name in sampling config"
-                                );
-                                // Update signals so primaryModelId and modelsUsed
-                                // reflect the model used after the override, not
-                                // the agent-level default (e.g. "grok-4.5").
-                                // set_primary_model also adds to models_used.
-                                session.signals_handle().set_primary_model(&model_name);
-                                cfg.model = model_name.clone();
-                                cfg.extra_headers.extend(extra_headers);
-                                if let Some(cw) = context_window
-                                    && session.compaction.context_window_override.is_none()
-                                {
-                                    cfg.context_window = cw;
-                                }
-                                session.chat_state_handle.update_sampling_config(cfg);
-
-                                let existing = session.chat_state_handle.get_credentials().await;
-                                if let Some(r) = crate::agent::config::try_resolve_model_credentials(model_name.as_str(), existing.api_key.as_deref()) {
-                                    session.chat_state_handle.update_credentials(xai_chat_state::Credentials {
-                                        api_key: r.api_key,
-                                        auth_type: r.auth_type,
-                                        alpha_test_key: existing.alpha_test_key,
-                                        client_version: existing.client_version,
-                                    });
-                                }
-                                // Credentials changed under a possibly-unchanged model id.
-                                session.invalidate_model_auth_memo();
-                            }
                         }
                         SessionCommand::GetCurrentModel { responds_to } => {
                             let model = session.chat_state_handle.get_sampling_config().await
@@ -850,6 +834,7 @@ pub(super) async fn run_session(
                                             prompt_blocks,
                                             priority,
                                             source,
+                                            owned_completion_reservation: None,
                                         },
                                     );
                                 }

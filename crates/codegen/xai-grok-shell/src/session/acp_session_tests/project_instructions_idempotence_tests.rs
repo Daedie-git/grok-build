@@ -76,6 +76,7 @@ fn wrapper_prefix_in_non_first_content_part_returns_false() {
                     text: format!("{LEGACY_AGENTS_MD_REMINDER_PREFIX} ...").into(),
                 },
             ],
+            response_item_id: None,
             synthetic_reason: None,
             ..Default::default()
         }),

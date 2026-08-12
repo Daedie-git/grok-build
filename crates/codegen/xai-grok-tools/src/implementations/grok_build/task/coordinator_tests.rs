@@ -4,29 +4,37 @@ use crate::implementations::grok_build::task::backend::{ChannelBackend, Subagent
 use crate::implementations::grok_build::task::types::{
     SubagentCancelRequest, SubagentClearUsageNotAppliedRequest, SubagentCompletionsRequest,
     SubagentListActiveRequest, SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest,
-    SubagentOutstandingReply, SubagentOutstandingRequest, SubagentOwner, SubagentRegistryCounts,
-    SubagentRequest, SubagentSnapshotStatus,
+    SubagentOutstandingReply, SubagentOutstandingRequest, SubagentOwner, SubagentQueryRequest,
+    SubagentRegistryCounts, SubagentRequest, SubagentSnapshotStatus,
 };
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct TestControl {
     cancellation: CancellationToken,
+    stall_progress: bool,
+    progress_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ChildControl for TestControl {
-    type ProgressFuture = std::future::Ready<SubagentProgress>;
+    type ProgressFuture = SendBoxFuture<SubagentProgress>;
 
     fn progress(&self) -> Self::ProgressFuture {
-        std::future::ready(SubagentProgress {
-            turn_count: 2,
-            tool_call_count: 3,
-            tokens_used: 100,
-            context_window_tokens: 1_000,
-            context_usage_pct: 10,
-            tools_used: vec!["read_file".to_owned()],
-            error_count: 0,
-        })
+        self.progress_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.stall_progress {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(std::future::ready(SubagentProgress {
+                turn_count: 2,
+                tool_call_count: 3,
+                tokens_used: 100,
+                context_window_tokens: 1_000,
+                context_usage_pct: 10,
+                tools_used: vec!["read_file".to_owned()],
+                error_count: 0,
+            }))
+        }
     }
 
     fn cancel(&self) {
@@ -37,11 +45,13 @@ impl ChildControl for TestControl {
 struct TestRunner {
     wait_before_start: bool,
     wait_after_cancel: bool,
+    stall_progress: bool,
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
     requests: mpsc::UnboundedSender<SubagentRequest>,
     started: mpsc::UnboundedSender<String>,
+    progress_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queue_waits: mpsc::UnboundedSender<(String, Option<std::time::Duration>, usize)>,
 }
 
@@ -55,10 +65,12 @@ impl ChildRunner for TestRunner {
     fn run(&self, run: ChildRunRequest<Self::Control>) -> Self::RunFuture {
         let wait_before_start = self.wait_before_start;
         let wait_after_cancel = self.wait_after_cancel;
+        let stall_progress = self.stall_progress;
         let mut start = self.start.subscribe();
         let mut finish = self.finish.subscribe();
         let requests = self.requests.clone();
         let started = self.started.clone();
+        let progress_calls = self.progress_calls.clone();
         let queue_waits = self.queue_waits.clone();
         Box::pin(async move {
             let ChildRunRequest {
@@ -97,6 +109,8 @@ impl ChildRunner for TestRunner {
                     definition_background: request.subagent_type == "background-default",
                     control: TestControl {
                         cancellation: cancellation.clone(),
+                        stall_progress,
+                        progress_calls,
                     },
                 })
                 .await
@@ -208,12 +222,13 @@ fn harness(wait_before_start: bool, foreground_budget: std::time::Duration) -> H
 }
 
 fn harness_with_config(wait_before_start: bool, config: CoordinatorConfig) -> Harness {
-    harness_with_options(wait_before_start, false, config)
+    harness_with_options(wait_before_start, false, false, config)
 }
 
 fn harness_with_options(
     wait_before_start: bool,
     wait_after_cancel: bool,
+    stall_progress: bool,
     config: CoordinatorConfig,
 ) -> Harness {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -222,6 +237,7 @@ fn harness_with_options(
     let (completion_tx, completions) = mpsc::unbounded_channel();
     let (request_tx, requests) = mpsc::unbounded_channel();
     let (started_tx, started) = mpsc::unbounded_channel();
+    let progress_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (queue_wait_tx, queue_waits) = mpsc::unbounded_channel();
     let actor = tokio::spawn(
         SubagentCoordinator::new(
@@ -229,11 +245,13 @@ fn harness_with_options(
             TestRunner {
                 wait_before_start,
                 wait_after_cancel,
+                stall_progress,
                 start: start.clone(),
                 finish: finish.clone(),
                 completions: completion_tx,
                 requests: request_tx,
                 started: started_tx,
+                progress_calls: progress_calls.clone(),
                 queue_waits: queue_wait_tx,
             },
             config,
@@ -253,6 +271,18 @@ fn harness_with_options(
         queue_waits,
         actor,
     }
+}
+
+fn harness_with_stalled_progress() -> Harness {
+    harness_with_options(
+        false,
+        false,
+        true,
+        CoordinatorConfig {
+            foreground_budget: std::time::Duration::from_secs(60),
+            ..CoordinatorConfig::default()
+        },
+    )
 }
 
 /// Session-bound backend for ParentSession cancel / admission on the default
@@ -388,6 +418,148 @@ async fn timed_out_waiter_does_not_suppress_later_completion() {
     let disposition = harness.completions.recv().await.unwrap();
     assert!(!disposition.waiter_delivered);
     assert!(disposition.should_surface);
+    assert!(spawn.await.unwrap().unwrap().success);
+    harness.actor.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_waiter_does_not_start_a_stalled_progress_query() {
+    let mut harness = harness_with_stalled_progress();
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("stalled-timeout", true)).await }
+    });
+    harness.started.recv().await.unwrap();
+
+    let (respond_to, response_rx) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::Query(SubagentQueryRequest {
+            subagent_id: "stalled-timeout".to_owned(),
+            parent_session_id: None,
+            block: true,
+            timeout_ms: Some(1_000),
+            respond_to,
+        }))
+        .unwrap();
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_millis(1_500), response_rx)
+        .await
+        .expect("deadline response must not depend on live progress")
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.is_running());
+
+    let _ = harness.finish.send(());
+    assert!(spawn.await.unwrap().unwrap().success);
+    harness.actor.abort();
+}
+
+#[test]
+fn queued_queries_with_dropped_receivers_register_no_work() {
+    let (_command_tx, command_rx) = mpsc::unbounded_channel();
+    let (start, _) = tokio::sync::broadcast::channel(1);
+    let (finish, _) = tokio::sync::broadcast::channel(1);
+    let (completion_tx, _completions) = mpsc::unbounded_channel();
+    let (request_tx, _requests) = mpsc::unbounded_channel();
+    let (started_tx, _started) = mpsc::unbounded_channel();
+    let (queue_wait_tx, _queue_waits) = mpsc::unbounded_channel();
+    let progress_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut coordinator = SubagentCoordinator::new(
+        command_rx,
+        TestRunner {
+            wait_before_start: false,
+            wait_after_cancel: false,
+            stall_progress: false,
+            start,
+            finish,
+            completions: completion_tx,
+            requests: request_tx,
+            started: started_tx,
+            progress_calls: progress_calls.clone(),
+            queue_waits: queue_wait_tx,
+        },
+        CoordinatorConfig::default(),
+    );
+
+    let cancellation = CancellationToken::new();
+    coordinator.active.insert(
+        "abandoned".to_owned(),
+        ActiveChild {
+            request: request("abandoned", true),
+            started_at: std::time::Instant::now(),
+            cancellation: cancellation.clone(),
+            spawn_reply: None,
+            foreground_deadline: None,
+            handle_only: true,
+            definition_background: false,
+            explicitly_killed: false,
+            child_session_id: "abandoned".to_owned(),
+            persona: None,
+            resumed_from: None,
+            child_cwd: String::new(),
+            worktree_path: None,
+            effective_model_id: "test".to_owned(),
+            control: TestControl {
+                cancellation,
+                stall_progress: false,
+                progress_calls: progress_calls.clone(),
+            },
+        },
+    );
+
+    let (respond_to, response_rx) = oneshot::channel();
+    drop(response_rx);
+    coordinator.handle_query("abandoned".to_owned(), None, false, None, respond_to);
+    assert_eq!(
+        progress_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an abandoned nonblocking query must not invoke child progress"
+    );
+    assert!(coordinator.progress.is_empty());
+
+    let (respond_to, response_rx) = oneshot::channel();
+    drop(response_rx);
+    coordinator.handle_query("abandoned".to_owned(), None, true, Some(30_000), respond_to);
+    assert!(
+        coordinator.waiters.is_empty(),
+        "an abandoned blocking query must not leave a dead waiter"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn completion_wins_over_an_in_flight_stalled_progress_query() {
+    let mut harness = harness_with_stalled_progress();
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(request("stalled-progress", true)).await }
+    });
+    harness.started.recv().await.unwrap();
+
+    let (respond_to, response_rx) = oneshot::channel();
+    harness
+        .backend
+        .sender()
+        .send(SubagentEvent::Query(SubagentQueryRequest {
+            subagent_id: "stalled-progress".to_owned(),
+            parent_session_id: None,
+            block: false,
+            timeout_ms: None,
+            respond_to,
+        }))
+        .unwrap();
+    tokio::task::yield_now().await;
+
+    let _ = harness.finish.send(());
+    let _ = harness.completions.recv().await.unwrap();
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_millis(1_500), response_rx)
+        .await
+        .expect("bounded progress request must resolve after completion")
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.status.is_terminal());
     assert!(spawn.await.unwrap().unwrap().success);
     harness.actor.abort();
 }
@@ -661,6 +833,7 @@ async fn workflow_cancel_waits_for_drain_and_hides_owned_children() {
     let mut harness = harness_with_options(
         true,
         true,
+        false,
         CoordinatorConfig {
             buffer_completions: true,
             ..CoordinatorConfig::default()
@@ -851,7 +1024,7 @@ async fn teardown_holds_admission_until_children_drain_then_reopens() {
     // the delete-path hold stays live across the whole flow: a mid-drain spawn
     // is refused, OpenSpawnAdmission cannot reopen it, and once the child
     // finishes the ack resolves and a later spawn is admitted again.
-    let mut harness = harness_with_options(true, true, CoordinatorConfig::default());
+    let mut harness = harness_with_options(true, true, false, CoordinatorConfig::default());
     let child = spawn_session_child(&mut harness, "slow", "parent").await;
     let _ = harness.start.send(());
     assert_eq!(harness.started.recv().await.as_deref(), Some("slow"));
@@ -934,7 +1107,7 @@ async fn teardown_holds_admission_until_children_drain_then_reopens() {
 async fn teardown_drain_deadline_reopens_spawns() {
     // A cancelled child that never finishes must not block spawns for the
     // process lifetime: the coordinator's backstop deadline force-reopens.
-    let mut harness = harness_with_options(true, true, CoordinatorConfig::default());
+    let mut harness = harness_with_options(true, true, false, CoordinatorConfig::default());
     let child = spawn_session_child(&mut harness, "stuck", "parent").await;
     let _ = harness.start.send(());
     assert_eq!(harness.started.recv().await.as_deref(), Some("stuck"));
@@ -1051,7 +1224,7 @@ async fn teardown_cancels_background_child_without_rebuffering() {
 async fn teardown_rejects_spawn_from_cancelled_parent() {
     // wait_after_cancel keeps the cancelled parent in `active`, so its late
     // nested Spawn still finds it.
-    let mut harness = harness_with_options(true, true, CoordinatorConfig::default());
+    let mut harness = harness_with_options(true, true, false, CoordinatorConfig::default());
 
     // A parent subagent whose child_session_id is "A".
     let parent = spawn_session_child(&mut harness, "A", "parent").await;

@@ -5,11 +5,17 @@
 
 pub mod terminal_command;
 pub mod wait_tasks;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 pub use terminal_command::GetTerminalCommandOutputTool;
 pub use wait_tasks::WaitTasksTool;
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::DEFAULT_TOOL_OUTPUT_BYTES;
+use crate::computer::types::TaskSnapshot;
 use crate::implementations::BashTool;
 use crate::implementations::grok_build::task::TaskTool;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
@@ -50,7 +56,7 @@ pub(crate) fn capped_wait_timeout(timeout_ms: Option<u64>, cap: Duration) -> Dur
 }
 
 /// The caller's requested wait before capping, or the default when omitted.
-fn requested_wait_timeout(timeout_ms: Option<u64>) -> Duration {
+pub(crate) fn requested_wait_timeout(timeout_ms: Option<u64>) -> Duration {
     timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_WAIT_TIMEOUT)
@@ -67,7 +73,7 @@ pub(crate) enum WaitHint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WaitSubject {
+enum WaitSubject {
     Task,
     Subagent,
 }
@@ -75,8 +81,8 @@ pub(crate) enum WaitSubject {
 impl WaitSubject {
     fn noun(self) -> &'static str {
         match self {
-            WaitSubject::Task => "task",
-            WaitSubject::Subagent => "subagent",
+            Self::Task => "task",
+            Self::Subagent => "subagent",
         }
     }
 }
@@ -104,12 +110,12 @@ fn still_running_wait_hint(hint: WaitHint, subject: WaitSubject) -> String {
     format!("{lead} You will be notified automatically when the {noun} completes.")
 }
 
-fn format_waited_duration(d: Duration) -> String {
-    let ms = d.as_millis();
-    if ms < 1000 {
-        format!("{ms}ms")
+fn format_waited_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
     } else {
-        format!("{}s", ms / 1000)
+        format!("{}s", millis / 1000)
     }
 }
 
@@ -122,11 +128,29 @@ fn apply_running_wait_hint(
     hint: WaitHint,
     subject: WaitSubject,
 ) -> TaskOutputResult {
-    if result.status == "running" {
+    if result.status == "running" || result.status == "initializing" {
         result.output =
             with_still_running_wait_hint(std::mem::take(&mut result.output), hint, subject);
     }
     result
+}
+
+pub(crate) fn completed_wait_hint(
+    deadline: tokio::time::Instant,
+    requested: Duration,
+    waited: Duration,
+) -> WaitHint {
+    if tokio::time::Instant::now() >= deadline {
+        WaitHint::Elapsed { requested, waited }
+    } else {
+        WaitHint::ReturnedEarly
+    }
+}
+
+fn duration_millis_ceil(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    let rounded = millis + u128::from(duration.subsec_nanos() % 1_000_000 != 0);
+    rounded.clamp(1, u128::from(u64::MAX)) as u64
 }
 
 pub(crate) fn background_bash_requires_exprs() -> Vec<Expr<ToolRequirement>> {
@@ -188,42 +212,30 @@ impl TaskOutputTool {
             .get::<xai_tool_runtime::BehaviorVersion>()
             .map(|v| v.0.clone());
         let is_legacy = crate::versions::is_legacy_contract(contract_version.as_deref());
-        let terminal;
-        {
-            terminal = resources.lock().await.require::<Terminal>()?.0.clone();
-        }
-
         let waits = xai_tool_types::task_output_waits(timeout_ms);
-        let wait_cap = max_wait_block();
+
+        let requested = requested_wait_timeout(timeout_ms);
+        let timeout = capped_wait_timeout(timeout_ms, max_wait_block());
+        let deadline = waits.then(|| tokio::time::Instant::now() + timeout);
         let wait_hint = if waits {
             WaitHint::Elapsed {
-                requested: requested_wait_timeout(timeout_ms),
-                waited: capped_wait_timeout(timeout_ms, wait_cap),
+                requested,
+                waited: timeout,
             }
         } else {
             WaitHint::NotRequested
         };
-        let snapshot = if waits {
-            // Cap the blocking wait so a large `timeout_ms` can't wedge the turn;
-            // the model is pinged on completion regardless (see `capped_wait_timeout`).
-            let timeout = capped_wait_timeout(timeout_ms, wait_cap);
-            terminal.wait_for_completion(task_id, Some(timeout)).await
-        } else {
-            terminal.get_task(task_id).await
-        };
 
-        if let Some(snapshot) = snapshot {
-            let read_file_name;
-            {
-                let res = resources.lock().await;
-                let renderer = res.require::<TemplateRenderer>()?;
-                read_file_name = renderer
-                    .render("${{ tools.by_kind.read }}")
-                    .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
-            }
+        let (terminal, backend, read_file_name, max_output_bytes) = {
+            let resources = resources.lock().await;
+            let terminal = resources.require::<Terminal>()?.0.clone();
+            let backend = resources.get::<SubagentBackendResource>().cloned();
+            let renderer = resources.require::<TemplateRenderer>()?;
+            let read_file_name = renderer
+                .render("${{ tools.by_kind.read }}")
+                .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
+
             let max_output_bytes = resources
-                .lock()
-                .await
                 .get::<TruncationCfg>()
                 .map(|cfg| {
                     cfg.0.max_output_bytes_for(
@@ -232,6 +244,46 @@ impl TaskOutputTool {
                     )
                 })
                 .unwrap_or(DEFAULT_TOOL_OUTPUT_BYTES);
+            (terminal, backend, read_file_name, max_output_bytes)
+        };
+
+        // First identify terminal tasks with a snapshot. This prevents a
+        // positive single-ID wait from spending its full budget on the
+        // terminal and then spending it again on the subagent coordinator.
+        let initial_terminal = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, terminal.get_task(task_id)).await {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    return Ok(task_not_found_output(task_id, is_legacy, None));
+                }
+            }
+        } else {
+            terminal.get_task(task_id).await
+        };
+
+        if let Some(initial) = initial_terminal {
+            let snapshot = if let Some(deadline) = deadline
+                && !initial.completed
+            {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    initial
+                } else {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        terminal.wait_for_completion(task_id, Some(remaining)),
+                    )
+                    .await
+                    {
+                        Ok(Some(snapshot)) => snapshot,
+                        // The initial running snapshot remains authoritative if
+                        // the terminal waiter is cancelled or misses the bound.
+                        Ok(None) | Err(_) => initial,
+                    }
+                }
+            } else {
+                initial
+            };
             return Ok(TaskOutputOutput::Result(apply_running_wait_hint(
                 snapshot_to_result(snapshot, &read_file_name, max_output_bytes),
                 wait_hint,
@@ -239,49 +291,47 @@ impl TaskOutputTool {
             )));
         }
 
-        let backend = {
-            resources
-                .lock()
-                .await
-                .get::<SubagentBackendResource>()
-                .cloned()
-        };
-        // Same cap as the bash path: a blocking subagent query can't wedge the
-        // turn beyond the wait cap (the parent is pinged when the child finishes).
-        let query_timeout_ms = if waits {
-            Some(capped_wait_timeout(timeout_ms, wait_cap).as_millis() as u64)
+        let subagent_snapshot = if let Some(backend) = backend {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    None
+                } else {
+                    let timeout_ms = duration_millis_ceil(remaining);
+                    tokio::time::timeout_at(
+                        deadline,
+                        backend.backend().query(task_id, true, Some(timeout_ms)),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                }
+            } else {
+                backend.backend().query(task_id, false, timeout_ms).await
+            }
         } else {
-            timeout_ms
+            None
         };
-        if let Some(backend) = backend
-            && let Some(snapshot) = backend
-                .backend()
-                .query(task_id, waits, query_timeout_ms)
-                .await
-        {
+        if let Some(snapshot) = subagent_snapshot {
             return Ok(format_subagent_snapshot(&snapshot, wait_hint));
         }
 
-        // Neither found
-        {
-            let msg = if is_legacy {
-                render_legacy_task_output_not_found(task_id)
+        // Preserve discoverability when there is still budget, but never start
+        // list I/O after a positive wait's hard boundary.
+        let known = if is_legacy {
+            None
+        } else if let Some(deadline) = deadline {
+            if tokio::time::Instant::now() >= deadline {
+                None
             } else {
-                let known = terminal.list_tasks().await;
-                if known.is_empty() {
-                    format!(
-                        "Task {task_id} not found. No background tasks or subagents exist in this session.",
-                    )
-                } else {
-                    let ids: Vec<&str> = known.iter().map(|t| t.task_id.as_str()).collect();
-                    format!(
-                        "Task {task_id} not found. Known task IDs: [{}]",
-                        ids.join(", ")
-                    )
-                }
-            };
-            Ok(TaskOutputOutput::TaskNotFound(msg))
-        }
+                tokio::time::timeout_at(deadline, terminal.list_tasks())
+                    .await
+                    .ok()
+            }
+        } else {
+            Some(terminal.list_tasks().await)
+        };
+        Ok(task_not_found_output(task_id, is_legacy, known.as_deref()))
     }
 
     pub(crate) async fn run_multi_tasks(
@@ -312,39 +362,44 @@ impl TaskOutputTool {
             (terminal, backend, rfn, mob)
         };
 
-        let initial = resolve_tasks(
+        // A positive timeout is the budget for the whole multi-wait, including
+        // the initial coordinator snapshots. Do not let transport timeouts
+        // extend the model-supplied wait duration.
+        let deadline = waits.then(|| tokio::time::Instant::now() + timeout);
+        let initial = resolve_tasks_until(
             task_ids,
             &terminal,
             &backend,
             &read_file_name,
             max_output_bytes,
-            WaitHint::NotRequested,
+            deadline,
         )
         .await;
 
         let results = if waits
             && (!initial.pending_bash_ids.is_empty() || !initial.pending_subagent_ids.is_empty())
         {
-            let deadline = tokio::time::Instant::now() + timeout;
-            let wait_hint = wait_all_event_driven(
+            let waited = wait_all_event_driven(
                 &terminal,
                 &backend,
                 &initial.pending_bash_ids,
                 &initial.pending_subagent_ids,
-                deadline,
+                deadline.expect("blocking multi-wait has a deadline"),
             )
-            .await
-            .hint(requested, timeout);
-            resolve_tasks(
+            .await;
+            let wait_hint = completed_wait_hint(
+                deadline.expect("blocking multi-wait has a deadline"),
+                requested,
+                timeout,
+            );
+            render_waited_results(
                 task_ids,
-                &terminal,
-                &backend,
                 &read_file_name,
                 max_output_bytes,
+                initial.results,
+                &waited,
                 wait_hint,
             )
-            .await
-            .results
         } else {
             initial.results
         };
@@ -397,46 +452,60 @@ pub(crate) struct ResolveResult {
     pub(crate) pending_subagent_ids: Vec<String>,
 }
 
-pub(crate) async fn resolve_tasks(
+enum PendingTaskKind {
+    Bash,
+    Subagent,
+}
+
+struct ResolvedTask {
+    result: TaskOutputResult,
+    pending: Option<PendingTaskKind>,
+}
+
+type TaskResolutionFuture = Pin<Box<dyn Future<Output = (usize, ResolvedTask)> + Send + 'static>>;
+
+fn task_resolution_futures(
     task_ids: &[String],
     terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
     backend: &Option<SubagentBackendResource>,
     read_file_name: &str,
     max_output_bytes: usize,
-    wait_hint: WaitHint,
+) -> FuturesUnordered<TaskResolutionFuture> {
+    let resolutions: FuturesUnordered<TaskResolutionFuture> = FuturesUnordered::new();
+    for (index, id) in task_ids.iter().enumerate() {
+        let id = id.clone();
+        let terminal = terminal.clone();
+        let backend = backend.clone();
+        let read_file_name = read_file_name.to_owned();
+        resolutions.push(Box::pin(async move {
+            let resolved =
+                resolve_task(&id, &terminal, &backend, &read_file_name, max_output_bytes).await;
+            (index, resolved)
+        }));
+    }
+    resolutions
+}
+
+fn ordered_resolve_result(
+    task_ids: &[String],
+    resolved: Vec<Option<ResolvedTask>>,
 ) -> ResolveResult {
-    let mut results = Vec::with_capacity(task_ids.len());
+    debug_assert_eq!(task_ids.len(), resolved.len());
+    let mut results = Vec::with_capacity(resolved.len());
     let mut pending_bash_ids = Vec::new();
     let mut pending_subagent_ids = Vec::new();
 
-    for id in task_ids {
-        if let Some(snap) = terminal.get_task(id).await {
-            let is_pending = !snap.completed;
-            results.push(apply_running_wait_hint(
-                snapshot_to_result(snap, read_file_name, max_output_bytes),
-                wait_hint,
-                WaitSubject::Task,
-            ));
-            if is_pending {
-                pending_bash_ids.push(id.clone());
-            }
-            continue;
+    for (id, resolved) in task_ids.iter().zip(resolved) {
+        let resolved = resolved.unwrap_or_else(|| ResolvedTask {
+            result: not_found_result(id),
+            pending: None,
+        });
+        match resolved.pending {
+            Some(PendingTaskKind::Bash) => pending_bash_ids.push(id.clone()),
+            Some(PendingTaskKind::Subagent) => pending_subagent_ids.push(id.clone()),
+            None => {}
         }
-
-        if let Some(be) = backend
-            && let Some(snap) = be.backend().query(id, false, None).await
-        {
-            let is_terminal = snap.status.is_terminal();
-            if let TaskOutputOutput::Result(r) = format_subagent_snapshot(&snap, wait_hint) {
-                if !is_terminal {
-                    pending_subagent_ids.push(id.clone());
-                }
-                results.push(r);
-                continue;
-            }
-        }
-
-        results.push(not_found_result(id));
+        results.push(resolved.result);
     }
 
     ResolveResult {
@@ -445,56 +514,219 @@ pub(crate) async fn resolve_tasks(
         pending_subagent_ids,
     }
 }
+
+/// Resolve independent IDs concurrently while retaining the caller's order.
+///
+/// `deadline` is supplied by blocking multi-waits so the initial snapshot
+/// phase consumes the same absolute budget as the wait itself. A stalled
+/// terminal or coordinator query degrades that ID to `not_found` at the
+/// boundary instead of extending the call.
+pub(crate) async fn resolve_tasks_until(
+    task_ids: &[String],
+    terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
+    backend: &Option<SubagentBackendResource>,
+    read_file_name: &str,
+    max_output_bytes: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> ResolveResult {
+    let resolved = futures_util::future::join_all(task_ids.iter().map(|id| async move {
+        let resolution = resolve_task(id, terminal, backend, read_file_name, max_output_bytes);
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, resolution)
+                .await
+                .unwrap_or_else(|_| ResolvedTask {
+                    result: not_found_result(id),
+                    pending: None,
+                })
+        } else {
+            resolution.await
+        }
+    }))
+    .await;
+
+    ordered_resolve_result(task_ids, resolved.into_iter().map(Some).collect())
+}
+
+/// Resolve initial wait-any snapshots until one is terminal.
+///
+/// Unlike [`resolve_tasks_until`], this does not wait for every initial lookup
+/// after one ID has already satisfied wait-any. Each probe owns its inputs, so
+/// dropping `resolutions` synchronously cancels every unresolved terminal or
+/// coordinator lookup. Completed rows retain caller order; unresolved rows use
+/// the normal not-found representation.
+pub(crate) async fn resolve_tasks_until_any_terminal(
+    task_ids: &[String],
+    terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
+    backend: &Option<SubagentBackendResource>,
+    read_file_name: &str,
+    max_output_bytes: usize,
+    deadline: tokio::time::Instant,
+) -> ResolveResult {
+    let mut resolutions = task_resolution_futures(
+        task_ids,
+        terminal,
+        backend,
+        read_file_name,
+        max_output_bytes,
+    );
+    let mut resolved: Vec<Option<ResolvedTask>> = std::iter::repeat_with(|| None)
+        .take(task_ids.len())
+        .collect();
+
+    while !resolutions.is_empty() {
+        tokio::select! {
+            biased;
+            resolution = resolutions.next() => {
+                let Some((index, resolution)) = resolution else {
+                    break;
+                };
+                let is_terminal = is_terminal_status(&resolution.result.status);
+                resolved[index] = Some(resolution);
+                if is_terminal {
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    // Do not leave a stalled initial lookup alive after wait-any has already
+    // been satisfied or its deadline has elapsed.
+    drop(resolutions);
+    ordered_resolve_result(task_ids, resolved)
+}
+
+async fn resolve_task(
+    id: &str,
+    terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
+    backend: &Option<SubagentBackendResource>,
+    read_file_name: &str,
+    max_output_bytes: usize,
+) -> ResolvedTask {
+    if let Some(snapshot) = terminal.get_task(id).await {
+        let pending = (!snapshot.completed).then_some(PendingTaskKind::Bash);
+        return ResolvedTask {
+            result: snapshot_to_result(snapshot, read_file_name, max_output_bytes),
+            pending,
+        };
+    }
+
+    if let Some(backend) = backend
+        && let Some(snapshot) = backend.backend().query(id, false, None).await
+    {
+        let pending = (!snapshot.status.is_terminal()).then_some(PendingTaskKind::Subagent);
+        if let TaskOutputOutput::Result(result) =
+            format_subagent_snapshot(&snapshot, WaitHint::NotRequested)
+        {
+            return ResolvedTask { result, pending };
+        }
+    }
+
+    ResolvedTask {
+        result: not_found_result(id),
+        pending: None,
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct WaitedTaskSnapshots {
+    bash: HashMap<String, TaskSnapshot>,
+    subagents: HashMap<String, SubagentSnapshot>,
+}
+
+/// Overlay snapshots returned by the blocking wait on the initial ordered
+/// rendering. If a helper did not respond by the deadline, keep the initial
+/// running snapshot rather than starting a fresh query after the boundary.
+pub(crate) fn render_waited_results(
+    task_ids: &[String],
+    read_file_name: &str,
+    max_output_bytes: usize,
+    initial_results: Vec<TaskOutputResult>,
+    waited: &WaitedTaskSnapshots,
+    wait_hint: WaitHint,
+) -> Vec<TaskOutputResult> {
+    debug_assert_eq!(task_ids.len(), initial_results.len());
+    task_ids
+        .iter()
+        .zip(initial_results)
+        .map(|(id, initial)| {
+            if let Some(snapshot) = waited.bash.get(id) {
+                return apply_running_wait_hint(
+                    snapshot_to_result(snapshot.clone(), read_file_name, max_output_bytes),
+                    wait_hint,
+                    WaitSubject::Task,
+                );
+            }
+            if let Some(snapshot) = waited
+                .subagents
+                .get(id)
+                .filter(|snapshot| snapshot.status.is_terminal())
+                && let TaskOutputOutput::Result(result) =
+                    format_subagent_snapshot(snapshot, wait_hint)
+            {
+                return result;
+            }
+            let subject = if initial.command.starts_with("[subagent:") {
+                WaitSubject::Subagent
+            } else {
+                WaitSubject::Task
+            };
+            apply_running_wait_hint(initial, wait_hint, subject)
+        })
+        .collect()
+}
 //
 // Uses `TerminalBackend::wait_for_completion` for bash tasks (event-driven via
 // the underlying `Notify`) and `SubagentQueryRequest { block: true }` for
 // subagents (blocks in the coordinator until the child session finishes).
 // No 200ms polling loop — wakeups happen on actual state transitions.
 
-/// Aborts all wrapped helper-wait tasks when dropped.
-///
-/// The per-task waits below are `tokio::spawn`ed so they can race each other,
-/// but they must not outlive the wait call itself: a detached wait left
-/// running after the caller returns (first completion, deadline) or is
-/// cancelled (turn abort dropping the tool future) becomes a zombie that
-/// consumes its task's completion later — marking the task `block_waited`
-/// and swallowing a result the model never saw, which suppresses the
-/// completion auto-wake. Aborting drops the underlying
-/// `wait_for_completion` future, whose dropped reply channel the terminal
-/// actor detects to keep `block_waited` accurate.
-struct AbortWaitsOnDrop(Vec<tokio::task::AbortHandle>);
+enum WaitOutcome {
+    Bash(String, Option<TaskSnapshot>),
+    Subagent(String, Option<SubagentSnapshot>),
+}
 
-impl Drop for AbortWaitsOnDrop {
-    fn drop(&mut self) {
-        for h in &self.0 {
-            h.abort();
+type TaskWaitFuture = Pin<Box<dyn Future<Output = WaitOutcome> + Send>>;
+
+fn task_wait_futures(
+    terminal: &std::sync::Arc<dyn crate::computer::types::TerminalBackend>,
+    backend: &Option<SubagentBackendResource>,
+    bash_ids: &[String],
+    subagent_ids: &[String],
+    remaining: Duration,
+) -> FuturesUnordered<TaskWaitFuture> {
+    let waits: FuturesUnordered<TaskWaitFuture> = FuturesUnordered::new();
+    for id in bash_ids {
+        let terminal = terminal.clone();
+        let id = id.clone();
+        waits.push(Box::pin(async move {
+            let snapshot = terminal.wait_for_completion(&id, Some(remaining)).await;
+            WaitOutcome::Bash(id, snapshot)
+        }));
+    }
+    if let Some(backend) = backend {
+        for id in subagent_ids {
+            let backend = backend.clone();
+            let id = id.clone();
+            let timeout_ms = duration_millis_ceil(remaining);
+            waits.push(Box::pin(async move {
+                let snapshot = backend.backend().query(&id, true, Some(timeout_ms)).await;
+                WaitOutcome::Subagent(id, snapshot)
+            }));
         }
     }
+    waits
 }
 
-/// Whether a multi-task wait returned because the deadline was hit or because
-/// the wait condition (any/all) completed first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WaitOutcome {
-    DeadlineElapsed,
-    CompletedEarly,
-}
-
-impl WaitOutcome {
-    pub(crate) fn hint(self, requested: Duration, waited: Duration) -> WaitHint {
-        match self {
-            WaitOutcome::DeadlineElapsed => WaitHint::Elapsed { requested, waited },
-            WaitOutcome::CompletedEarly => WaitHint::ReturnedEarly,
+fn record_wait_outcome(snapshots: &mut WaitedTaskSnapshots, outcome: WaitOutcome) {
+    match outcome {
+        WaitOutcome::Bash(id, Some(snapshot)) => {
+            snapshots.bash.insert(id, snapshot);
         }
-    }
-}
-
-fn finalize_wait_outcome(outcome: WaitOutcome, deadline: tokio::time::Instant) -> WaitOutcome {
-    // select! is non-deterministic when both arms are ready at the deadline.
-    if tokio::time::Instant::now() >= deadline {
-        WaitOutcome::DeadlineElapsed
-    } else {
-        outcome
+        WaitOutcome::Subagent(id, Some(snapshot)) => {
+            snapshots.subagents.insert(id, snapshot);
+        }
+        WaitOutcome::Bash(_, None) | WaitOutcome::Subagent(_, None) => {}
     }
 }
 
@@ -505,59 +737,27 @@ pub(crate) async fn wait_any_event_driven(
     bash_ids: &[String],
     subagent_ids: &[String],
     deadline: tokio::time::Instant,
-) -> WaitOutcome {
+) -> WaitedTaskSnapshots {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        return WaitOutcome::DeadlineElapsed;
+        return WaitedTaskSnapshots::default();
     }
 
-    // Register waiter BEFORE spawns to avoid race: a spawned task could complete
-    // and call notify_waiters() before the Notified future exists.
-    use tokio::sync::Notify as TokioNotify;
-    let done = std::sync::Arc::new(TokioNotify::new());
-    let notified = done.notified();
-
-    let mut waits: Vec<tokio::task::AbortHandle> = Vec::new();
-
-    for id in bash_ids {
-        let terminal = terminal.clone();
-        let id = id.clone();
-        let timeout = remaining;
-        let done = done.clone();
-        waits.push(
-            tokio::spawn(async move {
-                terminal.wait_for_completion(&id, Some(timeout)).await;
-                done.notify_waiters();
-            })
-            .abort_handle(),
-        );
-    }
-
-    for id in subagent_ids {
-        if let Some(be) = backend {
-            let be = be.clone();
-            let id = id.clone();
-            let timeout_ms = remaining.as_millis() as u64;
-            let done = done.clone();
-            waits.push(
-                tokio::spawn(async move {
-                    let _ = be.backend().query(&id, true, Some(timeout_ms)).await;
-                    done.notify_waiters();
-                })
-                .abort_handle(),
-            );
+    // The owned futures are polled directly, not detached. Dropping this tool
+    // future therefore drops every terminal/coordinator reply receiver
+    // synchronously, so cancellation cannot leave zombie blocking waiters.
+    let mut waits = task_wait_futures(terminal, backend, bash_ids, subagent_ids, remaining);
+    let mut snapshots = WaitedTaskSnapshots::default();
+    tokio::select! {
+        biased;
+        outcome = waits.next(), if !waits.is_empty() => {
+            if let Some(outcome) = outcome {
+                record_wait_outcome(&mut snapshots, outcome);
+            }
         }
+        _ = tokio::time::sleep_until(deadline) => {}
     }
-
-    // Tear the helper waits down on every exit path: first completion,
-    // deadline, or cancellation of this future.
-    let _guard = AbortWaitsOnDrop(waits);
-
-    let outcome = tokio::select! {
-        _ = notified => WaitOutcome::CompletedEarly,
-        _ = tokio::time::sleep_until(deadline) => WaitOutcome::DeadlineElapsed,
-    };
-    finalize_wait_outcome(outcome, deadline)
+    snapshots
 }
 
 /// Wait until all tasks (bash and subagent) complete, or deadline is reached.
@@ -567,44 +767,29 @@ pub(crate) async fn wait_all_event_driven(
     bash_ids: &[String],
     subagent_ids: &[String],
     deadline: tokio::time::Instant,
-) -> WaitOutcome {
+) -> WaitedTaskSnapshots {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        return WaitOutcome::DeadlineElapsed;
+        return WaitedTaskSnapshots::default();
     }
 
-    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-
-    for id in bash_ids {
-        let terminal = terminal.clone();
-        let id = id.clone();
-        let timeout = remaining;
-        handles.push(tokio::spawn(async move {
-            terminal.wait_for_completion(&id, Some(timeout)).await;
-        }));
-    }
-
-    for id in subagent_ids {
-        if let Some(be) = backend {
-            let be = be.clone();
-            let id = id.clone();
-            let timeout_ms = remaining.as_millis() as u64;
-            handles.push(tokio::spawn(async move {
-                let _ = be.backend().query(&id, true, Some(timeout_ms)).await;
-            }));
+    // As in wait-any, ownership stays in this future so every cancellation
+    // path synchronously closes outstanding reply receivers.
+    let mut waits = task_wait_futures(terminal, backend, bash_ids, subagent_ids, remaining);
+    let mut snapshots = WaitedTaskSnapshots::default();
+    while !waits.is_empty() {
+        tokio::select! {
+            biased;
+            outcome = waits.next() => {
+                let Some(outcome) = outcome else {
+                    break;
+                };
+                record_wait_outcome(&mut snapshots, outcome);
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
         }
     }
-
-    // Tear the helper waits down on every exit path: all complete, deadline,
-    // or cancellation of this future (see `AbortWaitsOnDrop`).
-    let _guard = AbortWaitsOnDrop(handles.iter().map(|h| h.abort_handle()).collect());
-
-    let all_fut = futures_util::future::join_all(handles);
-    let outcome = tokio::select! {
-        _ = all_fut => WaitOutcome::CompletedEarly,
-        _ = tokio::time::sleep_until(deadline) => WaitOutcome::DeadlineElapsed,
-    };
-    finalize_wait_outcome(outcome, deadline)
+    snapshots
 }
 
 //
@@ -621,12 +806,36 @@ fn render_legacy_task_output_not_found(task_id: &str) -> String {
     format!("Task {} not found", task_id)
 }
 
+fn task_not_found_output(
+    task_id: &str,
+    is_legacy: bool,
+    known_terminal_tasks: Option<&[TaskSnapshot]>,
+) -> TaskOutputOutput {
+    let message = if is_legacy {
+        render_legacy_task_output_not_found(task_id)
+    } else if let Some(known) = known_terminal_tasks {
+        if known.is_empty() {
+            format!(
+                "Task {task_id} not found. No background tasks or subagents exist in this session.",
+            )
+        } else {
+            let ids: Vec<&str> = known.iter().map(|task| task.task_id.as_str()).collect();
+            format!(
+                "Task {task_id} not found. Known task IDs: [{}]",
+                ids.join(", ")
+            )
+        }
+    } else {
+        format!("Task {task_id} was not resolved before the wait deadline.")
+    };
+    TaskOutputOutput::TaskNotFound(message)
+}
+
 fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> TaskOutputOutput {
     let started = format_epoch_ms_as_rfc3339(snap.started_at_epoch_ms);
     match &snap.status {
         SubagentSnapshotStatus::Initializing => {
             let duration_secs = snap.duration_ms as f64 / 1000.0;
-            // Measure body only — wait-hint is harness advisory, not task output.
             let body = format!(
                 "Subagent is initializing (creating worktree, resolving config).\n\
                  Type: {}\n\
@@ -667,7 +876,6 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
             };
             let tokens_k = tokens_used / 1000;
             let capacity_k = context_window_tokens / 1000;
-            // Measure body only — wait-hint is harness advisory, not task output.
             let body = format!(
                 "Subagent is still running.\n\
                  Type: {}\n\
@@ -966,17 +1174,29 @@ pub(crate) mod test_helpers {
     /// Mock backend that returns a pre-configured snapshot.
     pub(crate) struct MockTerminal {
         snapshot: Option<TaskSnapshot>,
+        stall_wait: bool,
     }
 
     impl MockTerminal {
         pub(crate) fn with_snapshot(snapshot: TaskSnapshot) -> Self {
             Self {
                 snapshot: Some(snapshot),
+                stall_wait: false,
+            }
+        }
+
+        pub(crate) fn with_stalled_wait(snapshot: TaskSnapshot) -> Self {
+            Self {
+                snapshot: Some(snapshot),
+                stall_wait: true,
             }
         }
 
         pub(crate) fn empty() -> Self {
-            Self { snapshot: None }
+            Self {
+                snapshot: None,
+                stall_wait: false,
+            }
         }
     }
 
@@ -1009,6 +1229,9 @@ pub(crate) mod test_helpers {
             _task_id: &str,
             _timeout: Option<Duration>,
         ) -> Option<TaskSnapshot> {
+            if self.stall_wait {
+                return std::future::pending().await;
+            }
             self.snapshot.clone()
         }
 
@@ -1085,10 +1308,12 @@ mod tests {
     fn capped_wait_timeout_clamps_and_defaults() {
         let cap = Duration::from_millis(xai_tool_types::MAX_WAIT_BLOCK_MS_DEFAULT);
         assert_eq!(capped_wait_timeout(None, cap), DEFAULT_WAIT_TIMEOUT);
+
         assert_eq!(
             capped_wait_timeout(Some(5_000), cap),
             Duration::from_millis(5_000)
         );
+
         assert_eq!(capped_wait_timeout(Some(36_000_000), cap), cap);
         assert_eq!(capped_wait_timeout(Some(600_000), cap), cap);
     }
@@ -1106,49 +1331,18 @@ mod tests {
     }
 
     #[test]
-    fn still_running_wait_hint_omitted_invites_timeout_ms() {
+    fn still_running_wait_hint_reports_omitted_and_clamped_waits() {
         assert_eq!(
             still_running_wait_hint(WaitHint::NotRequested, WaitSubject::Task),
             "Use timeout_ms to wait for completion. You will be notified automatically when the task completes."
         );
-        assert_eq!(
-            still_running_wait_hint(WaitHint::NotRequested, WaitSubject::Subagent),
-            "Use timeout_ms to wait for completion. You will be notified automatically when the subagent completes."
-        );
-    }
 
-    #[test]
-    fn still_running_wait_hint_within_cap_reports_auto_wake() {
-        let hint = WaitHint::Elapsed {
-            requested: Duration::from_secs(30),
-            waited: Duration::from_secs(30),
-        };
-        assert_eq!(
-            still_running_wait_hint(hint, WaitSubject::Task),
-            "Waited the requested 30s; the task is still running. \
-             You will be notified automatically when the task completes."
-        );
-        assert_eq!(
-            still_running_wait_hint(hint, WaitSubject::Subagent),
-            "Waited the requested 30s; the subagent is still running. \
-             You will be notified automatically when the subagent completes."
-        );
-    }
-
-    #[test]
-    fn still_running_wait_hint_clamped_reports_cap_and_auto_wake() {
-        let hint = WaitHint::Elapsed {
+        let clamped = WaitHint::Elapsed {
             requested: Duration::from_secs(2_400),
             waited: Duration::from_secs(600),
         };
         assert_eq!(
-            still_running_wait_hint(hint, WaitSubject::Task),
-            "Waited 600s, the per-call maximum, of the 2400s you requested; \
-             the task is still running. You do not need to call this again. \
-             You will be notified automatically when the task completes."
-        );
-        assert_eq!(
-            still_running_wait_hint(hint, WaitSubject::Subagent),
+            still_running_wait_hint(clamped, WaitSubject::Subagent),
             "Waited 600s, the per-call maximum, of the 2400s you requested; \
              the subagent is still running. You do not need to call this again. \
              You will be notified automatically when the subagent completes."
@@ -1156,16 +1350,11 @@ mod tests {
     }
 
     #[test]
-    fn still_running_wait_hint_returned_early_is_honest() {
+    fn still_running_wait_hint_reports_early_return_honestly() {
         assert_eq!(
             still_running_wait_hint(WaitHint::ReturnedEarly, WaitSubject::Task),
             "Wait returned early because another finished; this task is still running. \
              You will be notified automatically when the task completes."
-        );
-        assert_eq!(
-            still_running_wait_hint(WaitHint::ReturnedEarly, WaitSubject::Subagent),
-            "Wait returned early because another finished; this subagent is still running. \
-             You will be notified automatically when the subagent completes."
         );
     }
 
@@ -2153,65 +2342,6 @@ mod tests {
         }
     }
 
-    // raw_output_bytes is body-only so identical Running state is stable across WaitHints.
-    #[test]
-    fn format_running_subagent_raw_output_bytes_stable_across_wait_hints() {
-        let snap = SubagentSnapshot {
-            subagent_id: "sub-stable".to_string(),
-            description: "stable body".to_string(),
-            subagent_type: "explore".to_string(),
-            persona: None,
-            status: SubagentSnapshotStatus::Running {
-                turn_count: 1,
-                tool_call_count: 2,
-                tokens_used: 3_000,
-                context_window_tokens: 128_000,
-                context_usage_pct: 2,
-                tools_used: vec!["bash".to_string()],
-                error_count: 0,
-            },
-            started_at_epoch_ms: 1_700_000_000_000,
-            duration_ms: 1_000,
-        };
-        let expected_body = format!(
-            "Subagent is still running.\n\
-             Type: {}\n\
-             Description: {}\n\
-             Elapsed: {:.1}s\n\
-             Progress: turn 1, 2 tool calls, \
-             3K/128K tokens (2% context)\n\
-             Tools used: bash\n\
-             Errors: 0",
-            snap.subagent_type,
-            snap.description,
-            snap.duration_ms as f64 / 1000.0,
-        );
-        let not_requested = match format_subagent_snapshot(&snap, WaitHint::NotRequested) {
-            TaskOutputOutput::Result(r) => r,
-            other => panic!("Expected Result, got {:?}", other),
-        };
-        let clamped = match format_subagent_snapshot(
-            &snap,
-            WaitHint::Elapsed {
-                requested: Duration::from_secs(2_400),
-                waited: Duration::from_secs(600),
-            },
-        ) {
-            TaskOutputOutput::Result(r) => r,
-            other => panic!("Expected Result, got {:?}", other),
-        };
-        assert_eq!(not_requested.raw_output_bytes, expected_body.len());
-        assert_eq!(clamped.raw_output_bytes, expected_body.len());
-        assert_eq!(not_requested.raw_output_bytes, clamped.raw_output_bytes);
-        assert!(not_requested.output.starts_with(&expected_body));
-        assert!(clamped.output.starts_with(&expected_body));
-        assert_ne!(
-            not_requested.output.len(),
-            clamped.output.len(),
-            "hint variants must still produce different formatted output"
-        );
-    }
-
     #[test]
     fn format_running_subagent_with_no_tools_shows_none_yet() {
         let snap = SubagentSnapshot {
@@ -2354,6 +2484,26 @@ mod tests {
         }
     }
 
+    fn running_subagent_snapshot(id: &str) -> SubagentSnapshot {
+        SubagentSnapshot {
+            subagent_id: id.to_owned(),
+            description: "working".to_owned(),
+            subagent_type: "explore".to_owned(),
+            status: SubagentSnapshotStatus::Running {
+                turn_count: 1,
+                tool_call_count: 1,
+                tokens_used: 10,
+                context_window_tokens: 1_000,
+                context_usage_pct: 1,
+                tools_used: Vec::new(),
+                error_count: 0,
+            },
+            started_at_epoch_ms: 1,
+            duration_ms: 10,
+            persona: None,
+        }
+    }
+
     #[tokio::test]
     async fn get_task_subagent_completed() {
         let (resources, mut query_rx) = resources_with_backend_query();
@@ -2452,6 +2602,586 @@ mod tests {
             }
             other => panic!("Expected Result(running), got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn multi_wait_uses_blocking_subagent_results_without_requerying() {
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let shared = resources.into_shared();
+        let (tool_done_tx, tool_done_rx) = tokio::sync::oneshot::channel();
+
+        let handler = tokio::spawn(async move {
+            let mut initial_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let req = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(!req.block);
+                assert!(initial_ids.remove(req.subagent_id.as_str()));
+                let id = req.subagent_id.clone();
+                req.respond_to
+                    .send(Some(running_subagent_snapshot(&id)))
+                    .unwrap();
+            }
+            let mut waiting_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let req = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(req.block);
+                assert!(waiting_ids.remove(req.subagent_id.as_str()));
+                let id = req.subagent_id.clone();
+                req.respond_to
+                    .send(Some(SubagentSnapshot {
+                        subagent_id: id.clone(),
+                        description: "working".to_owned(),
+                        subagent_type: "explore".to_owned(),
+                        status: SubagentSnapshotStatus::Completed {
+                            output: format!("{id} done"),
+                            tool_calls: 2,
+                            turns: 1,
+                            worktree_path: None,
+                        },
+                        started_at_epoch_ms: 1,
+                        duration_ms: 20,
+                        persona: None,
+                    }))
+                    .unwrap();
+            }
+            tool_done_rx.await.unwrap();
+            assert!(
+                query_rx.try_recv().is_err(),
+                "final rendering must use the authoritative blocking responses"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            xai_tool_runtime::Tool::run(
+                &TaskOutputTool,
+                test_ctx(shared),
+                TaskOutputToolInput {
+                    task_ids: vec!["sub-a".into(), "sub-b".into()],
+                    timeout_ms: Some(5_000),
+                },
+            ),
+        )
+        .await
+        .expect("completed blocking responses should render without another query")
+        .unwrap();
+        tool_done_tx.send(()).unwrap();
+        handler.await.unwrap();
+
+        let TaskOutputOutput::MultiResult(result) = result else {
+            panic!("expected multi-task result");
+        };
+        assert!(result.results.iter().all(|item| item.status == "completed"));
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|item| item.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sub-a", "sub-b"],
+            "concurrent resolution must retain caller order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_poll_stalled_coordinator_queries_run_concurrently() {
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let started = tokio::time::Instant::now();
+        let task_ids = vec!["sub-c".into(), "sub-a".into(), "sub-b".into()];
+
+        // Keep the queued query events (and therefore their reply senders)
+        // alive without servicing them. Every query must share the same 2s
+        // backend timeout rather than paying it sequentially.
+        let result = xai_tool_runtime::Tool::run(
+            &TaskOutputTool,
+            test_ctx(resources.into_shared()),
+            TaskOutputToolInput {
+                task_ids: task_ids.clone(),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_secs(2),
+            "all stalled coordinator snapshots should time out in parallel"
+        );
+        let queried_ids = (0..task_ids.len())
+            .map(|_| {
+                let request = unwrap_query(query_rx.try_recv().expect("query should be queued"));
+                assert!(!request.block);
+                request.subagent_id
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            queried_ids,
+            task_ids.iter().cloned().collect(),
+            "every ID should be queried"
+        );
+
+        let TaskOutputOutput::MultiResult(result) = result else {
+            panic!("expected multi-task result");
+        };
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|item| item.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sub-c", "sub-a", "sub-b"],
+            "result order must match input order"
+        );
+        assert!(result.results.iter().all(|item| item.status == "not_found"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_wait_deadline_keeps_initial_snapshots_without_requerying() {
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let (blocking_ready_tx, blocking_ready_rx) = tokio::sync::oneshot::channel();
+        let (tool_done_tx, tool_done_rx) = tokio::sync::oneshot::channel();
+
+        let handler = tokio::spawn(async move {
+            let mut initial_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let request = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(!request.block);
+                assert!(initial_ids.remove(request.subagent_id.as_str()));
+                let id = request.subagent_id.clone();
+                request
+                    .respond_to
+                    .send(Some(running_subagent_snapshot(&id)))
+                    .unwrap();
+            }
+
+            // Hold both blocking responses past the model-facing deadline.
+            let mut held_requests = Vec::new();
+            let mut blocking_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let request = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(request.block);
+                assert!(blocking_ids.remove(request.subagent_id.as_str()));
+                held_requests.push(request);
+            }
+            blocking_ready_tx.send(()).unwrap();
+
+            tool_done_rx.await.unwrap();
+            assert!(
+                query_rx.try_recv().is_err(),
+                "deadline rendering must not issue fresh coordinator queries"
+            );
+            drop(held_requests);
+        });
+
+        let started = tokio::time::Instant::now();
+        let tool = tokio::spawn(xai_tool_runtime::Tool::run(
+            &TaskOutputTool,
+            test_ctx(resources.into_shared()),
+            TaskOutputToolInput {
+                task_ids: vec!["sub-a".into(), "sub-b".into()],
+                timeout_ms: Some(100),
+            },
+        ));
+        blocking_ready_rx.await.unwrap();
+        let result = tool.await.unwrap().unwrap();
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_millis(100),
+            "the requested timeout is the absolute multi-wait boundary"
+        );
+
+        let TaskOutputOutput::MultiResult(result) = result else {
+            panic!("expected multi-task result");
+        };
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .map(|item| (item.task_id.as_str(), item.status.as_str()))
+                .collect::<Vec<_>>(),
+            [("sub-a", "running"), ("sub-b", "running")],
+            "missing deadline responses should retain the initial snapshots"
+        );
+
+        tool_done_tx.send(()).unwrap();
+        handler.await.unwrap();
+    }
+
+    #[test]
+    fn nonterminal_wait_snapshot_does_not_replace_initial_progress() {
+        let mut initial_snapshot = running_subagent_snapshot("sub-progress");
+        initial_snapshot.status = SubagentSnapshotStatus::Running {
+            turn_count: 7,
+            tool_call_count: 19,
+            tokens_used: 700,
+            context_window_tokens: 1_000,
+            context_usage_pct: 70,
+            tools_used: vec!["read_file".to_owned()],
+            error_count: 0,
+        };
+        let TaskOutputOutput::Result(initial_result) =
+            format_subagent_snapshot(&initial_snapshot, WaitHint::NotRequested)
+        else {
+            panic!("running snapshot must format as a result");
+        };
+
+        let mut waited_snapshot = running_subagent_snapshot("sub-progress");
+        waited_snapshot.status = SubagentSnapshotStatus::Running {
+            turn_count: 0,
+            tool_call_count: 0,
+            tokens_used: 0,
+            context_window_tokens: 1_000,
+            context_usage_pct: 0,
+            tools_used: Vec::new(),
+            error_count: 0,
+        };
+        let waited = WaitedTaskSnapshots {
+            bash: HashMap::new(),
+            subagents: HashMap::from([("sub-progress".to_owned(), waited_snapshot)]),
+        };
+
+        let rendered = render_waited_results(
+            &["sub-progress".to_owned()],
+            "read_file",
+            DEFAULT_TOOL_OUTPUT_BYTES,
+            vec![initial_result],
+            &waited,
+            WaitHint::NotRequested,
+        );
+        assert!(
+            rendered[0].output.contains("turn 7"),
+            "the richer initial progress must win: {}",
+            rendered[0].output
+        );
+        assert!(!rendered[0].output.contains("turn 0"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_multi_wait_closes_coordinator_receiver_synchronously() {
+        use crate::implementations::grok_build::task::backend::{
+            ChannelBackend, SubagentBackendResource,
+        };
+        use crate::implementations::grok_build::task::types::SubagentEvent;
+
+        let terminal: Arc<dyn TerminalBackend> = Arc::new(MockTerminal::empty());
+        let (tx, mut query_rx) = tokio::sync::mpsc::unbounded_channel::<SubagentEvent>();
+        let backend = Some(SubagentBackendResource(Arc::new(ChannelBackend::new(tx))));
+        let wait = tokio::spawn(async move {
+            wait_all_event_driven(
+                &terminal,
+                &backend,
+                &[],
+                &["sub-cancel".to_owned()],
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await
+        });
+
+        let request = unwrap_query(query_rx.recv().await.unwrap());
+        assert!(request.block);
+        wait.abort();
+        let _ = wait.await;
+        assert!(
+            request.respond_to.is_closed(),
+            "dropping the wait future must synchronously drop its reply receiver"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_wait_any_uses_one_deadline_and_never_requeries() {
+        use xai_tool_types::{WaitMode, WaitTasksToolInput};
+
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let (blocking_ready_tx, blocking_ready_rx) = tokio::sync::oneshot::channel();
+        let (tool_done_tx, tool_done_rx) = tokio::sync::oneshot::channel();
+        let handler = tokio::spawn(async move {
+            let mut initial_ids = std::collections::HashSet::from(["sub-a", "sub-b"]);
+            for _ in 0..2 {
+                let request = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(!request.block);
+                assert!(initial_ids.remove(request.subagent_id.as_str()));
+                let id = request.subagent_id.clone();
+                request
+                    .respond_to
+                    .send(Some(running_subagent_snapshot(&id)))
+                    .unwrap();
+            }
+
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let request = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(request.block);
+                held.push(request);
+            }
+            blocking_ready_tx.send(()).unwrap();
+            tool_done_rx.await.unwrap();
+            assert!(query_rx.try_recv().is_err(), "wait-any must not requery");
+            assert!(
+                held.iter().all(|request| request.respond_to.is_closed()),
+                "returning at the deadline must close every helper receiver"
+            );
+        });
+
+        let started = tokio::time::Instant::now();
+        let tool = tokio::spawn(xai_tool_runtime::Tool::run(
+            &WaitTasksTool,
+            test_ctx(resources.into_shared()),
+            WaitTasksToolInput {
+                task_ids: vec!["sub-a".into(), "sub-b".into()],
+                mode: WaitMode::WaitAny,
+                timeout_ms: Some(100),
+            },
+        ));
+        blocking_ready_rx.await.unwrap();
+        let output = tool.await.unwrap().unwrap();
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_millis(100)
+        );
+        let TaskOutputOutput::MultiResult(output) = output else {
+            panic!("expected multi-task result");
+        };
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|item| item.status.as_str())
+                .collect::<Vec<_>>(),
+            ["running", "running"]
+        );
+        tool_done_tx.send(()).unwrap();
+        handler.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_wait_any_returns_immediately_when_one_task_is_already_complete() {
+        use xai_tool_types::{WaitMode, WaitTasksToolInput};
+
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let (tool_done_tx, tool_done_rx) = tokio::sync::oneshot::channel();
+        let handler = tokio::spawn(async move {
+            let mut initial_ids = std::collections::HashSet::from(["sub-done", "sub-running"]);
+            for _ in 0..2 {
+                let request = unwrap_query(query_rx.recv().await.unwrap());
+                assert!(!request.block);
+                assert!(initial_ids.remove(request.subagent_id.as_str()));
+                let mut snapshot = running_subagent_snapshot(&request.subagent_id);
+                if request.subagent_id == "sub-done" {
+                    snapshot.status = SubagentSnapshotStatus::Completed {
+                        output: "finished".to_owned(),
+                        tool_calls: 1,
+                        turns: 1,
+                        worktree_path: None,
+                    };
+                }
+                request.respond_to.send(Some(snapshot)).unwrap();
+            }
+
+            tool_done_rx.await.unwrap();
+            assert!(
+                query_rx.try_recv().is_err(),
+                "an already-completed task must satisfy wait-any without a blocking query"
+            );
+        });
+
+        let started = tokio::time::Instant::now();
+        let output = xai_tool_runtime::Tool::run(
+            &WaitTasksTool,
+            test_ctx(resources.into_shared()),
+            WaitTasksToolInput {
+                task_ids: vec!["sub-done".into(), "sub-running".into()],
+                mode: WaitMode::WaitAny,
+                timeout_ms: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::ZERO
+        );
+        let TaskOutputOutput::MultiResult(output) = output else {
+            panic!("expected multi-task result");
+        };
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|item| item.status.as_str())
+                .collect::<Vec<_>>(),
+            ["completed", "not_found"],
+            "wait-any cancels initial probes that remain unresolved after the terminal row"
+        );
+
+        tool_done_tx.send(()).unwrap();
+        handler.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_wait_any_terminal_initial_probe_cancels_stalled_lookup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use xai_tool_types::{WaitMode, WaitTasksToolInput};
+
+        struct StallingInitialTerminal {
+            completed: TaskSnapshot,
+            stalled_lookup_cancelled: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl TerminalBackend for StallingInitialTerminal {
+            async fn run(
+                &self,
+                _request: TerminalRunRequest,
+            ) -> Result<TerminalRunResult, crate::computer::types::ComputerError> {
+                unimplemented!()
+            }
+
+            async fn run_background(
+                &self,
+                _request: TerminalRunRequest,
+            ) -> Result<BackgroundHandle, crate::computer::types::ComputerError> {
+                unimplemented!()
+            }
+
+            async fn get_task(&self, task_id: &str) -> Option<TaskSnapshot> {
+                if task_id == self.completed.task_id {
+                    return Some(self.completed.clone());
+                }
+
+                struct MarkCancelled(Arc<AtomicBool>);
+                impl Drop for MarkCancelled {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+
+                let _mark_cancelled = MarkCancelled(self.stalled_lookup_cancelled.clone());
+                std::future::pending().await
+            }
+
+            async fn kill_task(&self, _task_id: &str) -> KillOutcome {
+                unimplemented!()
+            }
+
+            async fn wait_for_completion(
+                &self,
+                _task_id: &str,
+                _timeout: Option<Duration>,
+            ) -> Option<TaskSnapshot> {
+                unimplemented!()
+            }
+
+            async fn list_tasks(&self) -> Vec<TaskSnapshot> {
+                vec![self.completed.clone()]
+            }
+        }
+
+        let stalled_lookup_cancelled = Arc::new(AtomicBool::new(false));
+        let mut resources = resources_with_terminal(None);
+        resources.insert(Terminal(Arc::new(StallingInitialTerminal {
+            completed: make_snapshot("done", true, Some(0)),
+            stalled_lookup_cancelled: stalled_lookup_cancelled.clone(),
+        })));
+
+        let started = tokio::time::Instant::now();
+        let output = xai_tool_runtime::Tool::run(
+            &WaitTasksTool,
+            test_ctx(resources.into_shared()),
+            WaitTasksToolInput {
+                // Put the stalled lookup first so the initial resolver must
+                // poll it before observing the completed second task.
+                task_ids: vec!["stalled".into(), "done".into()],
+                mode: WaitMode::WaitAny,
+                timeout_ms: Some(10_000),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::ZERO,
+            "a terminal initial result must satisfy wait-any immediately"
+        );
+        assert!(
+            stalled_lookup_cancelled.load(Ordering::SeqCst),
+            "returning the terminal result must cancel unresolved initial probes"
+        );
+
+        let TaskOutputOutput::MultiResult(output) = output else {
+            panic!("expected multi-task result");
+        };
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|item| (item.task_id.as_str(), item.status.as_str()))
+                .collect::<Vec<_>>(),
+            [("stalled", "not_found"), ("done", "completed")],
+            "resolved and fallback rows must retain caller order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_bash_wait_uses_one_absolute_budget() {
+        let snapshot = make_snapshot("bash-stalled", false, None);
+        let mut resources = resources_with_terminal(None);
+        let terminal: Arc<dyn TerminalBackend> =
+            Arc::new(MockTerminal::with_stalled_wait(snapshot));
+        resources.insert(Terminal(terminal));
+
+        let started = tokio::time::Instant::now();
+        let output = xai_tool_runtime::Tool::run(
+            &TaskOutputTool,
+            test_ctx(resources.into_shared()),
+            TaskOutputToolInput {
+                task_ids: vec!["bash-stalled".into()],
+                timeout_ms: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_millis(100)
+        );
+        let TaskOutputOutput::Result(output) = output else {
+            panic!("the initial bash snapshot should be retained");
+        };
+        assert_eq!(output.status, "running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_subagent_wait_uses_one_absolute_budget() {
+        let (resources, mut query_rx) = resources_with_backend_query();
+        let started = tokio::time::Instant::now();
+        let tool = tokio::spawn(xai_tool_runtime::Tool::run(
+            &TaskOutputTool,
+            test_ctx(resources.into_shared()),
+            TaskOutputToolInput {
+                task_ids: vec!["sub-stalled".into()],
+                timeout_ms: Some(100),
+            },
+        ));
+
+        let request = unwrap_query(query_rx.recv().await.unwrap());
+        assert!(request.block);
+        assert!(request.timeout_ms.is_some_and(|timeout| timeout <= 100));
+        let output = tool.await.unwrap().unwrap();
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            std::time::Duration::from_millis(100)
+        );
+        assert!(
+            request.respond_to.is_closed(),
+            "the outer deadline must cancel the backend query and its grace period"
+        );
+        assert!(
+            query_rx.try_recv().is_err(),
+            "single-ID timeout must not start another lookup"
+        );
+        assert!(matches!(output, TaskOutputOutput::TaskNotFound(_)));
     }
 
     #[tokio::test]

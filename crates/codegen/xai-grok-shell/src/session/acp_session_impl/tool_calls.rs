@@ -2060,24 +2060,14 @@ impl SessionActor {
         self.chat_state_handle.push_tool_result(tool_chat);
         Ok(())
     }
-    /// Sweep `pending_inputs` and `pending_notifications` for entries
-    /// matching `consumed_ids`. Called after every successful tool result
-    /// so that queued auto-wake synthetic prompts for a task/subagent the
-    /// model already learned about are dropped before they get flushed to
-    /// chat history (which would surface as a trailing
-    /// `<system-reminder>` with no assistant reply).
+    /// Sweep `pending_inputs` and `pending_notifications` for entries matching
+    /// `consumed_ids`, and leave tombstones for wake commands that have not
+    /// reached the queue yet.
     ///
     /// The ID list comes from
     /// `xai_grok_tools::reminders::task_completion::consumed_completion_ids`,
     /// which is the same predicate used by `TaskCompletionReminder` —
     /// they cannot drift because they share the function.
-    ///
-    /// Reservations are deliberately not released here because the tool result
-    /// that triggered this sweep is the canonical consumption surface, and
-    /// `TaskCompletionReminder` already suppresses the per-tool-call
-    /// reminder for these IDs via its own suppress list (also derived
-    /// from `consumed_completion_ids`). Un-marking here would risk a
-    /// duplicate reminder for an ID that was just consumed.
     ///
     /// Note on `MonitorEvent` interaction: any pending `MonitorEvent`
     /// notification whose `task_id` matches a consumed completion is
@@ -2089,6 +2079,19 @@ impl SessionActor {
             return;
         }
         let mut state = self.state.lock().await;
+        for consumed_id in consumed_ids {
+            state.record_consumed_completion(consumed_id);
+        }
+        let (dropped_inputs, dropped_notifications) =
+            Self::drop_pending_items_for_consumed_completions_locked(&mut state, consumed_ids);
+        drop(state);
+        Self::log_dropped_consumed_completions(consumed_ids, dropped_inputs, dropped_notifications);
+    }
+
+    fn drop_pending_items_for_consumed_completions_locked(
+        state: &mut State,
+        consumed_ids: &[&str],
+    ) -> (usize, usize) {
         let dropped = state.sweep_pending_inputs(|i| {
             i.origin
                 .completion_id()
@@ -2100,15 +2103,14 @@ impl SessionActor {
             .pending_notifications
             .retain(|n| !consumed_ids.contains(&n.source.task_id()));
         let dropped_notifications = before_notifications - state.pending_notifications.len();
-        drop(state);
-        if let Some(reservations) = &self.tool_context.task_completion_reservations {
-            for task_id in dropped
-                .iter()
-                .filter_map(|input| input.origin.completion_id())
-            {
-                reservations.release(task_id);
-            }
-        }
+        (dropped_inputs, dropped_notifications)
+    }
+
+    fn log_dropped_consumed_completions(
+        consumed_ids: &[&str],
+        dropped_inputs: usize,
+        dropped_notifications: usize,
+    ) {
         if dropped_inputs > 0 || dropped_notifications > 0 {
             tracing::info!(
                 dropped_inputs,
@@ -2143,14 +2145,6 @@ impl SessionActor {
         state.pending_inputs = kept;
         state.pending_notifications.clear();
         drop(state);
-        if let Some(reservations) = &self.tool_context.task_completion_reservations {
-            for task_id in dropped
-                .iter()
-                .filter_map(|input| input.origin.completion_id())
-            {
-                reservations.release(task_id);
-            }
-        }
     }
     /// Record git/PR ops from a successful tool result into session signals
     /// (`turn_result.json`) and telemetry. Detection runs here at the shell's
@@ -2222,12 +2216,11 @@ impl SessionActor {
     ) -> Result<Vec<ConversationItem>, acp::Error> {
         use crate::session::acp_conversion::{acp_plan_update, acp_tool_update, maybe_rewrite};
         let (mut result, mut tool_layer_images) = drained.into_parts();
-        let consumed_ids =
-            xai_grok_tools::reminders::task_completion::consumed_completion_ids(&result.output);
-        if !consumed_ids.is_empty() {
-            self.drop_pending_items_for_consumed_completions(&consumed_ids)
-                .await;
-        }
+        let consumed_ids: Vec<String> =
+            xai_grok_tools::reminders::task_completion::consumed_completion_ids(&result.output)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
         if let ToolsToolOutput::BackgroundTaskStarted(ref bg) = result.output {
             self.record_goal_turn_task_ids([bg.task_id.clone()]);
         }
@@ -2400,7 +2393,36 @@ impl SessionActor {
                 inline_images,
             )
         };
-        self.chat_state_handle.push_tool_result(tool_chat);
+        if consumed_ids.is_empty() {
+            self.chat_state_handle.push_tool_result(tool_chat);
+        } else {
+            // This is the consumption commit point. Tombstoning/sweeping any
+            // earlier would let Ctrl+C abort before the canonical tool result
+            // reached chat, losing both delivery paths. With no await while the
+            // state lock is held, either cancellation wins first and leaves the
+            // fallback intact, or this chat insertion and suppression win
+            // together.
+            let consumed_id_refs: Vec<&str> = consumed_ids.iter().map(String::as_str).collect();
+            let mut state = self.state.lock().await;
+            // Enqueue the canonical copy before dropping any reservation owner:
+            // reminder collectors on other tasks do not share the session-state
+            // mutex, but they do observe those reservations.
+            self.chat_state_handle.push_tool_result(tool_chat);
+            for consumed_id in &consumed_id_refs {
+                state.record_consumed_completion(consumed_id);
+            }
+            let (dropped_inputs, dropped_notifications) =
+                Self::drop_pending_items_for_consumed_completions_locked(
+                    &mut state,
+                    &consumed_id_refs,
+                );
+            drop(state);
+            Self::log_dropped_consumed_completions(
+                &consumed_id_refs,
+                dropped_inputs,
+                dropped_notifications,
+            );
+        }
         let mut deferred_followups = Vec::new();
         if !extracted_images.is_empty() {
             let count = extracted_images.len();

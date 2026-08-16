@@ -22,10 +22,10 @@ pub mod types;
 
 pub use self::codex::{
     CHATGPT_ACCOUNT_ID_HEADER, CODEX_ACCOUNT_USAGE_URL, CODEX_BACKEND_BASE_URL,
-    CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL, CapturedResponseOutputItem,
-    CapturedResponseOutputItemValue, CodexCompactInputItem, CodexCompactMessage,
-    CodexCompactMessageContent, CodexCompactOutputItem, CodexCompactRequest, CodexCompactResponse,
-    CodexCompactTypedInputItem, CodexStreamAccumulator, DecodedResponse,
+    CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL, CODEX_ORIGINATOR_HEADER, CODEX_ORIGINATOR_VALUE,
+    CapturedResponseOutputItem, CapturedResponseOutputItemValue, CodexCompactInputItem,
+    CodexCompactMessage, CodexCompactMessageContent, CodexCompactOutputItem, CodexCompactRequest,
+    CodexCompactResponse, CodexCompactTypedInputItem, CodexStreamAccumulator, DecodedResponse,
     DecodedResponseStreamEvent, ResponsesStreamAccumulator,
     captured_response_to_conversation_items, codex_compact_output_to_conversation,
     conversation_request_to_codex_compact_request,

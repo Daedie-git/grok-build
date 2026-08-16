@@ -28,25 +28,30 @@ use crate::types::{
 use state::ChatState;
 use xai_grok_sampling_types::{ConversationItem, SamplingConfig};
 
-const SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
+/// How [`ChatStateCommand`] interacts with an in-flight rewind transaction.
+enum RewindInteraction {
+    /// Begin / install / abort — handled by [`ChatStateActor::handle_command`].
+    GateControl,
+    /// Timeline mutations and timeline-dependent ops wait for install/abort.
+    Queue,
+    /// Identity updates, bookkeeping, and rewind-prep reads run immediately.
+    Allow,
+}
 
 async fn await_history_replacement_ack(
     receiver: tokio::sync::oneshot::Receiver<Result<ReplaceHistoryAck, ReplaceHistoryError>>,
-    timeout: std::time::Duration,
 ) -> Result<ReplaceHistoryAck, ReplaceHistoryError> {
-    match tokio::time::timeout(timeout, receiver).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
+    // Do not impose a caller-side timeout here. Once persistence owns the
+    // replacement request it may still commit, so abandoning the receiver
+    // could leave disk on the new identity while memory continues on the old
+    // one. A closed acknowledgement channel is genuinely indeterminate; a
+    // slow acknowledgement must remain in flight until its durable outcome is
+    // known.
+    match receiver.await {
+        Ok(result) => result,
+        Err(_) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "history replacement acknowledgement dropped",
-        ))),
-        Err(_) => Err(ReplaceHistoryError::Indeterminate(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "history replacement acknowledgement timed out after {} seconds",
-                timeout.as_secs()
-            ),
         ))),
     }
 }
@@ -66,8 +71,10 @@ pub struct ChatStateActor {
     event_tx: mpsc::UnboundedSender<ChatStateEvent>,
     /// Cancellation token for graceful shutdown.
     cancellation_token: tokio_util::sync::CancellationToken,
-    /// Actor-local bound for identity-transition persistence acknowledgements.
-    sampling_transition_ack_timeout: std::time::Duration,
+    /// Actor-owned rewind transaction: conversation mutations queue here
+    /// until the durable replacement is installed.
+    rewind_pending: bool,
+    rewind_queue: Vec<ChatStateCommand>,
 }
 
 impl ChatStateActor {
@@ -112,27 +119,6 @@ impl ChatStateActor {
             persistence,
             event_tx,
             cancellation_token,
-            SAMPLING_TRANSITION_PERSISTENCE_ACK_TIMEOUT,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spawn_with_persistence_ack_timeout(
-        initial_conversation: Vec<ConversationItem>,
-        sampling_config: SamplingConfig,
-        persistence: Box<dyn ChatPersistence>,
-        event_tx: mpsc::UnboundedSender<ChatStateEvent>,
-        cancellation_token: tokio_util::sync::CancellationToken,
-        sampling_transition_ack_timeout: std::time::Duration,
-    ) -> ChatStateHandle {
-        Self::spawn_inner(
-            initial_conversation,
-            sampling_config,
-            PruningConfig::default(),
-            persistence,
-            event_tx,
-            cancellation_token,
-            sampling_transition_ack_timeout,
         )
     }
 
@@ -143,7 +129,6 @@ impl ChatStateActor {
         persistence: Box<dyn ChatPersistence>,
         event_tx: mpsc::UnboundedSender<ChatStateEvent>,
         cancellation_token: tokio_util::sync::CancellationToken,
-        sampling_transition_ack_timeout: std::time::Duration,
     ) -> ChatStateHandle {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -154,7 +139,8 @@ impl ChatStateActor {
             cmd_rx,
             event_tx,
             cancellation_token,
-            sampling_transition_ack_timeout,
+            rewind_pending: false,
+            rewind_queue: Vec::new(),
         };
 
         tokio::spawn(actor.run());
@@ -182,8 +168,126 @@ impl ChatStateActor {
         }
     }
 
+    /// How a command interacts with an in-flight rewind transaction.
+    /// Exhaustive so a new variant must pick a class.
+    fn rewind_interaction(cmd: &ChatStateCommand) -> RewindInteraction {
+        match cmd {
+            ChatStateCommand::BeginConversationRewind { .. }
+            | ChatStateCommand::InstallConversationRewind { .. }
+            | ChatStateCommand::AbortConversationRewind { .. } => RewindInteraction::GateControl,
+
+            // Timeline mutations and operations that must observe the
+            // post-rewind conversation (including request construction).
+            ChatStateCommand::PushUserMessage { .. }
+            | ChatStateCommand::PushUserMessageAndAck { .. }
+            | ChatStateCommand::AppendWorkingDirectorySwitchAndAck { .. }
+            | ChatStateCommand::PushUserMessageWithRepairReason { .. }
+            | ChatStateCommand::PushAssistantResponse { .. }
+            | ChatStateCommand::PushToolResult { .. }
+            | ChatStateCommand::IncrementPromptIndex
+            | ChatStateCommand::TransitionSamplingState { .. }
+            | ChatStateCommand::ReplaceConversation { .. }
+            | ChatStateCommand::RepairHistory { .. }
+            | ChatStateCommand::StripConversationImages { .. }
+            | ChatStateCommand::ReplaceSystemHead { .. }
+            | ChatStateCommand::CachePromptText { .. }
+            | ChatStateCommand::RecordCompactionAt { .. }
+            | ChatStateCommand::RestoreSnapshot(_)
+            | ChatStateCommand::BeginTurnRoutingScope
+            | ChatStateCommand::BeginTurnCapture
+            | ChatStateCommand::InstallPersistedCompaction { .. }
+            | ChatStateCommand::RepairDanglingAfterHarnessHalt { .. }
+            | ChatStateCommand::BuildConversationRequest { .. }
+            | ChatStateCommand::TruncateToPromptIndex { .. }
+            | ChatStateCommand::CheckAutoCompactNeeded { .. }
+            | ChatStateCommand::Snapshot { .. }
+            | ChatStateCommand::TakeTurnMessages { .. } => RewindInteraction::Queue,
+
+            // Identity updates, usage bookkeeping, and unrelated queries may
+            // run immediately. The rewind source snapshot is captured by the
+            // gate-control command itself; ordinary snapshots must queue.
+            ChatStateCommand::RecordTokenUsage { .. }
+            | ChatStateCommand::RecordLastTurnUsage { .. }
+            | ChatStateCommand::RecordModelCallUsage { .. }
+            | ChatStateCommand::RecordSubagentUsage { .. }
+            | ChatStateCommand::MarkUsageIncomplete { .. }
+            | ChatStateCommand::UpdateSamplingConfig { .. }
+            | ChatStateCommand::RecordAgentEditedPath { .. }
+            | ChatStateCommand::RecordStreamStart { .. }
+            | ChatStateCommand::RecordTurnStart { .. }
+            | ChatStateCommand::Flush
+            | ChatStateCommand::UpdateCredentials { .. }
+            | ChatStateCommand::AppendHarnessTraceItems { .. }
+            | ChatStateCommand::FlushHarnessTraceTurn
+            | ChatStateCommand::GetConversation { .. }
+            | ChatStateCommand::GetPromptIndex { .. }
+            | ChatStateCommand::GetTurnRoutingState { .. }
+            | ChatStateCommand::GetLastCompactionPromptIndex { .. }
+            | ChatStateCommand::GetTotalTokens { .. }
+            | ChatStateCommand::GetLastTurnUsage { .. }
+            | ChatStateCommand::GetPromptUsage { .. }
+            | ChatStateCommand::GetSessionUsage { .. }
+            | ChatStateCommand::GetEstimatedTotalTokens { .. }
+            | ChatStateCommand::GetEstimatedMessagesTokens { .. }
+            | ChatStateCommand::GetSamplingConfig { .. }
+            | ChatStateCommand::GetSamplingState { .. }
+            | ChatStateCommand::GetAgentEditedPaths { .. }
+            | ChatStateCommand::GetNotificationMeta { .. }
+            | ChatStateCommand::GetCredentials { .. }
+            | ChatStateCommand::GetLastModelMetadata { .. }
+            | ChatStateCommand::TakeHarnessTraceTurns { .. }
+            | ChatStateCommand::GetConversationLen { .. }
+            | ChatStateCommand::HasDanglingToolCalls { .. }
+            | ChatStateCommand::GetLastAssistantText { .. }
+            | ChatStateCommand::GetLastAssistantTextInTurn { .. }
+            | ChatStateCommand::GetFirstUserText { .. }
+            | ChatStateCommand::GetConversationItemAt { .. }
+            | ChatStateCommand::GetLastUserQueryText { .. }
+            | ChatStateCommand::GetConversationCounts { .. }
+            | ChatStateCommand::GetSystemMessage { .. } => RewindInteraction::Allow,
+        }
+    }
+
+    async fn drain_rewind_queue(&mut self) {
+        let queued = std::mem::take(&mut self.rewind_queue);
+        for queued_cmd in queued {
+            self.dispatch_command(queued_cmd).await;
+        }
+    }
+
     /// Dispatch a command to the appropriate mutation or query handler.
     async fn handle_command(&mut self, cmd: ChatStateCommand) {
+        match cmd {
+            ChatStateCommand::BeginConversationRewind { reply } => {
+                if self.rewind_pending {
+                    let _ = reply.send(None);
+                } else {
+                    self.rewind_pending = true;
+                    let _ = reply.send(Some(self.snapshot()));
+                }
+            }
+            ChatStateCommand::InstallConversationRewind { state, reply } => {
+                self.install_conversation_rewind(*state);
+                self.rewind_pending = false;
+                self.drain_rewind_queue().await;
+                let _ = reply.send(());
+            }
+            ChatStateCommand::AbortConversationRewind { reply } => {
+                self.rewind_pending = false;
+                self.drain_rewind_queue().await;
+                let _ = reply.send(());
+            }
+            other
+                if self.rewind_pending
+                    && matches!(Self::rewind_interaction(&other), RewindInteraction::Queue) =>
+            {
+                self.rewind_queue.push(other);
+            }
+            other => self.dispatch_command(other).await,
+        }
+    }
+
+    async fn dispatch_command(&mut self, cmd: ChatStateCommand) {
         match cmd {
             // ═══ Mutations ═══
             ChatStateCommand::PushUserMessage { item } => {
@@ -305,9 +409,7 @@ impl ChatStateActor {
                 }
 
                 let persist_rx = self.persistence.replace_history_and_ack(&proposed_history);
-                let persisted =
-                    await_history_replacement_ack(persist_rx, self.sampling_transition_ack_timeout)
-                        .await;
+                let persisted = await_history_replacement_ack(persist_rx).await;
                 let persistence = match persisted {
                     Ok(ReplaceHistoryAck::Committed) => SamplingTransitionPersistence::Committed,
                     Ok(ReplaceHistoryAck::CommittedWithBookkeepingWarning(error)) => {
@@ -426,9 +528,10 @@ impl ChatStateActor {
                 self.replace_conversation_without_persistence(items, true);
                 let _ = reply.send(());
             }
-            ChatStateCommand::InstallPersistedRewind { snapshot, reply } => {
-                self.install_persisted_rewind(*snapshot);
-                let _ = reply.send(());
+            ChatStateCommand::BeginConversationRewind { .. }
+            | ChatStateCommand::InstallConversationRewind { .. }
+            | ChatStateCommand::AbortConversationRewind { .. } => {
+                unreachable!("rewind gate commands are handled in handle_command")
             }
             ChatStateCommand::AppendHarnessTraceItems { items } => {
                 self.state.harness_trace_buffer.extend(items);

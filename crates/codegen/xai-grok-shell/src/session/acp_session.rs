@@ -1752,6 +1752,9 @@ mod reverse_request_session_id_tests;
 #[path = "acp_session_tests/rewind_cross_compaction_tests.rs"]
 mod rewind_cross_compaction_tests;
 #[cfg(test)]
+#[path = "acp_session_tests/rewind_gate_tests.rs"]
+mod rewind_gate_tests;
+#[cfg(test)]
 #[path = "acp_session_tests/rewind_synthetic_turn_tests.rs"]
 mod rewind_synthetic_turn_tests;
 /// Pins the `SubagentFinished` usage-fold attribution gate.

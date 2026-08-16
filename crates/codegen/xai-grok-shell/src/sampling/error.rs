@@ -512,6 +512,7 @@ mod tests {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
             code: None,
+            status: None,
         };
         let acp_err = map_sampling_err_to_acp(err);
         assert_eq!(acp_err.code, acp::ErrorCode::InternalError);

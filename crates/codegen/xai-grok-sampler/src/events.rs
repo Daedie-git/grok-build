@@ -290,9 +290,11 @@ impl From<&SamplingError> for SamplingErrorInfo {
             SamplingError::StreamError {
                 error_type,
                 message,
+                status,
                 ..
             } => {
-                let status = structured_stream_error_status(error_type, message);
+                let status =
+                    status.unwrap_or_else(|| structured_stream_error_status(error_type, message));
                 let kind = if err.is_auth_error() {
                     SamplingErrorKind::Auth
                 } else if err.is_rate_limited() {
@@ -376,6 +378,7 @@ mod tests {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
             code: None,
+            status: None,
         };
         assert_eq!(SamplingErrorInfo::from(&stream_err).should_retry, None);
     }
@@ -399,6 +402,7 @@ mod tests {
             error_type: "invalid_request_error".into(),
             message: "bad image".into(),
             code: Some(ApiErrorCode::InvalidImage),
+            status: None,
         };
         assert_eq!(
             SamplingErrorInfo::from(&stream).error_code,
@@ -522,6 +526,7 @@ mod tests {
             error_type: "server_error".into(),
             message: "transient".into(),
             code: None,
+            status: None,
         };
         let info = SamplingErrorInfo::from(&err);
         assert_eq!(info.kind, SamplingErrorKind::Api);

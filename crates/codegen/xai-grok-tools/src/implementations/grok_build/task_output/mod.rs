@@ -12,6 +12,7 @@ use std::time::Duration;
 pub use terminal_command::GetTerminalCommandOutputTool;
 pub use wait_tasks::WaitTasksTool;
 
+use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::DEFAULT_TOOL_OUTPUT_BYTES;
@@ -262,12 +263,16 @@ impl TaskOutputTool {
         };
 
         if let Some(initial) = initial_terminal {
-            let snapshot = if let Some(deadline) = deadline
-                && !initial.completed
-            {
+            // Positive waits must always call wait_for_completion, including
+            // for already-completed tasks, so the terminal backend can stamp
+            // block_waited and suppress a duplicate automatic wake-up.
+            let snapshot = if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    initial
+                    terminal
+                        .wait_for_completion(task_id, Some(std::time::Duration::ZERO))
+                        .await
+                        .unwrap_or(initial)
                 } else {
                     match tokio::time::timeout_at(
                         deadline,
@@ -293,18 +298,33 @@ impl TaskOutputTool {
 
         let subagent_snapshot = if let Some(backend) = backend {
             if let Some(deadline) = deadline {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    None
-                } else {
-                    let timeout_ms = duration_millis_ceil(remaining);
-                    tokio::time::timeout_at(
-                        deadline,
-                        backend.backend().query(task_id, true, Some(timeout_ms)),
-                    )
-                    .await
-                    .ok()
-                    .flatten()
+                let initial = tokio::time::timeout_at(
+                    deadline,
+                    backend.backend().query(task_id, false, None),
+                )
+                .await
+                .ok()
+                .flatten();
+                match initial {
+                    Some(initial) if !initial.status.is_terminal() => {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            Some(initial)
+                        } else {
+                            let timeout_ms = duration_millis_ceil(remaining);
+                            match tokio::time::timeout_at(
+                                deadline,
+                                backend.backend().query(task_id, true, Some(timeout_ms)),
+                            )
+                            .await
+                            {
+                                Ok(Some(snapshot)) => Some(snapshot),
+                                Ok(None) | Err(_) => Some(initial),
+                            }
+                        }
+                    }
+                    initial => initial,
                 }
             } else {
                 backend.backend().query(task_id, false, timeout_ms).await
@@ -515,6 +535,26 @@ fn ordered_resolve_result(
     }
 }
 
+fn unresolved_wait_any_result(task_id: &str) -> ResolvedTask {
+    ResolvedTask {
+        result: TaskOutputResult {
+            task_id: task_id.to_owned(),
+            command: String::new(),
+            status: "unknown".to_owned(),
+            exit_code: None,
+            started: String::new(),
+            ended: None,
+            duration_secs: 0.0,
+            output: "Status lookup was still in flight when wait-any returned.".to_owned(),
+            output_file: String::new(),
+            truncated: false,
+            truncation_hint: String::new(),
+            raw_output_bytes: 0,
+        },
+        pending: None,
+    }
+}
+
 /// Resolve independent IDs concurrently while retaining the caller's order.
 ///
 /// `deadline` is supplied by blocking multi-waits so the initial snapshot
@@ -583,6 +623,9 @@ pub(crate) async fn resolve_tasks_until_any_terminal(
                 let is_terminal = is_terminal_status(&resolution.result.status);
                 resolved[index] = Some(resolution);
                 if is_terminal {
+                    while let Some(Some((index, resolution))) = resolutions.next().now_or_never() {
+                        resolved[index] = Some(resolution);
+                    }
                     break;
                 }
             }
@@ -593,6 +636,11 @@ pub(crate) async fn resolve_tasks_until_any_terminal(
     // Do not leave a stalled initial lookup alive after wait-any has already
     // been satisfied or its deadline has elapsed.
     drop(resolutions);
+    for (index, resolution) in resolved.iter_mut().enumerate() {
+        if resolution.is_none() {
+            *resolution = Some(unresolved_wait_any_result(&task_ids[index]));
+        }
+    }
     ordered_resolve_result(task_ids, resolved)
 }
 
@@ -615,9 +663,7 @@ async fn resolve_task(
         && let Some(snapshot) = backend.backend().query(id, false, None).await
     {
         let pending = (!snapshot.status.is_terminal()).then_some(PendingTaskKind::Subagent);
-        if let TaskOutputOutput::Result(result) =
-            format_subagent_snapshot(&snapshot, WaitHint::NotRequested)
-        {
+        if let TaskOutputOutput::Result(result) = format_subagent_snapshot_body(&snapshot) {
             return ResolvedTask { result, pending };
         }
     }
@@ -832,6 +878,17 @@ fn task_not_found_output(
 }
 
 fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> TaskOutputOutput {
+    match format_subagent_snapshot_body(snap) {
+        TaskOutputOutput::Result(result) => TaskOutputOutput::Result(apply_running_wait_hint(
+            result,
+            wait_hint,
+            WaitSubject::Subagent,
+        )),
+        other => other,
+    }
+}
+
+fn format_subagent_snapshot_body(snap: &SubagentSnapshot) -> TaskOutputOutput {
     let started = format_epoch_ms_as_rfc3339(snap.started_at_epoch_ms);
     match &snap.status {
         SubagentSnapshotStatus::Initializing => {
@@ -844,7 +901,6 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
                 snap.subagent_type, snap.description,
             );
             let raw_output_bytes = body.len();
-            let output = with_still_running_wait_hint(body, wait_hint, WaitSubject::Subagent);
             TaskOutputOutput::Result(TaskOutputResult {
                 task_id: snap.subagent_id.clone(),
                 command: format!("[subagent:{}] {}", snap.subagent_type, snap.description),
@@ -853,7 +909,7 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
                 started,
                 ended: None,
                 duration_secs,
-                output,
+                output: body,
                 output_file: String::new(),
                 truncated: false,
                 truncation_hint: String::new(),
@@ -890,7 +946,6 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
                 snap.duration_ms as f64 / 1000.0,
             );
             let raw_output_bytes = body.len();
-            let output = with_still_running_wait_hint(body, wait_hint, WaitSubject::Subagent);
             TaskOutputOutput::Result(TaskOutputResult {
                 task_id: snap.subagent_id.clone(),
                 command: format!("[subagent:{}] {}", snap.subagent_type, snap.description),
@@ -899,7 +954,7 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
                 started,
                 ended: None,
                 duration_secs: snap.duration_ms as f64 / 1000.0,
-                output,
+                output: body,
                 output_file: String::new(),
                 truncated: false,
                 truncation_hint: String::new(),
@@ -2821,7 +2876,7 @@ mod tests {
             error_count: 0,
         };
         let TaskOutputOutput::Result(initial_result) =
-            format_subagent_snapshot(&initial_snapshot, WaitHint::NotRequested)
+            format_subagent_snapshot_body(&initial_snapshot)
         else {
             panic!("running snapshot must format as a result");
         };
@@ -2855,6 +2910,11 @@ mod tests {
             rendered[0].output
         );
         assert!(!rendered[0].output.contains("turn 0"));
+        assert_eq!(
+            rendered[0].output.matches("Use timeout_ms").count(),
+            1,
+            "a running subagent must receive exactly one wait hint"
+        );
     }
 
     #[tokio::test]
@@ -3010,8 +3070,13 @@ mod tests {
                 .iter()
                 .map(|item| item.status.as_str())
                 .collect::<Vec<_>>(),
-            ["completed", "not_found"],
-            "wait-any cancels initial probes that remain unresolved after the terminal row"
+            ["completed", "running"],
+            "already-ready sibling snapshots must be drained before wait-any returns"
+        );
+        assert!(
+            output.results[1]
+                .output
+                .contains("Wait returned early because another finished")
         );
 
         tool_done_tx.send(()).unwrap();
@@ -3165,6 +3230,12 @@ mod tests {
             },
         ));
 
+        let initial = unwrap_query(query_rx.recv().await.unwrap());
+        assert!(!initial.block);
+        initial
+            .respond_to
+            .send(Some(running_subagent_snapshot("sub-stalled")))
+            .unwrap();
         let request = unwrap_query(query_rx.recv().await.unwrap());
         assert!(request.block);
         assert!(request.timeout_ms.is_some_and(|timeout| timeout <= 100));
@@ -3181,7 +3252,11 @@ mod tests {
             query_rx.try_recv().is_err(),
             "single-ID timeout must not start another lookup"
         );
-        assert!(matches!(output, TaskOutputOutput::TaskNotFound(_)));
+        let TaskOutputOutput::Result(output) = output else {
+            panic!("the initial subagent snapshot should be retained");
+        };
+        assert_eq!(output.status, "running");
+        assert!(output.output.contains("Waited the requested 100ms"));
     }
 
     #[tokio::test]
@@ -3240,8 +3315,8 @@ mod tests {
         let handle = tokio::spawn(async move {
             let req = unwrap_query(query_rx.recv().await.unwrap());
             assert!(
-                req.block,
-                "waits must issue a blocking query; backends short-circuit already-terminal"
+                !req.block,
+                "already-terminal subagents are identified with a snapshot query"
             );
             req.respond_to
                 .send(Some(completed_subagent_snapshot("sub-done")))

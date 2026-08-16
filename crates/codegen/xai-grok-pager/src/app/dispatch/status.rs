@@ -58,6 +58,7 @@ pub(super) fn open_usage_info_modal(
         return vec![];
     };
     let session_id = agent.session.session_id.clone();
+    let is_codex = agent.session.models.current_model_is_codex();
 
     if let Some(state) = usage_modal_state_mut(agent) {
         state.set_tab(tab);
@@ -74,9 +75,16 @@ pub(super) fn open_usage_info_modal(
             chat_kind: agent.chat_kind,
             billing_redirect_url: redirect_url,
             subscription_tier: tier,
+            codex: is_codex,
         },
     );
     state.fetch_nonce = nonce;
+    if is_codex {
+        state.codex_usage_text = agent
+            .codex_rate_limits
+            .as_ref()
+            .map(crate::views::codex_usage::format_usage_summary);
+    }
 
     let mut effects = Vec::new();
     if let Some(session_id) = session_id {
@@ -98,7 +106,12 @@ pub(super) fn open_usage_info_modal(
         });
     }
     // Silent refresh of the cached billing mirrors the modal renders from.
-    if billing_reachable {
+    if is_codex && !agent.chat_kind {
+        state.billing_loading = true;
+        effects.push(super::billing::account_usage_refresh_effect(
+            agent, id, true,
+        ));
+    } else if billing_reachable {
         state.billing_loading = true;
         effects.push(Effect::FetchBilling {
             agent_id: id,

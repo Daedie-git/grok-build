@@ -232,6 +232,15 @@ impl xai_tool_runtime::Tool for WaitTasksTool {
                 &waited,
                 wait_hint,
             )
+        } else if already_completed {
+            render_waited_results(
+                &input.task_ids,
+                &read_file_name,
+                max_output_bytes,
+                initial.results,
+                &Default::default(),
+                crate::implementations::grok_build::task_output::WaitHint::ReturnedEarly,
+            )
         } else {
             initial.results
         };

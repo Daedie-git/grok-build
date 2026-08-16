@@ -677,14 +677,16 @@ impl JsonlStorageAdapter {
             return Ok(false);
         }
 
+        let derived = super::chat_rebuild::derive_authoritative_history(&self.session_dir(info))?
+            .unwrap_or_else(|| checkpoint.compacted_history.clone());
         tracing::warn!(
             checkpoint_id = %marker.checkpoint_id,
             cached_items = cache.len(),
-            authoritative_items = checkpoint.compacted_history.len(),
-            "repairing stale or missing chat history from committed compaction checkpoint"
+            authoritative_items = derived.len(),
+            "repairing stale or missing chat history from committed compaction checkpoint plus later updates"
         );
         match self
-            .replace_chat_history_with_bookkeeping(info, &checkpoint.compacted_history)
+            .replace_chat_history_with_bookkeeping(info, &derived)
             .await
         {
             Ok(()) => Ok(true),

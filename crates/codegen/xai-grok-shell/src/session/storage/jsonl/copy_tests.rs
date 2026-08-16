@@ -155,6 +155,122 @@ async fn copy_uses_committed_rewind_instead_of_stale_chat_cache() {
     );
 }
 
+#[tokio::test]
+async fn review_regression_fork_before_native_compaction_does_not_copy_future_compacted_state() {
+    use crate::extensions::notification::{
+        CompactionCheckpointFile, CompactionCheckpointInfo,
+        FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION, SessionNotification as XaiNotification,
+        SessionUpdate as XaiSessionUpdate,
+    };
+
+    let temp_dir = TempDir::new().unwrap();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    let source = Info {
+        id: acp::SessionId::new("fork-pre-compact-source"),
+        cwd: "/source".to_string(),
+    };
+    let target = Info {
+        id: acp::SessionId::new("fork-pre-compact-target"),
+        cwd: "/source".to_string(),
+    };
+    adapter
+        .init_session(&source, default_model_id())
+        .await
+        .unwrap();
+
+    for update in [
+        fork_user_chunk("fork-pre-compact-source", "P0", 0),
+        fork_agent_chunk("fork-pre-compact-source", "A0"),
+        fork_user_chunk("fork-pre-compact-source", "P1", 1),
+        fork_agent_chunk("fork-pre-compact-source", "A1"),
+    ] {
+        adapter.append_update(&source, &update).await.unwrap();
+    }
+
+    let mut compatibility =
+        xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-fork", None);
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+        item_id: Some("cmp-future".into()),
+        internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
+    }];
+    let compacted = vec![
+        ConversationItem::system("system"),
+        ConversationItem::native_compaction_metadata(compatibility),
+        ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-future".into()),
+                encrypted_content: "future-compaction-cipher".into(),
+            },
+        ),
+    ];
+    let checkpoint = CompactionCheckpointFile {
+        checkpoint_id: "future-compact".into(),
+        prompt_index_at_compaction: 2,
+        compacted_history: compacted.clone(),
+        schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        original_user_info: None,
+        reread_file_paths: vec![],
+    };
+    adapter
+        .write_compaction_checkpoint(&source, &checkpoint)
+        .await
+        .unwrap();
+    adapter
+        .append_update(
+            &source,
+            &SessionUpdate::Xai(Box::new(XaiNotification {
+                session_id: source.id.clone(),
+                update: XaiSessionUpdate::CompactionCheckpoint(Box::new(
+                    CompactionCheckpointInfo {
+                        checkpoint_id: checkpoint.checkpoint_id.clone(),
+                        prompt_index_at_compaction: 2,
+                        checkpoint_file: "compaction_checkpoints/future-compact.json".into(),
+                        auto_continue: None,
+                        schema_version: FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
+                        created_at: checkpoint.created_at.clone(),
+                    },
+                )),
+                meta: None,
+            })),
+        )
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&source, &compacted)
+        .await
+        .unwrap();
+
+    adapter
+        .copy_session_data(
+            &source,
+            &target,
+            CopySessionOptions {
+                target_prompt_index: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let copied = adapter.load_session(&target).await.unwrap().chat_history;
+    assert!(
+        !copied.iter().any(|item| matches!(
+            item,
+            ConversationItem::Provider(provider) if provider.is_native_compaction_item()
+        )),
+        "a fork at P0 must not inherit a compaction committed after P1: {copied:?}"
+    );
+    assert!(
+        copied.iter().any(|item| item.text_content() == "P0"),
+        "fork at P0 must keep the pre-compaction prompt: {copied:?}"
+    );
+}
+
 /// Fork truncation targets the live branch (dead-branch runs from a
 /// prior rewind overlap its stamps, since indices are branch-local) and keeps
 /// prompt N inclusive in both the updates and chat (model-context) files.

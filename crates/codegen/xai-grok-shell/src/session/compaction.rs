@@ -3213,8 +3213,20 @@ impl SessionActor {
             }
             acp::Error::internal_error().data(error.message().to_owned())
         })?;
-        ensure_timeline_committed(outcome, op_name, self.session_info.id.0.as_ref())
-            .map_err(|message| acp::Error::internal_error().data(message))?;
+        let cache_status =
+            ensure_timeline_committed(outcome, op_name, self.session_info.id.0.as_ref())
+                .map_err(|message| acp::Error::internal_error().data(message))?;
+        if matches!(
+            cache_status,
+            crate::session::persistence::TimelineCacheStatus::RepairRequired(_)
+        ) {
+            self.compaction
+                .reconciliation_required
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Err(acp::Error::internal_error().data(format!(
+                "{op_name} committed but the chat cache was not replaced; reload the session before continuing"
+            )));
+        }
         tracing::info!(
             prompt_index_at_compaction,
             ?commit_kind,

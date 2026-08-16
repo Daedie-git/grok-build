@@ -2758,6 +2758,69 @@ fn fit_large_tool_result_jump_preserves_all_call_result_boundaries() {
     );
 }
 
+#[test]
+fn fit_preserves_tool_unit_across_response_siblings() {
+    use xai_grok_sampling_types::{ResponseOutputItemMetadata, ToolCall, rs};
+    let huge = "tool output ".repeat(20_000);
+    let conv = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::assistant_tool_calls(vec![ToolCall {
+            id: "call-a".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]),
+        ConversationItem::Reasoning(rs::ReasoningItem {
+            id: "rs-a".into(),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("cipher".into()),
+            status: None,
+        }),
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "resp-a".into(),
+            output_items: 0,
+            items: vec![],
+            origin: None,
+        }),
+        ConversationItem::tool_result("call-a", huge),
+    ];
+
+    let out = fit_conversation_to_budget(conv, 256);
+    assert!(out.iter().any(|item| matches!(
+        item,
+        ConversationItem::Assistant(assistant)
+            if assistant.tool_calls.iter().any(|call| call.id.as_ref() == "call-a")
+    )));
+    assert!(
+        out.iter()
+            .any(|item| matches!(item, ConversationItem::Reasoning(_)))
+    );
+    assert!(
+        out.iter()
+            .any(|item| matches!(item, ConversationItem::Provider(_)))
+    );
+    assert!(out.iter().any(|item| matches!(
+        item,
+        ConversationItem::ToolResult(result) if result.tool_call_id == "call-a"
+    )));
+
+    let wire = serde_json::to_value(xai_grok_sampling_types::rs::CreateResponse::from(
+        &xai_grok_sampling_types::ConversationRequest::from_items(out),
+    ))
+    .unwrap();
+    let input = wire["input"].as_array().unwrap();
+    assert!(
+        input
+            .iter()
+            .any(|item| { item["type"] == "function_call" && item["call_id"] == "call-a" })
+    );
+    assert!(
+        input
+            .iter()
+            .any(|item| { item["type"] == "function_call_output" && item["call_id"] == "call-a" })
+    );
+}
+
 /// A single oversized trailing text turn is also truncated in place, not dropped.
 #[test]
 fn fit_truncates_oversized_tail_text_item() {

@@ -8,7 +8,7 @@ use xai_grok_sampling_types::{
 use super::ChatStateActor;
 use super::request_builder::HARD_CLEAR_PLACEHOLDER;
 use crate::events::ChatStateEvent;
-use crate::types::ChatStateSnapshot;
+use crate::types::{ChatStateSnapshot, ConversationRewindState};
 
 /// Static string label for tracing on `ConversationItem` (avoids pulling
 /// the `Role` enum into the format string).
@@ -604,16 +604,29 @@ impl ChatStateActor {
         changed
     }
 
-    /// Install an externally-persisted rewind and publish the same reset/token
-    /// events as a normal conversation replacement, without writing history a
-    /// second time.
-    pub(super) fn install_persisted_rewind(&mut self, snap: ChatStateSnapshot) {
-        self.restore_snapshot(snap);
+    /// Install only rewind-owned timeline fields after the durable marker
+    /// committed. Sampling config, credentials, and unrelated lifecycle
+    /// fields stay on the live identity.
+    pub(super) fn install_conversation_rewind(&mut self, rewind: ConversationRewindState) {
+        self.snapshot_turn_slice();
+        self.state.conversation = rewind.conversation;
+        self.rebase_turn_capture_offset();
+        self.state.prompt_index = rewind.prompt_index;
+        self.state.prompt_texts = rewind.prompt_texts;
+        self.state.last_compaction_prompt_index = rewind.last_compaction_prompt_index;
+        self.state.total_tokens =
+            super::state::estimate_conversation_tokens(&self.state.conversation);
+        self.state.estimated_tokens_since_model = 0;
+        self.state.estimate_at_last_response = self.state.total_tokens;
+        self.state.prompt_usage = None;
         self.send_event(ChatStateEvent::ConversationReset {
             new_len: self.state.conversation.len(),
         });
         self.send_event(ChatStateEvent::TokensUpdated {
             total_tokens: self.state.total_tokens,
+        });
+        self.send_event(ChatStateEvent::PromptIndexChanged {
+            new_index: self.state.prompt_index,
         });
     }
 

@@ -10,8 +10,8 @@ use xai_grok_sampling_types::{
 
 use crate::commands::{ChatStateCommand, RepairHistoryBlocked, StrictAppendAck, StrictAppendError};
 use crate::types::{
-    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    SamplingState, SamplingTransitionResult, TurnCapture,
+    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, ConversationRewindState,
+    Credentials, NotificationMeta, SamplingState, SamplingTransitionResult, TurnCapture,
 };
 
 /// Handle to communicate with ChatStateActor.
@@ -230,15 +230,34 @@ impl ChatStateHandle {
         .await
     }
 
-    /// Install a complete rewind snapshot whose durable marker already
-    /// committed. Returns only after the actor made the snapshot live and does
-    /// not persist history a second time.
-    pub async fn install_persisted_rewind(&self, snapshot: ChatStateSnapshot) -> Option<()> {
-        self.query("InstallPersistedRewind", |reply| {
-            ChatStateCommand::InstallPersistedRewind {
-                snapshot: Box::new(snapshot),
+    /// Atomically enter the rewind transaction gate and capture the source
+    /// snapshot. Timeline-dependent commands wait until install or abort.
+    /// Returns `None` if the actor is unavailable or another rewind owns the
+    /// gate.
+    pub async fn begin_conversation_rewind(&self) -> Option<ChatStateSnapshot> {
+        self.query("BeginConversationRewind", |reply| {
+            ChatStateCommand::BeginConversationRewind { reply }
+        })
+        .await
+        .flatten()
+    }
+
+    /// Install only rewind-owned timeline fields after the durable marker
+    /// committed, then replay queued conversation mutations.
+    pub async fn install_conversation_rewind(&self, state: ConversationRewindState) -> Option<()> {
+        self.query("InstallConversationRewind", |reply| {
+            ChatStateCommand::InstallConversationRewind {
+                state: Box::new(state),
                 reply,
             }
+        })
+        .await
+    }
+
+    /// Release the rewind gate without installing.
+    pub async fn abort_conversation_rewind(&self) -> Option<()> {
+        self.query("AbortConversationRewind", |reply| {
+            ChatStateCommand::AbortConversationRewind { reply }
         })
         .await
     }

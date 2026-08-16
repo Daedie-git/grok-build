@@ -59,13 +59,26 @@ struct GrokRequestHeaders<'a> {
 }
 
 impl GrokRequestHeaders<'_> {
-    fn apply(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn apply(
+        &self,
+        builder: reqwest::RequestBuilder,
+        uses_chatgpt_auth: bool,
+    ) -> reqwest::RequestBuilder {
         let mut b = builder
             .header("x-grok-conv-id", self.conv_id)
             .header("x-grok-req-id", self.req_id)
             .header("x-grok-model-override", self.model_id)
             .header("x-grok-session-id", self.session_id)
             .header("x-grok-agent-id", self.agent_id);
+        if uses_chatgpt_auth && !self.session_id.is_empty() {
+            // Match the first-party Codex Responses correlation contract.
+            // Grok's session id is the authoritative thread identity in this
+            // client, so use it for both session- and thread-scoped headers.
+            b = b
+                .header("session-id", self.session_id)
+                .header("thread-id", self.session_id)
+                .header("x-client-request-id", self.session_id);
+        }
         if let Some(idx) = self.turn_idx {
             b = b.header("x-grok-turn-idx", idx);
         }
@@ -856,6 +869,12 @@ impl SamplingClient {
             |var| std::env::var(var).ok(),
             &mut headers,
         )?;
+        if provider.capabilities().uses_chatgpt_auth() {
+            headers.insert(
+                HeaderName::from_static(xai_grok_sampling_types::CODEX_ORIGINATOR_HEADER),
+                HeaderValue::from_static(xai_grok_sampling_types::CODEX_ORIGINATOR_VALUE),
+            );
+        }
         let chatgpt_account_id = sampling_identity_from_effective_headers(
             provider.protocol(),
             &config.base_url,
@@ -1252,7 +1271,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers.apply(builder).json(&payload);
+        let http_request = grok_headers
+            .apply(builder, self.provider.capabilities().uses_chatgpt_auth())
+            .json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
@@ -1313,7 +1334,7 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
         let http_request = grok_headers
-            .apply(builder)
+            .apply(builder, self.provider.capabilities().uses_chatgpt_auth())
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&streaming_request);
 
@@ -1494,6 +1515,16 @@ impl SamplingClient {
         self.responses_wire.normalize_create_response(request);
     }
 
+    fn normalize_unary_response_for_backend(&self, request: &mut CreateResponseWrapper) {
+        self.normalize_response_for_backend(request);
+        if self.responses_wire.preserves_response_metadata() {
+            // Codex ordinary sampling normally requires SSE. This public unary
+            // API must nevertheless describe an actual unary request instead
+            // of asking for SSE and then parsing the body as one JSON object.
+            request.inner.stream = None;
+        }
+    }
+
     fn apply_responses_sideband(
         sideband: crate::responses_wire::ResponsesSideband,
         turn_routing_state: Option<&TurnRoutingState>,
@@ -1552,12 +1583,23 @@ impl SamplingClient {
             SamplingError::Serialization(error)
         })?;
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
+        self.responses_wire.append_client_metadata(
+            &mut request_body,
+            request
+                .x_grok_session_id
+                .as_deref()
+                .or(request.x_grok_conv_id.as_deref()),
+            request.x_grok_req_id.as_deref(),
+        )?;
         let turn_routing_state = request.turn_routing_state.as_ref();
         let SentRequest {
             builder: compact_builder,
             sent_bearer,
         } = self.post(self.endpoint("responses/compact"));
-        let compact_builder = tracking.apply(compact_builder);
+        let compact_builder = tracking.apply(
+            compact_builder,
+            self.provider.capabilities().uses_chatgpt_auth(),
+        );
         let compact_builder = self
             .responses_wire
             .apply_turn_routing(compact_builder, turn_routing_state);
@@ -1642,7 +1684,7 @@ impl SamplingClient {
         mut request: CreateResponseWrapper,
     ) -> Result<xai_grok_sampling_types::DecodedResponse> {
         self.apply_response_defaults(&mut request)?;
-        self.normalize_response_for_backend(&mut request);
+        self.normalize_unary_response_for_backend(&mut request);
 
         let x_grok_conv_id = request.x_grok_conv_id.as_deref().unwrap_or_default();
         let x_grok_req_id = request.x_grok_req_id.as_deref().unwrap_or_default();
@@ -1686,15 +1728,21 @@ impl SamplingClient {
             &request.response_item_metadata_passthrough,
         )
         .map_err(SamplingError::serialization_message)?;
+        self.responses_wire
+            .finalize_serialized_request(&mut request_body, &request)?;
         let turn_routing_state = request.turn_routing_state.as_ref();
         let SentRequest {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder);
+        let http_request =
+            grok_headers.apply(builder, self.provider.capabilities().uses_chatgpt_auth());
         let http_request = self
             .responses_wire
-            .apply_turn_routing(http_request, turn_routing_state)
+            .apply_turn_routing(http_request, turn_routing_state);
+        let http_request = self
+            .responses_wire
+            .apply_request_headers(http_request, &model_id)
             .json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1819,7 +1867,6 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let extra_tool_entries = std::mem::take(&mut request.extra_tool_entries);
         let mut request_body = serde_json::to_value(&request.inner).map_err(|e| {
             tracing::error!("Failed to serialize responses request: {}", e);
             SamplingError::Serialization(e)
@@ -1827,15 +1874,6 @@ impl SamplingClient {
         // Inject xAI-specific fields not in async-openai's CreateResponse type.
         if self.defaults.stream_tool_calls {
             request_body["stream_tool_calls"] = serde_json::json!(true);
-        }
-        // Inject xAI-specific tools (e.g., x_search) that can't be expressed
-        // via async_openai's rs::Tool enum.
-        if !extra_tool_entries.is_empty() {
-            if let Some(tools) = request_body.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                tools.extend(extra_tool_entries);
-            } else {
-                request_body["tools"] = serde_json::Value::Array(extra_tool_entries);
-            }
         }
         append_response_includes(&mut request_body, &self.defaults.extra_response_includes);
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
@@ -1849,6 +1887,8 @@ impl SamplingClient {
             &request.response_item_metadata_passthrough,
         )
         .map_err(SamplingError::serialization_message)?;
+        self.responses_wire
+            .finalize_serialized_request(&mut request_body, &request)?;
         // Fresh per attempt so signals never leak across retries; `None`
         // (check disabled) sends no header and does no peek work per event.
         let doom_loop = self
@@ -1860,10 +1900,14 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let http_request = grok_headers.apply(builder);
+        let http_request =
+            grok_headers.apply(builder, self.provider.capabilities().uses_chatgpt_auth());
+        let http_request = self
+            .responses_wire
+            .apply_turn_routing(http_request, turn_routing_state);
         let mut http_request = self
             .responses_wire
-            .apply_turn_routing(http_request, turn_routing_state)
+            .apply_request_headers(http_request, &model_id)
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(policy) = self.defaults.doom_loop_recovery {
             http_request =
@@ -2100,7 +2144,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("messages"));
-        let http_request = grok_headers.apply(builder).json(&request.inner);
+        let http_request = grok_headers
+            .apply(builder, self.provider.capabilities().uses_chatgpt_auth())
+            .json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
@@ -2215,7 +2261,7 @@ impl SamplingClient {
             sent_bearer,
         } = self.post(self.endpoint("messages"));
         let http_request = grok_headers
-            .apply(builder)
+            .apply(builder, self.provider.capabilities().uses_chatgpt_auth())
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
             .json(&request.inner);
 
@@ -2379,11 +2425,8 @@ impl SamplingClient {
         &self,
         model: &str,
     ) -> Option<xai_grok_sampling_types::ResponseMetadataOrigin> {
-        let identity = self.sampling_identity_for_model(model);
-        xai_grok_sampling_types::ResponseMetadataOrigin::codex(
-            &identity.base_url,
-            &identity.model,
-            identity.chatgpt_account_id,
+        xai_grok_sampling_types::ResponseMetadataOrigin::from_sampling_identity(
+            &self.sampling_identity_for_model(model),
         )
     }
 
@@ -3040,6 +3083,10 @@ mod tests {
         assert_eq!(wrapper.inner.temperature, Some(0.6));
         assert_eq!(wrapper.inner.top_p, Some(0.9));
         assert_eq!(wrapper.inner.max_output_tokens, Some(2048));
+        assert!(
+            client.response_metadata_origin("test-model").is_none(),
+            "an explicit custom provider must not acquire Codex history origin from its URL"
+        );
     }
 
     #[test]
@@ -3075,6 +3122,9 @@ mod tests {
                 "last-mile Codex body must omit {field}: {wire:#}"
             );
         }
+
+        client.normalize_unary_response_for_backend(&mut wrapper);
+        assert_eq!(wrapper.inner.stream, None);
     }
 
     /// Verify the serialized shape of StreamingChatRequest matches the
@@ -3451,6 +3501,22 @@ mod tests {
         .unwrap();
         let client = SamplingClient::new(config).unwrap();
         assert_eq!(identity.chatgpt_account_id, client.chatgpt_account_id);
+    }
+
+    #[test]
+    fn codex_client_sets_required_originator_header() {
+        let mut config = minimal_config();
+        config.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+        config.api_backend = ApiBackend::Responses;
+        config.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.into();
+        let client = SamplingClient::new(config).unwrap();
+        assert_eq!(
+            client
+                .default_headers
+                .get(xai_grok_sampling_types::CODEX_ORIGINATOR_HEADER)
+                .unwrap(),
+            xai_grok_sampling_types::CODEX_ORIGINATOR_VALUE
+        );
     }
 
     #[test]

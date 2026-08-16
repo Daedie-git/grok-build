@@ -31,7 +31,8 @@ pub(crate) use auth_provider::{
 pub(crate) use auth_provider::{test_backdate_provider_mint, test_counting_provider};
 pub use codex::{
     CodexAuthError, CodexCredentials, default_auth_path as codex_auth_path, load_codex_credentials,
-    load_codex_credentials_async, run_cli_login_codex,
+    load_codex_credentials_async, read_codex_credentials, recover_rejected_codex_credentials_async,
+    run_cli_login_codex,
 };
 pub(crate) use config::LEGACY_AUTH_SCOPE;
 pub use config::{

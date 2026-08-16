@@ -92,6 +92,16 @@ impl SessionActor {
             Err(xai_chat_state::SamplingTransitionError::History(error)) => {
                 return Err(acp::Error::invalid_params().data(error.to_string()));
             }
+            Err(xai_chat_state::SamplingTransitionError::HistoryReplacementIndeterminate(
+                error,
+            )) => {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(acp::Error::internal_error().data(format!(
+                    "sampling identity persistence is indeterminate; reload required: {error}"
+                )));
+            }
             Err(error) => {
                 return Err(acp::Error::internal_error().data(error.to_string()));
             }
@@ -231,6 +241,16 @@ impl SessionActor {
             }
             Err(xai_chat_state::SamplingTransitionError::History(error)) => {
                 return Err(acp::Error::invalid_params().data(error.to_string()));
+            }
+            Err(xai_chat_state::SamplingTransitionError::HistoryReplacementIndeterminate(
+                error,
+            )) => {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(acp::Error::internal_error().data(format!(
+                    "sampling identity persistence is indeterminate; reload required: {error}"
+                )));
             }
             Err(error) => {
                 return Err(acp::Error::internal_error().data(error.to_string()));

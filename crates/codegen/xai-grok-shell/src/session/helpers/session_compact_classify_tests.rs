@@ -47,6 +47,7 @@ fn sampling_non_api_variants_classify_correctly() {
             error_type: "overloaded_error".into(),
             message: "try again".into(),
             code: None,
+            status: None,
         }
     )));
     assert!(is_det(&classify_sampling_error(
@@ -54,6 +55,7 @@ fn sampling_non_api_variants_classify_correctly() {
             error_type: "unknown".into(),
             message: "The prompt is too long for this model's context window.".into(),
             code: None,
+            status: None,
         }
     )));
 }

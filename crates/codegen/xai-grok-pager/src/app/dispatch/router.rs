@@ -1610,13 +1610,33 @@ fn dispatch_cycle_effort(app: &mut AppView) -> Vec<Effect> {
         return vec![];
     }
     let Some(session_id) = agent.session.session_id.clone() else {
+        let prev_model = agent.session.models.current.clone();
+        let prev_effort = agent.session.models.reasoning_effort;
+        agent
+            .session
+            .models
+            .set_current(model_id.clone(), Some(next));
+        let resolved_effort = agent.session.models.reasoning_effort;
+        let rollback_prev = agent
+            .session
+            .deferred_model_switch
+            .take()
+            .and_then(|prior| prior.prev_model_id)
+            .or(prev_model);
         agent.session.deferred_model_switch = Some(crate::app::agent::DeferredModelSwitch {
-            model_id,
-            effort: Some(next),
-            prev_model_id: None,
+            model_id: model_id.clone(),
+            effort: resolved_effort,
+            prev_model_id: rollback_prev,
         });
         agent.show_toast(&format!("Reasoning effort: {next}"));
-        return vec![];
+        return if prev_effort == resolved_effort {
+            vec![]
+        } else {
+            vec![Effect::PersistPreferredModel {
+                model_id,
+                reasoning_effort: resolved_effort,
+            }]
+        };
     };
     agent.session.model_switch_pending = true;
     agent.show_toast(&format!("Reasoning effort: {next}"));

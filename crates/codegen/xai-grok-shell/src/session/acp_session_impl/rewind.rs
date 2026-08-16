@@ -264,19 +264,52 @@ impl SessionActor {
             use crate::extensions::notification::{
                 SessionNotification, SessionUpdate as XaiSessionUpdate,
             };
+            use xai_chat_state::ConversationRewindState;
+
+            let Some(mut prepared_snapshot) =
+                self.chat_state_handle.begin_conversation_rewind().await
+            else {
+                anyhow::bail!(
+                    "rewind could not enter the chat-state transaction gate; original history remains live"
+                );
+            };
+            let abort_rewind = || async {
+                let _ = self.chat_state_handle.abort_conversation_rewind().await;
+            };
 
             let session_dir = crate::session::persistence::session_dir(&self.session_info);
             let updates_path = session_dir.join("updates.jsonl");
-            let mut prepared_snapshot = live_snapshot.clone().ok_or_else(|| {
-                anyhow::anyhow!("chat-state actor unavailable while preparing rewind")
-            })?;
+            if target_index >= prepared_snapshot.prompt_index {
+                abort_rewind().await;
+                return Ok(RewindResponse {
+                    success: false,
+                    target_prompt_index: target_index,
+                    mode,
+                    reverted_files: vec![],
+                    clean_files,
+                    conflicts,
+                    prompt_text: None,
+                    error: Some(format!(
+                        "Cannot rewind to prompt #{} — current prompt index is {}. \
+                         Valid targets: 0..{}",
+                        target_index,
+                        prepared_snapshot.prompt_index,
+                        prepared_snapshot.prompt_index.saturating_sub(1)
+                    )),
+                });
+            }
             prompt_text = prepared_snapshot.prompt_texts.get(target_index).cloned();
             let mut conversation = prepared_snapshot.conversation.clone();
 
             // Cross-compaction replay recomputes whether a compaction summary
             // survives; `None` keeps the existing marker (standard truncation).
+            // Targets at or after the last compaction boundary must truncate
+            // the rich live snapshot rather than rebuild text-only ACP chunks.
             let mut replay_compaction_marker: Option<Option<usize>> = None;
-            if prepared_snapshot.last_compaction_prompt_index.is_some() {
+            let rewind_across_compaction = prepared_snapshot
+                .last_compaction_prompt_index
+                .is_some_and(|boundary| target_index < boundary);
+            if rewind_across_compaction {
                 // Cross-compaction rewind: reconstruct conversation from updates.jsonl.
                 // Run on the blocking pool since replay does synchronous file I/O
                 // (reading checkpoint files + scanning updates.jsonl).
@@ -290,7 +323,14 @@ impl SessionActor {
                     )
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("spawn_blocking panicked: {e}"));
+                let replay_result = match replay_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        abort_rewind().await;
+                        return Err(error);
+                    }
+                };
                 match replay_result {
                     Ok(replay_result) => {
                         tracing::info!(
@@ -321,6 +361,7 @@ impl SessionActor {
                             target_index,
                             "Cross-compaction replay failed — rewind aborted"
                         );
+                        abort_rewind().await;
                         return Ok(RewindResponse {
                             success: false,
                             target_prompt_index: target_index,
@@ -348,12 +389,19 @@ impl SessionActor {
             prepared_snapshot.prompt_texts.truncate(target_index);
             prepared_snapshot.last_compaction_prompt_index =
                 replay_compaction_marker.unwrap_or(prepared_snapshot.last_compaction_prompt_index);
+            let rewind_state = ConversationRewindState::from_snapshot(&prepared_snapshot);
 
             let transaction_id = uuid::Uuid::new_v4().to_string();
             let created_at = chrono::Utc::now().to_rfc3339();
-            let rewound_history_json = serde_json::to_string(&conversation).map_err(|error| {
-                anyhow::anyhow!("failed to serialize rewind transaction history: {error}")
-            })?;
+            let rewound_history_json = match serde_json::to_string(&conversation) {
+                Ok(json) => json,
+                Err(error) => {
+                    abort_rewind().await;
+                    return Err(anyhow::anyhow!(
+                        "failed to serialize rewind transaction history: {error}"
+                    ));
+                }
+            };
             let marker =
                 crate::session::storage::SessionUpdate::Xai(Box::new(SessionNotification {
                     session_id: self.session_info.id.clone(),
@@ -366,18 +414,21 @@ impl SessionActor {
                     meta: Some(self.build_notification_meta()),
                 }));
             let (respond_to, response) = tokio::sync::oneshot::channel();
-            self.notifications
+            if self
+                .notifications
                 .persistence_tx
                 .send(PersistenceMsg::InstallRewindAndAck {
                     marker,
                     replacement: conversation.clone(),
                     respond_to,
                 })
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "rewind persistence channel closed before marker commit; original history remains live"
-                    )
-                })?;
+                .is_err()
+            {
+                abort_rewind().await;
+                anyhow::bail!(
+                    "rewind persistence channel closed before marker commit; original history remains live"
+                );
+            }
 
             let verification_updates = updates_path.clone();
             let verification_id = transaction_id.clone();
@@ -398,27 +449,49 @@ impl SessionActor {
                         )
                     },
                 )
-                .await
-                .map_err(|error| {
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
                     if error.requires_reconciliation() {
                         self.compaction
                             .reconciliation_required
                             .store(true, std::sync::atomic::Ordering::Release);
                     }
-                    anyhow::anyhow!("{}", error.message())
-                })?;
-            crate::session::helpers::timeline_transaction::ensure_timeline_committed(
-                outcome,
-                "rewind",
-                self.session_info.id.0.as_ref(),
-            )
-            .map_err(anyhow::Error::msg)?;
+                    abort_rewind().await;
+                    anyhow::bail!("{}", error.message());
+                }
+            };
+            let cache_status =
+                match crate::session::helpers::timeline_transaction::ensure_timeline_committed(
+                    outcome,
+                    "rewind",
+                    self.session_info.id.0.as_ref(),
+                ) {
+                    Ok(status) => status,
+                    Err(message) => {
+                        abort_rewind().await;
+                        anyhow::bail!("{message}");
+                    }
+                };
+            if matches!(
+                cache_status,
+                crate::session::persistence::TimelineCacheStatus::RepairRequired(_)
+            ) {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                abort_rewind().await;
+                anyhow::bail!(
+                    "rewind committed but the chat cache was not replaced; reload the session before continuing"
+                );
+            }
 
-            // The marker is now authoritative. Install the complete prepared
-            // snapshot with an acknowledged no-persistence actor command.
+            // The marker is now authoritative. Install only rewind-owned
+            // timeline fields, then replay queued conversation mutations.
             if self
                 .chat_state_handle
-                .install_persisted_rewind(prepared_snapshot)
+                .install_conversation_rewind(rewind_state)
                 .await
                 .is_none()
             {
@@ -429,6 +502,14 @@ impl SessionActor {
                     "rewind committed but could not be installed in live chat state; reload required"
                 );
             }
+
+            // A recap generated from the pre-rewind snapshot must neither
+            // finish late nor remain persisted after the removed turns.
+            self.abort_turn_summary();
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::LastTurnSummary(None));
 
             if let Ok(mut pending) = self.rewind_pending_prompt.lock() {
                 *pending = prompt_text.clone();

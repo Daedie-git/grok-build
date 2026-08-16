@@ -151,6 +151,15 @@ async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
         captured.headers.get("x-grok-session-id").unwrap(),
         "session-native"
     );
+    assert_eq!(
+        captured.headers.get("session-id").unwrap(),
+        "session-native"
+    );
+    assert_eq!(captured.headers.get("thread-id").unwrap(), "session-native");
+    assert_eq!(
+        captured.headers.get("x-client-request-id").unwrap(),
+        "session-native"
+    );
     assert_eq!(captured.headers.get("x-grok-turn-idx").unwrap(), "7");
     assert_eq!(
         captured.headers.get("x-grok-agent-id").unwrap(),
@@ -165,6 +174,23 @@ async fn native_compact_uses_exact_path_headers_body_and_decodes_replacement() {
     assert_eq!(captured.body["parallel_tool_calls"], true);
     assert!(captured.body["tools"].is_array());
     assert!(captured.body["reasoning"].is_object());
+    assert_eq!(
+        captured.body["client_metadata"]["session_id"],
+        "session-native"
+    );
+    assert_eq!(
+        captured.body["client_metadata"]["thread_id"],
+        "session-native"
+    );
+    assert_eq!(captured.body["client_metadata"]["turn_id"], "req-native");
+    for key in ["x-codex-installation-id", "x-codex-window-id"] {
+        uuid::Uuid::parse_str(
+            captured.body["client_metadata"][key]
+                .as_str()
+                .expect("Codex client identity"),
+        )
+        .expect("Codex client identity is a UUID");
+    }
     for unsupported in [
         "temperature",
         "top_p",

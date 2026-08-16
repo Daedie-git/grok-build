@@ -343,7 +343,11 @@ fn build_responses_tools(req: &ConversationRequest) -> Vec<rs::Tool> {
                 name: t.name.clone(),
                 description: t.description.clone(),
                 parameters: Some(t.parameters.clone()),
-                strict: None,
+                // The Responses API defaults an omitted `strict` field to
+                // strict schema validation. Grok Build tool schemas are not
+                // guaranteed to satisfy that contract, and the Codex client
+                // explicitly sends false for the same reason.
+                strict: Some(false),
             })
         })
         .collect();

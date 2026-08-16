@@ -1,7 +1,9 @@
 //! Whole-conversation policy for provider-owned durable history.
 
 use crate::conversation::ConversationItem;
-use crate::provider_history::{NativeCompactionCompatibility, NativeCompactionItemKind};
+use crate::provider_history::{
+    NativeCompactionCompatibility, NativeCompactionItemKind, ResponseOutputItemKind,
+};
 use crate::sampling_identity::SamplingIdentity;
 use crate::types::ApiBackend;
 
@@ -13,20 +15,88 @@ pub fn strip_incompatible_response_metadata_for_identity(
     items: &mut Vec<ConversationItem>,
     identity: &SamplingIdentity,
 ) -> bool {
-    let original_len = items.len();
-    items.retain(|item| {
-        !matches!(
-            item,
-            ConversationItem::Provider(provider)
-                if provider.as_response_output_metadata().is_some_and(|metadata| {
-                    !metadata
-                        .origin
+    // Incompatible ordinary response manifests are complete ordered groups.
+    // Preserve semantic messages (clearing provider-owned IDs), remove the
+    // matching provider-owned reasoning items, and drop the sidecar itself.
+    // Native-compaction segments are a separate fail-closed policy and are
+    // not ordinary response metadata.
+    let mut index = 0usize;
+    let mut changed = false;
+    while index < items.len() {
+        let Some(metadata) = items.get(index).and_then(|item| match item {
+            ConversationItem::Provider(provider) => provider.as_response_output_metadata(),
+            _ => None,
+        }) else {
+            index += 1;
+            continue;
+        };
+        if metadata
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.matches_identity(identity))
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut message_ids = std::collections::BTreeSet::new();
+        let mut reasoning_ids = std::collections::BTreeSet::new();
+        for entry in &metadata.items {
+            match entry.kind {
+                ResponseOutputItemKind::Message => {
+                    if let Some(id) = entry.item_id.clone() {
+                        message_ids.insert(id);
+                    }
+                }
+                ResponseOutputItemKind::Reasoning => {
+                    if let Some(id) = entry.item_id.clone() {
+                        reasoning_ids.insert(id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        items.remove(index);
+        changed = true;
+
+        while index < items.len() {
+            if matches!(
+                &items[index],
+                ConversationItem::Provider(provider) if provider.as_response_output_metadata().is_some()
+            ) {
+                break;
+            }
+            match &mut items[index] {
+                ConversationItem::User(user) => {
+                    if user
+                        .response_item_id
                         .as_ref()
-                        .is_some_and(|origin| origin.matches_identity(identity))
-                })
-        )
-    });
-    items.len() != original_len
+                        .is_some_and(|id| message_ids.remove(id))
+                    {
+                        user.response_item_id = None;
+                    }
+                    index += 1;
+                }
+                ConversationItem::Assistant(assistant) => {
+                    if assistant
+                        .response_item_id
+                        .as_ref()
+                        .is_some_and(|id| message_ids.remove(id))
+                    {
+                        assistant.response_item_id = None;
+                    }
+                    index += 1;
+                }
+                ConversationItem::Reasoning(reasoning)
+                    if reasoning_ids.remove(reasoning.id.as_str()) =>
+                {
+                    items.remove(index);
+                }
+                _ => index += 1,
+            }
+        }
+    }
+    changed
 }
 
 /// Backward-compatible field-wise wrapper. New state-transition code should
@@ -286,4 +356,157 @@ pub fn prepare_history_for_sampling_identity(
     Ok(strip_incompatible_response_metadata_for_identity(
         items, identity,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_history::{
+        ResponseMetadataOrigin, ResponseOutputItemMetadata, ResponseOutputItemOrder,
+    };
+
+    fn codex_identity(model: &str) -> SamplingIdentity {
+        SamplingIdentity::new(
+            ApiBackend::Responses,
+            crate::CODEX_BACKEND_BASE_URL,
+            model,
+            Some("account-a".into()),
+        )
+    }
+
+    fn message_manifest(model: &str, item_id: &str) -> ConversationItem {
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "response-a".into(),
+            output_items: 1,
+            items: vec![ResponseOutputItemOrder {
+                output_index: 0,
+                kind: ResponseOutputItemKind::Message,
+                item_id: Some(item_id.into()),
+                call_id: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            origin: ResponseMetadataOrigin::codex(
+                crate::CODEX_BACKEND_BASE_URL,
+                model,
+                Some("account-a".into()),
+            ),
+        })
+    }
+
+    fn reasoning_manifest(model: &str, item_id: &str) -> ConversationItem {
+        ConversationItem::response_output_metadata(ResponseOutputItemMetadata {
+            response_id: "response-rs".into(),
+            output_items: 1,
+            items: vec![ResponseOutputItemOrder {
+                output_index: 0,
+                kind: ResponseOutputItemKind::Reasoning,
+                item_id: Some(item_id.into()),
+                call_id: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            origin: ResponseMetadataOrigin::codex(
+                crate::CODEX_BACKEND_BASE_URL,
+                model,
+                Some("account-a".into()),
+            ),
+        })
+    }
+
+    fn signed_reasoning(id: &str) -> ConversationItem {
+        ConversationItem::Reasoning(crate::rs::ReasoningItem {
+            id: id.into(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("codex-signed-cipher".into()),
+            status: None,
+        })
+    }
+
+    #[test]
+    fn incompatible_manifest_clears_its_message_owner_id() {
+        let mut assistant = ConversationItem::assistant("hello");
+        let ConversationItem::Assistant(owner) = &mut assistant else {
+            unreachable!()
+        };
+        owner.response_item_id = Some("msg-a".into());
+        let mut history = vec![message_manifest("codex-a", "msg-a"), assistant];
+
+        assert!(strip_incompatible_response_metadata_for_identity(
+            &mut history,
+            &codex_identity("codex-b")
+        ));
+        assert_eq!(history.len(), 1);
+        let ConversationItem::Assistant(owner) = &history[0] else {
+            panic!("semantic owner was removed")
+        };
+        assert_eq!(owner.response_item_id, None);
+    }
+
+    #[test]
+    fn compatible_manifest_preserves_message_owner_id() {
+        let mut assistant = ConversationItem::assistant("hello");
+        let ConversationItem::Assistant(owner) = &mut assistant else {
+            unreachable!()
+        };
+        owner.response_item_id = Some("msg-a".into());
+        let mut history = vec![message_manifest("codex-a", "msg-a"), assistant];
+
+        assert!(!strip_incompatible_response_metadata_for_identity(
+            &mut history,
+            &codex_identity("codex-a")
+        ));
+        assert_eq!(history.len(), 2);
+        let ConversationItem::Assistant(owner) = &history[1] else {
+            panic!("semantic owner was removed")
+        };
+        assert_eq!(owner.response_item_id.as_deref(), Some("msg-a"));
+    }
+
+    #[test]
+    fn incompatible_manifest_does_not_clear_same_id_in_a_later_group() {
+        let mut unrelated = ConversationItem::assistant("later");
+        let ConversationItem::Assistant(owner) = &mut unrelated else {
+            unreachable!()
+        };
+        owner.response_item_id = Some("msg-a".into());
+        let mut history = vec![
+            message_manifest("codex-old", "msg-a"),
+            ConversationItem::assistant("owner missing from malformed old group"),
+            message_manifest("codex-new", "msg-a"),
+            unrelated,
+        ];
+
+        assert!(strip_incompatible_response_metadata_for_identity(
+            &mut history,
+            &codex_identity("codex-new")
+        ));
+        let ConversationItem::Assistant(owner) = &history[2] else {
+            panic!("later semantic owner was removed")
+        };
+        assert_eq!(owner.response_item_id.as_deref(), Some("msg-a"));
+    }
+
+    #[test]
+    fn incompatible_codex_manifest_removes_its_signed_reasoning_item() {
+        let mut history = vec![
+            reasoning_manifest("codex-a", "rs-a"),
+            signed_reasoning("rs-a"),
+            ConversationItem::assistant("portable text"),
+        ];
+
+        assert!(strip_incompatible_response_metadata_for_identity(
+            &mut history,
+            &SamplingIdentity::new(
+                ApiBackend::ChatCompletions,
+                "https://api.x.ai/v1",
+                "grok-4",
+                None,
+            )
+        ));
+        assert_eq!(history.len(), 1);
+        assert!(
+            matches!(&history[0], ConversationItem::Assistant(_)),
+            "Codex-encrypted reasoning must not cross into a Grok request"
+        );
+    }
 }

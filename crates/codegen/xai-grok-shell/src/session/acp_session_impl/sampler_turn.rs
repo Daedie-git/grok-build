@@ -271,6 +271,105 @@ impl SessionActor {
         creds.api_key = Some(new_key);
         self.chat_state_handle.update_credentials(creds);
     }
+    fn sampling_config_uses_codex_auth(config: &xai_grok_sampling_types::SamplingConfig) -> bool {
+        xai_grok_sampling_types::resolve_provider(
+            config.provider_id,
+            config.api_backend.clone(),
+            &config.base_url,
+        )
+        .capabilities()
+        .uses_chatgpt_auth()
+            && xai_grok_sampling_types::is_codex_backend_url(&config.base_url)
+    }
+    /// Refresh provider-native Codex credentials and install the token and
+    /// account header as one authoritative sampling-state transition.
+    async fn refresh_codex_credentials(&self, force: bool) -> bool {
+        let Some(mut state) = self.chat_state_handle.get_sampling_state().await else {
+            return false;
+        };
+        if !Self::sampling_config_uses_codex_auth(&state.config) {
+            return false;
+        }
+        let loaded = if force {
+            crate::auth::recover_rejected_codex_credentials_async(
+                &crate::auth::codex_auth_path(),
+                state.credentials.api_key.as_deref(),
+            )
+            .await
+        } else {
+            crate::auth::load_codex_credentials_async(&crate::auth::codex_auth_path()).await
+        };
+        let credentials = match loaded {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                tracing::warn!(
+                    model = %state.config.model,
+                    %error,
+                    force,
+                    "Codex credential refresh failed"
+                );
+                return false;
+            }
+        };
+
+        let current_account_id = state
+            .config
+            .extra_headers
+            .iter()
+            .find(|(name, _)| {
+                name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+            })
+            .map(|(_, value)| value.as_str());
+        if state.credentials.api_key.as_deref() == Some(credentials.access_token.as_str())
+            && current_account_id == credentials.account_id.as_deref()
+            && state.credentials.auth_type == xai_chat_state::AuthType::ApiKey
+        {
+            return true;
+        }
+
+        state.config.extra_headers.retain(|name, _| {
+            !name.eq_ignore_ascii_case(xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER)
+        });
+        if let Some(account_id) = credentials.account_id {
+            state.config.extra_headers.insert(
+                xai_grok_sampling_types::CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                account_id,
+            );
+        }
+        state.credentials.api_key = Some(credentials.access_token);
+        state.credentials.auth_type = xai_chat_state::AuthType::ApiKey;
+        let identity =
+            xai_grok_sampling_types::SamplingIdentity::from_sampling_config(&state.config);
+        let target =
+            match xai_grok_sampling_types::ResolvedSamplingTarget::new(state.config, identity) {
+                Ok(target) => target,
+                Err(error) => {
+                    tracing::error!(%error, "refusing mismatched Codex credential transition");
+                    return false;
+                }
+            };
+        match self
+            .chat_state_handle
+            .transition_sampling_state(target, state.credentials)
+            .await
+        {
+            Some(Ok(_)) => true,
+            Some(Err(
+                xai_chat_state::SamplingTransitionError::HistoryReplacementIndeterminate(error),
+            )) => {
+                self.compaction
+                    .reconciliation_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                tracing::error!(%error, "Codex credential persistence is indeterminate; reload required");
+                false
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "Codex credential transition rejected");
+                false
+            }
+            None => false,
+        }
+    }
     /// Pre-turn arm for a provider-backed model: mint on a cold cache,
     /// re-mint near expiry, and adopt a rotation chat-state missed. No-op
     /// when `current_key` is already the fresh cached token.
@@ -966,12 +1065,20 @@ impl SessionActor {
             .data(detailed_message);
             return Err(acp_err);
         }
-        let (failed_model_id, failed_base_url) = self
+        let (failed_model_id, failed_base_url, failed_provider_id, failed_api_backend) = self
             .chat_state_handle
             .get_sampling_config()
             .await
-            .map(|c| (c.model, c.base_url))
+            .map(|c| (c.model, c.base_url, c.provider_id, c.api_backend))
             .unwrap_or_default();
+        let failed_uses_codex_auth = xai_grok_sampling_types::resolve_provider(
+            failed_provider_id,
+            failed_api_backend,
+            &failed_base_url,
+        )
+        .capabilities()
+        .uses_chatgpt_auth()
+            && xai_grok_sampling_types::is_codex_backend_url(&failed_base_url);
         let auth_provider =
             if matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401) {
                 self.model_auth_provider(&failed_model_id)
@@ -982,7 +1089,7 @@ impl SessionActor {
             let gate = self.auth_gate(&failed_model_id, &failed_base_url);
             let eligible = gate.active();
             self.log_auth_gate_unknown("handle_sampling_failure", gate, &failed_base_url);
-            if !eligible && auth_provider.is_none() {
+            if !eligible && auth_provider.is_none() && !failed_uses_codex_auth {
                 tracing::warn!(
                     session_id = %self.session_info.id.0,
                     is_session_based = gate.is_session_based,
@@ -1011,6 +1118,7 @@ impl SessionActor {
         if !matches!(error.kind, SamplingErrorKind::Auth)
             && error.status_code == Some(401)
             && auth_provider.is_none()
+            && !failed_uses_codex_auth
         {
             xai_grok_telemetry::unified_log::warn(
                 "auth recovery: sampler 401 not eligible (non-auth error kind)",
@@ -1044,6 +1152,16 @@ impl SessionActor {
                 Some(self.session_info.id.0.as_ref()),
                 None,
             );
+        }
+        if (matches!(error.kind, SamplingErrorKind::Auth) || error.status_code == Some(401))
+            && failed_uses_codex_auth
+            && self.refresh_codex_credentials(true).await
+        {
+            self.prepare_sampler_for_turn().await;
+            return Ok(SamplerFailureRecovery::RefreshAuthAndResubmit {
+                credential: error.credential,
+                store: RecoveredStore::AuthProvider,
+            });
         }
         if let Some(ref provider) = auth_provider
             && self.try_provider_401_recovery(provider).await
@@ -1320,10 +1438,15 @@ impl SessionActor {
         }
         use crate::auth::{is_jwt_expired_or_near, parse_jwt_expiration};
         const REFRESH_THRESHOLD: chrono::Duration = chrono::Duration::minutes(5);
-        let sampling_state = self.chat_state_handle.get_sampling_state().await;
-        let (current_key, current_model_id) = sampling_state
-            .map(|state| (state.credentials.api_key, state.config.model))
-            .unwrap_or_default();
+        let Some(sampling_state) = self.chat_state_handle.get_sampling_state().await else {
+            return;
+        };
+        if Self::sampling_config_uses_codex_auth(&sampling_state.config) {
+            self.refresh_codex_credentials(false).await;
+            return;
+        }
+        let current_key = sampling_state.credentials.api_key;
+        let current_model_id = sampling_state.config.model;
         if let Some(provider) = self.model_auth_provider(&current_model_id) {
             self.refresh_provider_token_pre_turn(
                 &provider,

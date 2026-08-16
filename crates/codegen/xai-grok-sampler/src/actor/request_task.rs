@@ -1009,6 +1009,7 @@ mod tests {
             error_type: "invalid_request_error".into(),
             message: "bad image".into(),
             code: Some(ApiErrorCode::InvalidImage),
+            status: None,
         };
         assert!(original.is_image_processing_error());
 

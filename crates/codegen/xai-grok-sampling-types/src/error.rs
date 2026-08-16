@@ -185,6 +185,9 @@ pub enum SamplingError {
         message: String,
         /// The stream error envelope's `code` slot, when present.
         code: Option<ApiErrorCode>,
+        /// Parsed HTTP-equivalent disposition. Prefer this over recovering a
+        /// status later from `error_type` / `message` strings.
+        status: Option<StatusCode>,
     },
     /// Per-chunk idle timeout — no SSE chunk received from the model within the
     /// configured deadline. NOT retryable: the model (or network path) is stuck,
@@ -260,6 +263,7 @@ pub fn structured_stream_error_status(error_type: &str, message: &str) -> Status
         "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
             Some(StatusCode::BAD_REQUEST)
         }
+        "validation_error" => Some(StatusCode::UNPROCESSABLE_ENTITY),
         "authentication_error" | "unauthorized" => Some(StatusCode::UNAUTHORIZED),
         "permission_error" | "forbidden" | "account_deactivated" => Some(StatusCode::FORBIDDEN),
         "insufficient_quota" | "billing_error" => Some(StatusCode::PAYMENT_REQUIRED),
@@ -392,11 +396,9 @@ impl SamplingError {
                 status: StatusCode::UNAUTHORIZED,
                 ..
             } => true,
-            SamplingError::StreamError {
-                error_type,
-                message,
-                ..
-            } => structured_stream_error_status(error_type, message) == StatusCode::UNAUTHORIZED,
+            SamplingError::StreamError { .. } => {
+                stream_error_http_status_of(self) == StatusCode::UNAUTHORIZED
+            }
             _ => false,
         }
     }
@@ -407,12 +409,8 @@ impl SamplingError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 ..
             } => true,
-            SamplingError::StreamError {
-                error_type,
-                message,
-                ..
-            } => {
-                structured_stream_error_status(error_type, message) == StatusCode::TOO_MANY_REQUESTS
+            SamplingError::StreamError { .. } => {
+                stream_error_http_status_of(self) == StatusCode::TOO_MANY_REQUESTS
             }
             _ => false,
         }
@@ -487,6 +485,7 @@ impl SamplingError {
                 error_type,
                 message,
                 code,
+                ..
             } => {
                 code.as_ref().is_some_and(|code| {
                     is_recoverable_image_error_code(&code.as_str().to_ascii_lowercase())
@@ -520,11 +519,9 @@ impl SamplingError {
             } => false,
             SamplingError::Api { status, .. } => is_retryable_api_status(*status),
             SamplingError::EventStreamError(_) => true,
-            SamplingError::StreamError {
-                error_type,
-                message,
-                ..
-            } => is_retryable_api_status(structured_stream_error_status(error_type, message)),
+            SamplingError::StreamError { .. } => {
+                is_retryable_api_status(stream_error_http_status_of(self))
+            }
             SamplingError::IdleTimeout { .. } => false,
             SamplingError::EmptyResponse { .. } => true,
             SamplingError::MaxTokensTruncation => false,
@@ -668,6 +665,8 @@ struct ParsedError {
     /// the flat envelope's slot is overloaded (gRPC kebab codes, type slots),
     /// so only semantic values surface from it.
     code: Option<ApiErrorCode>,
+    /// Explicit HTTP-equivalent disposition parsed at the boundary.
+    status: Option<StatusCode>,
 }
 
 /// Extract the error fields from a supported provider error format.
@@ -680,6 +679,7 @@ fn try_parse_error(data: &str) -> Option<ParsedError> {
                 .message
                 .unwrap_or_else(|| "unknown error".to_string()),
             code: resp.error.code.as_deref().map(ApiErrorCode::parse),
+            status: None,
         });
     }
     if let Ok(flat) = serde_json::from_str::<FlatErrorResponse>(data) {
@@ -692,6 +692,7 @@ fn try_parse_error(data: &str) -> Option<ParsedError> {
             code,
             error_type: flat.code.unwrap_or_else(|| "server_error".to_string()),
             message: flat.error,
+            status: None,
         });
     }
     // Some Responses-compatible gateways emit FastAPI-style failures as a
@@ -702,15 +703,82 @@ fn try_parse_error(data: &str) -> Option<ParsedError> {
     // `detail` field from being swallowed as an error.
     if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(data)
         && !object.contains_key("type")
-        && let Some(message) = object.get("detail").and_then(serde_json::Value::as_str)
+        && let Some(detail) = object.get("detail")
     {
-        return Some(ParsedError {
-            error_type: "unknown".to_string(),
-            message: message.to_string(),
-            code: None,
-        });
+        return parse_fastapi_detail(detail);
     }
     None
+}
+
+fn parse_fastapi_detail(detail: &serde_json::Value) -> Option<ParsedError> {
+    match detail {
+        serde_json::Value::String(message) => {
+            let validation = looks_like_validation_message(message);
+            Some(ParsedError {
+                error_type: if validation {
+                    "validation_error".into()
+                } else {
+                    "unknown".into()
+                },
+                message: message.clone(),
+                code: None,
+                status: validation.then_some(StatusCode::UNPROCESSABLE_ENTITY),
+            })
+        }
+        serde_json::Value::Array(entries) if looks_like_pydantic_detail(entries) => {
+            let message = entries
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("msg")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(ParsedError {
+                error_type: "validation_error".into(),
+                message: if message.is_empty() {
+                    "validation error".into()
+                } else {
+                    message
+                },
+                code: None,
+                status: Some(StatusCode::UNPROCESSABLE_ENTITY),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn looks_like_validation_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("validation") || lower.contains("pydantic")
+}
+
+fn looks_like_pydantic_detail(entries: &[serde_json::Value]) -> bool {
+    !entries.is_empty()
+        && entries.iter().all(|entry| {
+            entry.is_object()
+                && (entry.get("loc").is_some()
+                    || entry.get("msg").is_some()
+                    || entry.get("type").is_some())
+        })
+}
+
+fn stream_error_http_status_of(error: &SamplingError) -> StatusCode {
+    match error {
+        SamplingError::StreamError {
+            status: Some(status),
+            ..
+        } => *status,
+        SamplingError::StreamError {
+            error_type,
+            message,
+            ..
+        } => structured_stream_error_status(error_type, message),
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 /// Semantic `error.code` from a raw error body. Nested envelopes yield their
@@ -823,12 +891,14 @@ pub fn try_parse_stream_error(data: &str) -> Option<SamplingError> {
         error_type,
         message,
         code,
+        status,
     } = try_parse_error(data)?;
     tracing::warn!(error_type, message, "Server-side stream error");
     Some(SamplingError::StreamError {
         error_type,
         message,
         code,
+        status,
     })
 }
 
@@ -890,6 +960,7 @@ mod tests {
                 error_type: "overloaded_error".into(),
                 message: "Overloaded".into(),
                 code: None,
+                status: None,
             }
             .is_overloaded()
         );
@@ -958,6 +1029,7 @@ mod tests {
                 error_type: "invalid_request_error".into(),
                 message: "tool result mentions overloaded".into(),
                 code: None,
+                status: None,
             }
             .is_overloaded()
         );
@@ -966,6 +1038,7 @@ mod tests {
                 error_type: "service_unavailable_error".into(),
                 message: "upstream capacity".into(),
                 code: None,
+                status: None,
             }
             .is_overloaded()
         );
@@ -1083,6 +1156,7 @@ mod tests {
                 error_type: "overloaded_error".into(),
                 message: "prompt is too long".into(),
                 code: None,
+                status: None,
             }
             .is_context_length_error()
         );
@@ -1154,6 +1228,7 @@ mod tests {
                 error_type,
                 message,
                 code,
+                ..
             } => {
                 assert_eq!(error_type, "The service is currently unavailable");
                 assert_eq!(
@@ -1187,6 +1262,7 @@ mod tests {
                 error_type,
                 message,
                 code,
+                status,
             } => {
                 assert_eq!(error_type, "unknown");
                 assert_eq!(
@@ -1194,9 +1270,34 @@ mod tests {
                     "The prompt is too long for this model's context window."
                 );
                 assert_eq!(code, None);
+                assert_eq!(status, None);
             }
             other => panic!("expected StreamError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fastapi_validation_detail_is_a_non_retryable_request_error() {
+        let err = try_parse_stream_error(r#"{"detail":"validation error"}"#)
+            .expect("bare validation detail must parse");
+        assert!(
+            !err.is_retryable(),
+            "a deterministic validation failure must not consume the retry budget"
+        );
+        assert_eq!(
+            stream_error_http_status_of(&err),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let array = try_parse_stream_error(
+            r#"{"detail":[{"loc":["body","model"],"msg":"field required","type":"value_error.missing"}]}"#,
+        )
+        .expect("pydantic array detail must parse");
+        assert!(!array.is_retryable());
+        assert_eq!(
+            stream_error_http_status_of(&array),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     #[test]
@@ -1727,6 +1828,7 @@ mod tests {
             error_type: "invalid_request_error".into(),
             message: message.into(),
             code: code.map(ApiErrorCode::parse),
+            status: None,
         };
         assert!(stream(Some(INVALID_IMAGE_ERROR_CODE), "anything").is_image_processing_error());
         assert!(!stream(Some("context_length_exceeded"), "anything").is_image_processing_error());

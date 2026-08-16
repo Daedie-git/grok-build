@@ -4883,7 +4883,7 @@ pub fn resolve_credentials(model: &ModelEntry, session_key: Option<&str>) -> Res
                 xai_chat_state::AuthType::ApiKey,
             )
         } else {
-            match crate::auth::load_codex_credentials(&crate::auth::codex_auth_path()) {
+            match crate::auth::read_codex_credentials(&crate::auth::codex_auth_path()) {
                 Ok(creds) => {
                     if let Some(aid) = creds.account_id {
                         extra_headers.insert(
@@ -5070,24 +5070,24 @@ pub(crate) fn resolve_model_auth_facts_and_provider(
 fn byok_from_lookup(lookup: &ModelLookup) -> ModelByok {
     match lookup {
         ModelLookup::ConfigUnavailable => ModelByok::Unknown,
-        ModelLookup::Loaded(Some(e)) if e.has_own_credentials() => ModelByok::Byok,
-        // Codex catalog entries have no static api_key/env_key; credentials
-        // come from ~/.codex/auth.json at resolve time. Still treat them as
-        // BYOK so the session OIDC bearer resolver cannot overwrite ChatGPT
-        // tokens on chatgpt.com/backend-api/codex.
-        ModelLookup::Loaded(Some(e))
-            if xai_grok_sampling_types::resolve_provider(
-                e.info.provider_id,
-                e.info.api_backend.clone(),
-                &e.info.base_url,
-            )
-            .capabilities()
-            .uses_chatgpt_auth() =>
-        {
-            ModelByok::Byok
-        }
+        ModelLookup::Loaded(Some(e)) if model_has_provider_native_credentials(e) => ModelByok::Byok,
         ModelLookup::Loaded(_) => ModelByok::NotByok,
     }
+}
+
+/// Whether credentials belong to the selected provider rather than the xAI
+/// session. Built-in Codex catalog entries resolve ChatGPT OAuth from disk and
+/// therefore count even though no key is stored on the model entry itself.
+pub(crate) fn model_has_provider_native_credentials(model: &ModelEntry) -> bool {
+    model.has_own_credentials()
+        || (xai_grok_sampling_types::resolve_provider(
+            model.info.provider_id,
+            model.info.api_backend.clone(),
+            &model.info.base_url,
+        )
+        .capabilities()
+        .uses_chatgpt_auth()
+            && xai_grok_sampling_types::is_codex_backend_url(&model.info.base_url))
 }
 enum ModelLookup<'a> {
     /// `None` if `model_id` is absent from the catalog.

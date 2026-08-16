@@ -35,9 +35,14 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
         _ => true,
     });
 
-    // Only Assistant advances the boundary; everything else is transparent.
-    let mut last_complete_end = 0;
-    let mut i = 0;
+    // A validated native replacement is an atomic completed boundary: it
+    // often ends in metadata + encrypted compaction with no assistant, and
+    // must not be silently truncated to the system message.
+    let mut last_complete_end = native_replacement_boundary(items).unwrap_or(0);
+
+    // Only Assistant advances the ordinary-turn boundary; everything else
+    // after the native prefix is transparent.
+    let mut i = last_complete_end;
     while i < items.len() {
         match &items[i] {
             ConversationItem::System(_) => {
@@ -82,4 +87,34 @@ pub(crate) fn fork_filter_chat(items: &mut Vec<ConversationItem>) {
     }
 
     items.truncate(last_complete_end);
+}
+
+/// End index of a validated native compaction replacement segment, counting
+/// the leading system message and the provider-authored prefix. `None` when
+/// the history has no native segment. Malformed native history is left
+/// untouched here — identity conversion happens at the sampling boundary.
+fn native_replacement_boundary(items: &[ConversationItem]) -> Option<usize> {
+    let descriptor = xai_grok_sampling_types::native_compaction_compatibility(items).ok()??;
+    let mut counted = 0usize;
+    let mut end = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            ConversationItem::System(_) => {
+                end = index + 1;
+            }
+            ConversationItem::Provider(provider) if provider.is_native_compaction_metadata() => {
+                // Manifest sidecar is adjacent to the segment but not one of
+                // the counted replacement items.
+                end = index + 1;
+            }
+            _ => {
+                if counted >= descriptor.replacement_segment_items {
+                    break;
+                }
+                counted += 1;
+                end = index + 1;
+            }
+        }
+    }
+    (counted == descriptor.replacement_segment_items).then_some(end)
 }

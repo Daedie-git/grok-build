@@ -2398,6 +2398,13 @@ fn byok_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
         ..test_model_entry(model_id)
     }
 }
+fn codex_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
+    let mut model = test_model_entry(model_id);
+    model.info.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+    model.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    model.info.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+    model
+}
 #[test]
 fn subagent_auth_type_rule() {
     use crate::agent::auth_method::{CACHED_TOKEN_AUTH_METHOD_ID, XAI_API_KEY_METHOD_ID};
@@ -2405,6 +2412,7 @@ fn subagent_auth_type_rule() {
     let session = acp::AuthMethodId::new(CACHED_TOKEN_AUTH_METHOD_ID);
     let api_key = acp::AuthMethodId::new(XAI_API_KEY_METHOD_ID);
     let byok = byok_model_entry("grok-byok");
+    let codex = codex_model_entry("gpt-5.6-sol");
     let plain = test_model_entry("grok-plain");
     assert_eq!(
             super::subagent_auth_type(Some(&byok), &session),
@@ -2412,6 +2420,10 @@ fn subagent_auth_type_rule() {
         );
     assert_eq!(
             super::subagent_auth_type(Some(&byok), &api_key),
+            AuthType::ApiKey
+        );
+    assert_eq!(
+            super::subagent_auth_type(Some(&codex), &session),
             AuthType::ApiKey
         );
     assert_eq!(

@@ -69,6 +69,9 @@ pub struct UsageInfoContext {
     pub billing_redirect_url: Option<String>,
     /// Plan name for the allowance header (e.g. "SuperGrok").
     pub subscription_tier: Option<String>,
+    /// Account usage is supplied by the ChatGPT/Codex quota endpoint rather
+    /// than Grok Build billing.
+    pub codex: bool,
 }
 
 /// Modal state. Billing figures are NOT stored here — the render reads the
@@ -89,6 +92,8 @@ pub struct UsageInfoModalState {
     pub session_usage_text: Option<String>,
     pub billing_loading: bool,
     pub billing_error: Option<String>,
+    /// Formatted provider-native account limits for a Codex session.
+    pub codex_usage_text: Option<String>,
     /// Fetch generation stamped at open; results from an earlier open (same
     /// session, modal reopened) are dropped instead of overwriting.
     pub fetch_nonce: u64,
@@ -135,6 +140,7 @@ impl UsageInfoModalState {
             session_usage_text: None,
             billing_loading: false,
             billing_error: None,
+            codex_usage_text: None,
             fetch_nonce: 0,
             session_fields: None,
             copy_hits: Vec::new(),
@@ -505,6 +511,22 @@ fn usage_limit_lines(
 
     if state.ctx.chat_kind {
         // Gateway chat sessions have no Build coding credits to show.
+    } else if state.ctx.codex {
+        if let Some(usage) = &state.codex_usage_text {
+            for (index, row) in usage.lines().enumerate() {
+                if index == 0 {
+                    lines.push(Line::styled(row.to_string(), header_style(theme)));
+                } else {
+                    lines.push(plain(theme, row));
+                }
+            }
+        } else if let Some(error) = &state.billing_error {
+            lines.push(muted_line(theme, format!("Couldn't load usage: {error}")));
+        } else if state.billing_loading {
+            lines.push(muted_line(theme, "Loading usage\u{2026}"));
+        } else {
+            lines.push(muted_line(theme, "No Codex usage data available."));
+        }
     } else if !state.ctx.usage_visible {
         lines.push(muted_line(theme, "Usage limits are managed by your team."));
     } else if let Some(url) = &state.ctx.billing_redirect_url {
@@ -712,6 +734,7 @@ mod tests {
                 chat_kind: false,
                 billing_redirect_url: None,
                 subscription_tier: Some("SuperGrok".to_string()),
+                codex: false,
             },
         )
     }

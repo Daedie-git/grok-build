@@ -303,7 +303,20 @@ impl JsonlStorageAdapter {
         let source_summary = self.read_summary_sync(source_info)?;
         let mut chat_to_copy = match options.source_chat_history.clone() {
             Some(snapshot) => snapshot,
-            None => self.load_authoritative_chat_history_for_copy(source_info)?,
+            None => {
+                if let Some(target) = options.target_prompt_index {
+                    crate::session::storage::chat_rebuild::derive_authoritative_history_at_prompt(
+                        &self.session_dir(source_info),
+                        Some(target),
+                    )?
+                    .map_or_else(
+                        || self.load_authoritative_chat_history_for_copy(source_info),
+                        Ok,
+                    )?
+                } else {
+                    self.load_authoritative_chat_history_for_copy(source_info)?
+                }
+            }
         };
 
         if let Some(target_idx) = options.target_prompt_index {

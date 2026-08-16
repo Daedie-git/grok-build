@@ -338,16 +338,21 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             silent,
             generation,
         } => {
-            if !silent
-                && let Some(agent) = app.agents.get_mut(&agent_id)
+            if let Some(agent) = app.agents.get_mut(&agent_id)
                 && agent.session.models.current_model_is_codex()
                 && generation == agent.codex_rate_limits_generation
             {
-                agent.scrollback.push_block(RenderBlock::System(
-                    crate::scrollback::blocks::SystemMessageBlock::new(format!(
-                        "Codex usage error: {error}"
-                    )),
-                ));
+                if let Some(state) = usage_modal_state_mut(agent) {
+                    state.billing_loading = false;
+                    state.billing_error = Some(error.clone());
+                }
+                if !silent {
+                    agent.scrollback.push_block(RenderBlock::System(
+                        crate::scrollback::blocks::SystemMessageBlock::new(format!(
+                            "Codex usage error: {error}"
+                        )),
+                    ));
+                }
             }
             vec![]
         }

@@ -443,6 +443,11 @@ pub(super) fn handle_codex_rate_limits_fetched(
         return vec![];
     }
     agent.apply_codex_rate_limits(limits.clone());
+    if let Some(state) = super::status::usage_modal_state_mut(agent) {
+        state.billing_loading = false;
+        state.billing_error = None;
+        state.codex_usage_text = Some(crate::views::codex_usage::format_usage_summary(&limits));
+    }
     if !silent && !agent.chat_kind {
         agent.scrollback.push_block(RenderBlock::System(
             crate::scrollback::blocks::SystemMessageBlock::new(

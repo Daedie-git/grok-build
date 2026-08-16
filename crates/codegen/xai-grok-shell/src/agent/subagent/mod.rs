@@ -965,7 +965,7 @@ fn subagent_auth_type(
     model: Option<&crate::agent::config::ModelEntry>,
     auth_method_id: &acp::AuthMethodId,
 ) -> xai_chat_state::AuthType {
-    if model.is_some_and(|m| m.has_own_credentials()) {
+    if model.is_some_and(crate::agent::config::model_has_provider_native_credentials) {
         xai_chat_state::AuthType::ApiKey
     } else if crate::agent::auth_method::is_session_based_method(auth_method_id) {
         xai_chat_state::AuthType::SessionToken
@@ -1003,7 +1003,7 @@ fn resolve_model_override_to_config(
     {
         session_bearer_resolver(
             ctx,
-            if entry.has_own_credentials() {
+            if crate::agent::config::model_has_provider_native_credentials(&entry) {
                 crate::agent::auth_method::ModelByok::Byok
             } else {
                 crate::agent::auth_method::ModelByok::NotByok
@@ -1022,7 +1022,7 @@ fn resolve_model_override_to_config(
             "resolved_model_raw": &config.model,
             "base_url": &config.base_url,
             "key_prefix": key_prefix(&config.api_key),
-            "has_own_credentials": entry.has_own_credentials(),
+            "has_provider_native_credentials": crate::agent::config::model_has_provider_native_credentials(&entry),
             "has_session_key": has_session_key,
             "auth_type": format!("{:?}", resolved_auth_type),
             "auth_method_id": ctx.auth_method_id.0.as_ref(),

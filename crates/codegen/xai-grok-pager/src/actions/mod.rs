@@ -917,9 +917,12 @@ mod tests {
             registry.lookup(&ctrl_r, When::ScrollbackFocused),
             Some(ActionId::ToggleMouseCapture)
         );
-        // Not on agent/prompt contexts (Ctrl+R is deliberately unbound there;
-        // agent keeps the model picker on Ctrl+M).
-        assert_eq!(registry.lookup(&ctrl_r, When::AgentScreen), None);
+        // AgentScreen keeps Ctrl+R for effort cycling; the more-specific
+        // ScrollbackFocused binding above wins while scrollback has focus.
+        assert_eq!(
+            registry.lookup(&ctrl_r, When::AgentScreen),
+            Some(ActionId::CycleEffort)
+        );
         assert_eq!(registry.lookup(&ctrl_r, When::PromptFocused), None);
         assert_eq!(
             registry.lookup(&ctrl_m, When::AgentScreen),

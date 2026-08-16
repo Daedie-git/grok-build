@@ -89,11 +89,16 @@ pub async fn await_timeline_transaction(
 
 /// Map a committed / not-committed persistence outcome and emit shared warnings.
 /// Returns `Err(message)` when the marker was not committed.
+///
+/// [`TimelineCacheStatus::RepairRequired`] is a committed marker whose derived
+/// cache did not land. Callers must not resume ordinary chat-cache appends:
+/// gate the session (set `reconciliation_required`) and force a reload so
+/// recovery can rebuild the authoritative cache.
 pub fn ensure_timeline_committed(
     outcome: TimelineTransactionOutcome,
     op_name: &'static str,
     session_id: &str,
-) -> Result<(), String> {
+) -> Result<TimelineCacheStatus, String> {
     match outcome {
         TimelineTransactionOutcome::NotCommitted(error) => Err(format!(
             "{op_name} was not committed; original history remains live: {error}"
@@ -109,7 +114,7 @@ pub fn ensure_timeline_committed(
                     "{op_name} committed; marker summary bookkeeping needs repair"
                 );
             }
-            match cache_status {
+            match &cache_status {
                 TimelineCacheStatus::Current => {}
                 TimelineCacheStatus::CurrentWithBookkeepingError(error) => {
                     tracing::warn!(
@@ -122,11 +127,11 @@ pub fn ensure_timeline_committed(
                     tracing::warn!(
                         session_id = %session_id,
                         %error,
-                        "{op_name} committed; chat cache repair deferred to marker reconciliation"
+                        "{op_name} committed; chat cache was not replaced — reload required before further sampling"
                     );
                 }
             }
-            Ok(())
+            Ok(cache_status)
         }
     }
 }

@@ -1069,6 +1069,10 @@ pub(in crate::app::dispatch) fn handle_session_created(
             agent.session.models = app.models.clone();
         }
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
+        agent.refresh_restricted_commands_for_model();
+        if agent.session.models.current_model_is_codex() {
+            agent.credit_balance = None;
+        }
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
         if deferred.is_some() {
@@ -1175,6 +1179,10 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             worktree_path.display()
         )));
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
+        agent.refresh_restricted_commands_for_model();
+        if agent.session.models.current_model_is_codex() {
+            agent.credit_balance = None;
+        }
         let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
         if deferred.is_some() {
@@ -1438,6 +1446,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 if provider_changed {
                     if agent.session.models.current_model_is_codex() {
                         agent.codex_rate_limits = None;
+                        agent.credit_balance = None;
                     }
                     effects.push(super::super::billing::account_usage_refresh_effect(
                         agent, agent_id, true,

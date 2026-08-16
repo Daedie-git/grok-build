@@ -21,6 +21,9 @@ pub const CODEX_ACCOUNT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/
 
 /// HTTP header carrying the ChatGPT account id.
 pub const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-ID";
+/// Client-family header required by the first-party Codex backend.
+pub const CODEX_ORIGINATOR_HEADER: &str = "originator";
+pub const CODEX_ORIGINATOR_VALUE: &str = "codex_cli_rs";
 
 /// OpenAI OAuth client id used by the official Codex CLI.
 pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";

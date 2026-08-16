@@ -720,6 +720,7 @@ mod tests {
             error_type: "overloaded_error".into(),
             message: "Overloaded".into(),
             code: None,
+            status: None,
         }));
         assert!(should_retry_side_question(&api(
             500,
@@ -770,6 +771,7 @@ mod tests {
                 error_type: "overloaded_error".into(),
                 message: "Overloaded".into(),
                 code: None,
+                status: None,
             })
         })
         .retry(side_question_retry_policy())

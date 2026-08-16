@@ -82,13 +82,80 @@ pub fn default_auth_path() -> PathBuf {
     codex_home().join("auth.json")
 }
 
-pub fn read_auth_file(path: &Path) -> Result<CodexAuthFile, CodexAuthError> {
+fn read_auth_value(path: &Path) -> Result<serde_json::Value, CodexAuthError> {
     if !path.is_file() {
         return Err(CodexAuthError::MissingFile(path.to_path_buf()));
     }
     let raw = std::fs::read_to_string(path)?;
-    let parsed: CodexAuthFile = serde_json::from_str(&raw)?;
-    Ok(parsed)
+    Ok(serde_json::from_str(&raw)?)
+}
+
+pub fn read_auth_file(path: &Path) -> Result<CodexAuthFile, CodexAuthError> {
+    Ok(serde_json::from_value(read_auth_value(path)?)?)
+}
+
+/// Official Codex infers a missing `auth_mode`: a present API key is
+/// `apikey`, otherwise a token-shaped file is ChatGPT.
+fn resolved_auth_mode(data: &serde_json::Value) -> Option<String> {
+    if let Some(mode) = data.get("auth_mode").and_then(serde_json::Value::as_str) {
+        return Some(mode.to_string());
+    }
+    let api_key = data.get("OPENAI_API_KEY");
+    if api_key.is_some_and(|value| match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        _ => true,
+    }) {
+        return Some("apikey".into());
+    }
+    let access = data
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str);
+    if access.is_some_and(|token| !token.trim().is_empty()) {
+        return Some("chatgpt".into());
+    }
+    None
+}
+
+fn require_chatgpt_mode(data: &serde_json::Value) -> Result<(), CodexAuthError> {
+    match resolved_auth_mode(data).as_deref() {
+        Some("chatgpt") => Ok(()),
+        other => Err(CodexAuthError::WrongMode(other.map(str::to_owned))),
+    }
+}
+
+fn tokens_from_auth_value(data: &serde_json::Value) -> Result<CodexTokens, CodexAuthError> {
+    let tokens: CodexTokens = serde_json::from_value(
+        data.get("tokens")
+            .cloned()
+            .ok_or(CodexAuthError::MissingToken)?,
+    )?;
+    if tokens.access_token.trim().is_empty() {
+        return Err(CodexAuthError::MissingToken);
+    }
+    Ok(tokens)
+}
+
+fn credentials_from_auth_value(
+    data: &serde_json::Value,
+) -> Result<CodexCredentials, CodexAuthError> {
+    require_chatgpt_mode(data)?;
+    let tokens = tokens_from_auth_value(data)?;
+    Ok(CodexCredentials {
+        expires_at: jwt_exp(&tokens.access_token),
+        access_token: tokens.access_token,
+        account_id: tokens.account_id,
+    })
+}
+
+/// Read the current ChatGPT credentials without locking or refreshing them.
+///
+/// Model construction uses this fast, non-networking path. The per-turn async
+/// preflight owns refresh, so selecting a model can never block an executor on
+/// an exclusive file lock or a synchronous OAuth request.
+pub fn read_codex_credentials(path: &Path) -> Result<CodexCredentials, CodexAuthError> {
+    credentials_from_auth_value(&read_auth_value(path)?)
 }
 
 fn acquire_auth_file_lock(path: &Path) -> Result<std::fs::File, CodexAuthError> {
@@ -107,7 +174,7 @@ fn acquire_auth_file_lock(path: &Path) -> Result<std::fs::File, CodexAuthError> 
     Ok(lock)
 }
 
-fn write_auth_file(path: &Path, data: &CodexAuthFile) -> Result<(), CodexAuthError> {
+fn write_auth_value(path: &Path, data: &serde_json::Value) -> Result<(), CodexAuthError> {
     let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_string_pretty(data)?;
     std::fs::write(&tmp, body + "\n")?;
@@ -122,6 +189,45 @@ fn write_auth_file(path: &Path, data: &CodexAuthFile) -> Result<(), CodexAuthErr
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+    Ok(())
+}
+
+fn apply_rotated_tokens(
+    data: &mut serde_json::Value,
+    tokens: &CodexTokens,
+    last_refresh: String,
+) -> Result<(), CodexAuthError> {
+    let tokens_value = data
+        .as_object_mut()
+        .and_then(|object| object.get_mut("tokens"))
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(object) = tokens_value {
+        object.insert(
+            "access_token".into(),
+            serde_json::Value::String(tokens.access_token.clone()),
+        );
+        if let Some(refresh_token) = &tokens.refresh_token {
+            object.insert(
+                "refresh_token".into(),
+                serde_json::Value::String(refresh_token.clone()),
+            );
+        }
+        if let Some(id_token) = &tokens.id_token {
+            object.insert(
+                "id_token".into(),
+                serde_json::Value::String(id_token.clone()),
+            );
+        }
+        if let Some(account_id) = &tokens.account_id {
+            object.insert(
+                "account_id".into(),
+                serde_json::Value::String(account_id.clone()),
+            );
+        }
+    } else {
+        data["tokens"] = serde_json::to_value(tokens)?;
+    }
+    data["last_refresh"] = serde_json::Value::String(last_refresh);
     Ok(())
 }
 
@@ -259,19 +365,26 @@ pub(crate) async fn refresh_access_token_async(
 /// Load ChatGPT/Codex credentials, refreshing when near expiry.
 ///
 /// `token_url` is the OAuth token endpoint (production: [`CODEX_OAUTH_TOKEN_URL`]).
+fn apply_refresh_response(tokens: &mut CodexTokens, fresh: RefreshResponse) {
+    if let Some(at) = fresh.access_token {
+        tokens.access_token = at;
+    }
+    if let Some(id) = fresh.id_token {
+        tokens.id_token = Some(id);
+    }
+    if let Some(rt_new) = fresh.refresh_token {
+        tokens.refresh_token = Some(rt_new);
+    }
+}
+
 pub(crate) fn load_codex_credentials_at(
     path: &Path,
     token_url: &str,
 ) -> Result<CodexCredentials, CodexAuthError> {
     let _auth_lock = acquire_auth_file_lock(path)?;
-    let mut data = read_auth_file(path)?;
-    if data.auth_mode.as_deref() != Some("chatgpt") {
-        return Err(CodexAuthError::WrongMode(data.auth_mode.clone()));
-    }
-    let mut tokens = data.tokens.ok_or(CodexAuthError::MissingToken)?;
-    if tokens.access_token.trim().is_empty() {
-        return Err(CodexAuthError::MissingToken);
-    }
+    let mut data = read_auth_value(path)?;
+    require_chatgpt_mode(&data)?;
+    let mut tokens = tokens_from_auth_value(&data)?;
 
     if needs_refresh(&tokens.access_token) {
         let rt = tokens
@@ -285,20 +398,9 @@ pub(crate) fn load_codex_credentials_at(
             })?;
         tracing::info!(%token_url, "codex auth: refreshing ChatGPT OAuth token");
         let fresh = refresh_access_token_at(token_url, rt)?;
-        if let Some(at) = fresh.access_token {
-            tokens.access_token = at;
-        }
-        if let Some(id) = fresh.id_token {
-            tokens.id_token = Some(id);
-        }
-        if let Some(rt_new) = fresh.refresh_token {
-            tokens.refresh_token = Some(rt_new);
-        }
-        data.tokens = Some(tokens.clone());
-        data.last_refresh = Some(Utc::now().to_rfc3339());
-        if let Err(e) = write_auth_file(path, &data) {
-            tracing::warn!(error = %e, "codex auth: failed to persist refreshed tokens");
-        }
+        apply_refresh_response(&mut tokens, fresh);
+        apply_rotated_tokens(&mut data, &tokens, Utc::now().to_rfc3339())?;
+        write_auth_value(path, &data)?;
     }
 
     Ok(CodexCredentials {
@@ -318,20 +420,25 @@ pub(crate) async fn load_codex_credentials_async_at(
     path: &Path,
     token_url: &str,
 ) -> Result<CodexCredentials, CodexAuthError> {
+    load_codex_credentials_async_at_with_rejected(path, token_url, None).await
+}
+
+async fn load_codex_credentials_async_at_with_rejected(
+    path: &Path,
+    token_url: &str,
+    rejected_access_token: Option<&str>,
+) -> Result<CodexCredentials, CodexAuthError> {
     let lock_path = path.to_path_buf();
     let _auth_lock = tokio::task::spawn_blocking(move || acquire_auth_file_lock(&lock_path))
         .await
         .map_err(|error| CodexAuthError::Refresh(format!("auth lock task failed: {error}")))??;
-    let mut data = read_auth_file(path)?;
-    if data.auth_mode.as_deref() != Some("chatgpt") {
-        return Err(CodexAuthError::WrongMode(data.auth_mode.clone()));
-    }
-    let mut tokens = data.tokens.ok_or(CodexAuthError::MissingToken)?;
-    if tokens.access_token.trim().is_empty() {
-        return Err(CodexAuthError::MissingToken);
-    }
+    let mut data = read_auth_value(path)?;
+    require_chatgpt_mode(&data)?;
+    let mut tokens = tokens_from_auth_value(&data)?;
 
-    if needs_refresh(&tokens.access_token) {
+    let rejected_token_is_current =
+        rejected_access_token.is_some_and(|rejected| rejected == tokens.access_token);
+    if rejected_token_is_current || needs_refresh(&tokens.access_token) {
         let rt = tokens
             .refresh_token
             .as_deref()
@@ -343,20 +450,9 @@ pub(crate) async fn load_codex_credentials_async_at(
             })?;
         tracing::info!(%token_url, "codex auth: refreshing ChatGPT OAuth token");
         let fresh = refresh_access_token_async_at(token_url, rt).await?;
-        if let Some(at) = fresh.access_token {
-            tokens.access_token = at;
-        }
-        if let Some(id) = fresh.id_token {
-            tokens.id_token = Some(id);
-        }
-        if let Some(rt_new) = fresh.refresh_token {
-            tokens.refresh_token = Some(rt_new);
-        }
-        data.tokens = Some(tokens.clone());
-        data.last_refresh = Some(Utc::now().to_rfc3339());
-        if let Err(e) = write_auth_file(path, &data) {
-            tracing::warn!(error = %e, "codex auth: failed to persist refreshed tokens");
-        }
+        apply_refresh_response(&mut tokens, fresh);
+        apply_rotated_tokens(&mut data, &tokens, Utc::now().to_rfc3339())?;
+        write_auth_value(path, &data)?;
     }
 
     Ok(CodexCredentials {
@@ -369,6 +465,23 @@ pub(crate) async fn load_codex_credentials_async_at(
 /// Async load against production OAuth.
 pub async fn load_codex_credentials_async(path: &Path) -> Result<CodexCredentials, CodexAuthError> {
     load_codex_credentials_async_at(path, CODEX_OAUTH_TOKEN_URL).await
+}
+
+/// Recover after the Codex backend rejects an access token.
+///
+/// The auth file is re-read under the cross-process lock. If another process
+/// has already rotated away from `rejected_access_token`, its fresh snapshot
+/// is reused rather than rotating the refresh token a second time.
+pub async fn recover_rejected_codex_credentials_async(
+    path: &Path,
+    rejected_access_token: Option<&str>,
+) -> Result<CodexCredentials, CodexAuthError> {
+    load_codex_credentials_async_at_with_rejected(
+        path,
+        CODEX_OAUTH_TOKEN_URL,
+        rejected_access_token,
+    )
+    .await
 }
 
 /// CLI: `grok login --codex` — validate/refresh `~/.codex/auth.json`.
@@ -479,6 +592,23 @@ mod tests {
         assert_eq!(c.access_token, token);
     }
 
+    #[test]
+    fn read_only_credentials_do_not_refresh_an_expired_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let token = make_jwt(1);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{token}","refresh_token":"rt","account_id":"a"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let credentials = read_codex_credentials(&path).unwrap();
+        assert_eq!(credentials.access_token, token);
+    }
+
     #[tokio::test]
     async fn near_expiry_token_refreshes_against_mock_and_rewrites_auth_json() {
         use axum::{Json, Router, routing::post};
@@ -542,6 +672,12 @@ mod tests {
         assert_eq!(creds.account_id.as_deref(), Some("acct-preserve-me"));
         assert_eq!(concurrent.access_token, "refreshed-access-token");
         assert_eq!(concurrent.account_id.as_deref(), Some("acct-preserve-me"));
+
+        let stale_recovery =
+            load_codex_credentials_async_at_with_rejected(&path, &token_url, Some(&old_token))
+                .await
+                .expect("a stale rejected token should reuse the rotation already on disk");
+        assert_eq!(stale_recovery.access_token, "refreshed-access-token");
 
         let hits = hits.lock().unwrap();
         assert_eq!(hits.len(), 1, "exactly one refresh POST expected");
@@ -681,5 +817,126 @@ mod tests {
         unsafe {
             std::env::remove_var(CODEX_HOME_ENV);
         }
+    }
+
+    #[test]
+    fn review_regression_legacy_chatgpt_auth_without_auth_mode_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let token = make_jwt(4_102_444_800);
+        std::fs::write(
+            &path,
+            format!(r#"{{"tokens":{{"access_token":"{token}","refresh_token":"rt"}}}}"#),
+        )
+        .unwrap();
+        let creds = read_codex_credentials(&path)
+            .expect("legacy token-shaped ChatGPT auth without auth_mode must be accepted");
+        assert_eq!(creds.access_token, token);
+    }
+
+    #[tokio::test]
+    async fn review_regression_refresh_preserves_unmodeled_official_auth_fields() {
+        use axum::{Json, Router, routing::post};
+
+        let app = Router::new().route(
+            "/oauth/token",
+            post(|| async {
+                Json(serde_json::json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "refreshed-rt",
+                    "id_token": "refreshed-id",
+                    "expires_in": 3600
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let near = Utc::now().timestamp() + 30;
+        let old_token = make_jwt(near);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{
+                  "auth_mode": "chatgpt",
+                  "tokens": {{
+                    "access_token": "{old_token}",
+                    "refresh_token": "rt-old",
+                    "account_id": "acct-preserve-me"
+                  }},
+                  "agent_identity": "workspace-preserve-me",
+                  "personal_access_token": "pat-preserve-me"
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let token_url = format!("http://{addr}/oauth/token");
+        load_codex_credentials_async_at(&path, &token_url)
+            .await
+            .expect("refresh should succeed");
+        let disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.get("agent_identity")
+                .and_then(serde_json::Value::as_str),
+            Some("workspace-preserve-me")
+        );
+        assert_eq!(
+            disk.get("personal_access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("pat-preserve-me")
+        );
+    }
+
+    #[tokio::test]
+    async fn review_regression_refresh_reports_failure_when_rotated_token_cannot_be_persisted() {
+        use axum::{Json, Router, routing::post};
+
+        let app = Router::new().route(
+            "/oauth/token",
+            post(|| async {
+                Json(serde_json::json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "refreshed-rt",
+                    "expires_in": 3600
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let near = Utc::now().timestamp() + 30;
+        let old_token = make_jwt(near);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{old_token}","refresh_token":"rt-old"}}}}"#
+            ),
+        )
+        .unwrap();
+        // A directory at the tmp path makes the atomic write fail.
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        let token_url = format!("http://{addr}/oauth/token");
+        let err = load_codex_credentials_async_at(&path, &token_url)
+            .await
+            .expect_err("a refreshed token is not usable until its rotation is durable");
+        assert!(
+            matches!(err, CodexAuthError::Io(_) | CodexAuthError::Refresh(_)),
+            "persist failure must surface, got {err:?}"
+        );
     }
 }

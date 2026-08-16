@@ -73,6 +73,36 @@ fn fork_filter_only_carries_ordinary_provider_metadata_through_turn_boundary() {
     fork_filter_chat(&mut native_items);
     assert_eq!(native_items.len(), 3);
 }
+
+#[test]
+fn fork_filter_keeps_a_fresh_native_compaction_replacement() {
+    let mut compatibility =
+        xai_grok_sampling_types::NativeCompactionCompatibility::codex("gpt-fork", None);
+    compatibility.replacement_segment_items = 1;
+    compatibility.item_metadata = vec![xai_grok_sampling_types::NativeCompactionItemMetadata {
+        input_index: 0,
+        kind: xai_grok_sampling_types::NativeCompactionItemKind::Compaction,
+        item_id: Some("cmp-fork".into()),
+        internal_chat_message_metadata_passthrough: None,
+        user_message_provider_metadata: None,
+    }];
+    let mut items = vec![
+        ConversationItem::system("sys"),
+        ConversationItem::native_compaction_metadata(compatibility),
+        ConversationItem::encrypted_compaction(
+            xai_grok_sampling_types::rs::CompactionSummaryItemParam {
+                id: Some("cmp-fork".into()),
+                encrypted_content: "ciphertext".into(),
+            },
+        ),
+    ];
+    fork_filter_chat(&mut items);
+    assert_eq!(
+        items.len(),
+        3,
+        "a validated native replacement is an atomic completed boundary"
+    );
+}
 #[test]
 fn fork_filter_consecutive_users_with_tool_calls() {
     use xai_grok_sampling_types::conversation::*;

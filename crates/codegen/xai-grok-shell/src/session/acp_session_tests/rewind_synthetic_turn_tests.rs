@@ -197,6 +197,7 @@ async fn committed_rewind_installs_full_snapshot_without_losing_actor_state() {
             snapshot.estimate_at_last_response = 4_000;
             snapshot.agent_edited_paths.insert("src/lib.rs".into());
             snapshot.credentials.api_key = Some("secret".into());
+            let live_model = snapshot.sampling_config.model.clone();
             actor.chat_state_handle.restore_snapshot(snapshot);
             actor.chat_state_handle.begin_turn_capture();
 
@@ -212,10 +213,15 @@ async fn committed_rewind_installs_full_snapshot_without_losing_actor_state() {
             let installed = actor.chat_state_handle.snapshot().await.unwrap();
             assert_eq!(installed.prompt_index, 1);
             assert_eq!(installed.conversation.len(), 4);
-            assert_eq!(installed.total_tokens, 4_321);
-            assert_eq!(installed.estimate_at_last_response, 4_000);
+            assert_eq!(
+                installed.total_tokens,
+                xai_chat_state::estimate_conversation_tokens(&installed.conversation),
+                "rewind must re-estimate tokens from the truncated conversation"
+            );
+            assert_eq!(installed.estimate_at_last_response, installed.total_tokens);
             assert!(installed.agent_edited_paths.contains("src/lib.rs"));
             assert_eq!(installed.credentials.api_key.as_deref(), Some("secret"));
+            assert_eq!(installed.sampling_config.model, live_model);
 
             actor
                 .chat_state_handle
@@ -685,6 +691,83 @@ async fn rewind_to_synthetic_auto_wake_turn_cuts_at_the_wake() {
                 "auto-wake turn and everything after it must be removed"
             );
             assert_eq!(actor.chat_state_handle.get_prompt_index().await, 1);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn review_regression_rewind_to_post_compaction_prompt_preserves_rich_live_items() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = tokio::sync::mpsc::unbounded_channel();
+            let persistence_tx = successful_rewind_persistence();
+            let actor = create_test_actor(0, 200_000, 80, gateway_tx, persistence_tx).await;
+
+            fn user_at(text: &str, prompt_index: usize) -> ConversationItem {
+                let mut item = ConversationItem::user(text);
+                item.set_prompt_index(prompt_index);
+                item
+            }
+
+            let signed = ConversationItem::Reasoning(xai_grok_sampling_types::rs::ReasoningItem {
+                id: "rs-post-compact".into(),
+                summary: Vec::new(),
+                content: None,
+                encrypted_content: Some("signed-post-checkpoint".into()),
+                status: None,
+            });
+            let mut snap = actor
+                .chat_state_handle
+                .snapshot()
+                .await
+                .expect("snapshot available");
+            snap.conversation = vec![
+                ConversationItem::system("SYS"),
+                user_at("P0", 0),
+                ConversationItem::assistant("A0"),
+                user_at("P1", 1),
+                ConversationItem::assistant("A1"),
+                user_at("P2", 2),
+                ConversationItem::assistant("A2"),
+                user_at("P3", 3),
+                ConversationItem::assistant("A3"),
+                user_at("P4", 4),
+                ConversationItem::assistant("A4"),
+                user_at("P5", 5),
+                signed,
+                ConversationItem::assistant("A5"),
+                user_at("P6", 6),
+                ConversationItem::assistant("A6"),
+            ];
+            snap.prompt_index = 7;
+            snap.prompt_texts = (0..7).map(|i| format!("P{i}")).collect();
+            snap.last_compaction_prompt_index = Some(5);
+            actor.chat_state_handle.restore_snapshot(snap);
+
+            let resp = actor
+                .handle_rewind(RewindRequest {
+                    target_prompt_index: 6,
+                    force: true,
+                    mode: RewindMode::ConversationOnly,
+                })
+                .await
+                .expect("handle_rewind ok");
+            assert!(resp.success, "post-compaction rewind should succeed: {resp:?}");
+
+            let conv = actor.chat_state_handle.get_conversation().await;
+            assert!(
+                conv.iter().any(|item| matches!(
+                    item,
+                    ConversationItem::Reasoning(r)
+                        if r.encrypted_content.as_deref() == Some("signed-post-checkpoint")
+                )),
+                "post-compaction rewind must truncate the rich live snapshot, not rebuild text-only ACP chunks: {conv:?}"
+            );
+            assert!(
+                !conv.iter().any(|item| item.text_content() == "P6"),
+                "target 6 must drop prompt 6: {conv:?}"
+            );
         })
         .await;
 }

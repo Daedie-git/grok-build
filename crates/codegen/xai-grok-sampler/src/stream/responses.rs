@@ -247,6 +247,22 @@ where
                 }
             };
 
+            // Output-item frames use a raw-aware decoded path and may return
+            // early below. Check the abort before dispatching any decoded
+            // variant so a confident doom-loop signal cannot leak tool or
+            // backend output and thereby disable retry-before-output.
+            if let Some(triggers) = doom_loop.as_ref().and_then(|c| c.abort_triggers()) {
+                let err = SamplingError::DoomLoopDetected {
+                    triggers,
+                    aborted_at_chunk: Some(chunk_index),
+                };
+                yield SamplingEvent::Failed {
+                    request_id: request_id.clone(),
+                    error: SamplingErrorInfo::from(&err),
+                };
+                return;
+            }
+
             let event = match decoded {
                 xai_grok_sampling_types::DecodedResponseStreamEvent::OutputItemAdded(item) => {
                     output_observed.store(true, Ordering::Relaxed);
@@ -300,23 +316,6 @@ where
 
             if responses_event_may_have_output(&event) {
                 output_observed.store(true, Ordering::Relaxed);
-            }
-
-            // A confident server-detected loop aborts the attempt (dropping
-            // the SSE connection) so the retry loop can resample instead of
-            // streaming the burning tail. Checked before the event is
-            // processed so a terminal frame carrying the signal never
-            // becomes the accepted response while the abort is armed.
-            if let Some(triggers) = doom_loop.as_ref().and_then(|c| c.abort_triggers()) {
-                let err = SamplingError::DoomLoopDetected {
-                    triggers,
-                    aborted_at_chunk: Some(chunk_index),
-                };
-                yield SamplingEvent::Failed {
-                    request_id: request_id.clone(),
-                    error: SamplingErrorInfo::from(&err),
-                };
-                return;
             }
 
             let event_has_content = responses_event_has_meaningful_content(&event);
@@ -1558,6 +1557,33 @@ mod tests {
             }
             other => panic!("expected Completed after disarm, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn confident_signal_aborts_before_raw_output_item_dispatch() {
+        let confident = r#"{"type":"response.doom_loop_check","doom_loop_check":{"triggers":["tail_repetition:8@thinking"]}}"#;
+        let collector = crate::doom_loop::DoomLoopSignalCollector::default();
+        assert!(collector.absorb("response.doom_loop_check", confident));
+        let added: xai_grok_sampling_types::DecodedResponseStreamEvent =
+            function_call_added_event(0, "call-doomed", "read_file").into();
+        let events = collect(stream_responses(
+            stream::iter(vec![Ok(added)]).boxed(),
+            None,
+            rid(),
+            Duration::from_secs(60),
+            Some(collector),
+        ))
+        .await;
+
+        assert!(matches!(
+            events.last(),
+            Some(SamplingEvent::Failed { error, .. })
+                if error.kind == crate::events::SamplingErrorKind::DoomLoopDetected
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SamplingEvent::ToolCallDelta { .. } | SamplingEvent::BackendToolCallCompleted { .. }
+        )));
     }
 
     #[tokio::test]

@@ -159,7 +159,10 @@ pub fn fit_conversation_to_budget(
         remaining -= cost;
         start = i;
     }
-    while start < body.len() && matches!(body[start], ConversationItem::ToolResult(_)) {
+    while start < body.len()
+        && (matches!(body[start], ConversationItem::ToolResult(_))
+            || is_tool_result_run_transparent(&body[start]))
+    {
         start += 1;
     }
     if start < body.len() {
@@ -174,12 +177,18 @@ fn recover_truncated_tail_unit(
     mut body: Vec<ConversationItem>,
     budget: u64,
 ) -> Vec<ConversationItem> {
-    let mut results: Vec<ConversationItem> = Vec::new();
-    while matches!(body.last(), Some(ConversationItem::ToolResult(_))) {
-        results.push(body.pop().expect("last() was Some"));
+    let mut tail: Vec<ConversationItem> = Vec::new();
+    let mut result_count = 0usize;
+    while body.last().is_some_and(|item| {
+        matches!(item, ConversationItem::ToolResult(_)) || is_tool_result_run_transparent(item)
+    }) {
+        let item = body.pop().expect("last() was Some");
+        result_count += usize::from(matches!(item, ConversationItem::ToolResult(_)));
+        tail.push(item);
     }
-    results.reverse();
-    if results.is_empty() {
+    tail.reverse();
+    if result_count == 0 {
+        body.extend(tail);
         return match body.pop() {
             Some(item) => vec![truncate_item_to_tokens(item, budget)],
             None => Vec::new(),
@@ -194,13 +203,24 @@ fn recover_truncated_tail_unit(
         None
     };
     let owner_cost = owner.as_ref().map(estimate_item_tokens).unwrap_or(0);
-    let result_budget = budget.saturating_sub(owner_cost);
-    let per = (result_budget / results.len() as u64).max(1);
+    let transparent_cost: u64 = tail
+        .iter()
+        .filter(|item| !matches!(item, ConversationItem::ToolResult(_)))
+        .map(estimate_item_tokens)
+        .sum();
+    let result_budget = budget.saturating_sub(owner_cost + transparent_cost);
+    let per = (result_budget / result_count as u64).max(1);
     let mut unit: Vec<ConversationItem> = Vec::new();
     if let Some(o) = owner {
         unit.push(o);
     }
-    unit.extend(results.into_iter().map(|r| truncate_item_to_tokens(r, per)));
+    unit.extend(tail.into_iter().map(|item| {
+        if matches!(item, ConversationItem::ToolResult(_)) {
+            truncate_item_to_tokens(item, per)
+        } else {
+            item
+        }
+    }));
     unit
 }
 /// Truncate one item's content text to at most `max_tokens`, appending a `[... truncated N bytes ...]` marker (structural fields kept).

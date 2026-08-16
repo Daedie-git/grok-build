@@ -1093,6 +1093,10 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             agent,
             app.cli_effort_token.as_deref(),
         );
+        agent.refresh_restricted_commands_for_model();
+        if agent.session.models.current_model_is_codex() {
+            agent.credit_balance = None;
+        }
         match (code_restored, restore_summary.as_deref()) {
             (true, Some(s)) => {
                 agent

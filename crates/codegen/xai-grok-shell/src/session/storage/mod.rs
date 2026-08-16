@@ -246,6 +246,19 @@ pub(crate) mod chat_rebuild {
     pub(crate) fn derive_authoritative_history(
         dir: &Path,
     ) -> io::Result<Option<Vec<ConversationItem>>> {
+        derive_authoritative_history_at_prompt(dir, None)
+    }
+
+    /// Like [`derive_authoritative_history`], but only applies checkpoints and
+    /// later updates that belong at or before `target_prompt_index`.
+    ///
+    /// A fork/repair at P0 must not inherit a compaction committed after P1.
+    /// When no usable pre-target checkpoint exists, later updates are reduced
+    /// from the start of the transcript (portable text reconstruction).
+    pub(crate) fn derive_authoritative_history_at_prompt(
+        dir: &Path,
+        target_prompt_index: Option<usize>,
+    ) -> io::Result<Option<Vec<ConversationItem>>> {
         use crate::extensions::notification::{
             FINALIZED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
             MAX_SUPPORTED_COMPACTION_CHECKPOINT_SCHEMA_VERSION,
@@ -255,7 +268,10 @@ pub(crate) mod chat_rebuild {
         let Some(iter) = UpdatesIterator::open(&updates_path)? else {
             return Ok(None);
         };
-        let mut history: Option<Vec<ConversationItem>> = None;
+        // A target-aware derive reconstructs from the transcript when no
+        // pre-target checkpoint exists, rather than falling back to a cache
+        // that may contain a later compaction.
+        let mut history: Option<Vec<ConversationItem>> = target_prompt_index.map(|_| Vec::new());
         let mut reducer = ChatReducer::new();
 
         for result in iter {
@@ -270,6 +286,13 @@ pub(crate) mod chat_rebuild {
                 use crate::extensions::notification::SessionUpdate as XaiUpdate;
                 match &notification.update {
                     XaiUpdate::CompactionCheckpoint(marker) => {
+                        if target_prompt_index
+                            .is_some_and(|target| marker.prompt_index_at_compaction > target)
+                        {
+                            // A future compaction must not become the child's
+                            // base. Keep reducing the pre-compaction transcript.
+                            continue;
+                        }
                         reducer.reset();
                         let expected =
                             format!("compaction_checkpoints/{}.json", marker.checkpoint_id);
@@ -277,17 +300,23 @@ pub(crate) mod chat_rebuild {
                             // Legacy/non-authoritative records with unusable
                             // references cannot provide an exact replacement;
                             // retain the ordinary cache fallback.
-                            history = None;
+                            if target_prompt_index.is_none() {
+                                history = None;
+                            }
                             continue;
                         }
                         let Ok(bytes) = std::fs::read(dir.join(&expected)) else {
-                            history = None;
+                            if target_prompt_index.is_none() {
+                                history = None;
+                            }
                             continue;
                         };
                         let Ok(checkpoint) = serde_json::from_slice::<
                             crate::extensions::notification::CompactionCheckpointFile,
                         >(&bytes) else {
-                            history = None;
+                            if target_prompt_index.is_none() {
+                                history = None;
+                            }
                             continue;
                         };
                         if checkpoint.schema_version
@@ -304,7 +333,9 @@ pub(crate) mod chat_rebuild {
                             || checkpoint.schema_version != marker.schema_version
                             || checkpoint.created_at != marker.created_at
                         {
-                            history = None;
+                            if target_prompt_index.is_none() {
+                                history = None;
+                            }
                             continue;
                         }
                         // Native schema-v1 checkpoints already bind an exact
@@ -321,7 +352,13 @@ pub(crate) mod chat_rebuild {
                             {
                                 Some(checkpoint.compacted_history)
                             }
-                            Ok(None) => None,
+                            Ok(None) => {
+                                if target_prompt_index.is_some() {
+                                    history
+                                } else {
+                                    None
+                                }
+                            }
                             Err(error) => {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, error));
                             }
@@ -329,11 +366,14 @@ pub(crate) mod chat_rebuild {
                         continue;
                     }
                     XaiUpdate::RewindMarker {
-                        target_prompt_index,
+                        target_prompt_index: rewind_target,
                         transaction_id,
                         rewound_history_json,
                         ..
                     } => {
+                        if target_prompt_index.is_some_and(|target| *rewind_target > target) {
+                            continue;
+                        }
                         reducer.reset();
                         if transaction_id.is_some() {
                             let json = rewound_history_json.as_deref().ok_or_else(|| {
@@ -351,7 +391,7 @@ pub(crate) mod chat_rebuild {
                             // rather than falling back to a stale cache.
                             let keep = crate::sampling::conversation_truncate_for_prompt(
                                 items,
-                                *target_prompt_index,
+                                *rewind_target,
                             );
                             items.truncate(keep);
                         } else {
@@ -369,6 +409,12 @@ pub(crate) mod chat_rebuild {
         }
         if let Some(items) = &mut history {
             items.extend(reducer.flush());
+            if let Some(target) = target_prompt_index {
+                // +1: the cut keeps the target prompt inclusive, matching
+                // fork copy.
+                let keep = crate::sampling::conversation_truncate_for_prompt(items, target + 1);
+                items.truncate(keep);
+            }
         }
         Ok(history)
     }

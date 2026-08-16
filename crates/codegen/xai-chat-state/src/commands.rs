@@ -9,8 +9,8 @@ use xai_grok_sampling_types::{
 };
 
 use crate::types::{
-    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, Credentials, NotificationMeta,
-    SamplingState, SamplingTransitionResult, TurnCapture,
+    AutoCompactTrigger, ChatStateSnapshot, ConversationCounts, ConversationRewindState,
+    Credentials, NotificationMeta, SamplingState, SamplingTransitionResult, TurnCapture,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -213,13 +213,25 @@ pub enum ChatStateCommand {
         reply: oneshot::Sender<()>,
     },
 
-    /// Install a complete rewind snapshot after its durable marker committed.
-    /// This preserves all non-history snapshot fields and must not emit a
-    /// duplicate persistence replacement.
-    InstallPersistedRewind {
-        snapshot: Box<ChatStateSnapshot>,
+    /// Atomically enter the rewind transaction gate and capture its source
+    /// snapshot. Returns `None` when another rewind already owns the gate.
+    /// Timeline-dependent commands queue until
+    /// [`ChatStateCommand::InstallConversationRewind`] or
+    /// [`ChatStateCommand::AbortConversationRewind`].
+    BeginConversationRewind {
+        reply: oneshot::Sender<Option<ChatStateSnapshot>>,
+    },
+
+    /// Install only rewind-owned timeline fields after the durable marker
+    /// committed, then replay queued conversation mutations.
+    InstallConversationRewind {
+        state: Box<ConversationRewindState>,
         reply: oneshot::Sender<()>,
     },
+
+    /// Release the rewind gate without installing, replaying queued mutations
+    /// onto the original live conversation.
+    AbortConversationRewind { reply: oneshot::Sender<()> },
 
     /// Append synthetic `task` pairs for a harness-spawned subagent (goal
     /// planner / verifier skeptic) to the in-progress harness trace phase.

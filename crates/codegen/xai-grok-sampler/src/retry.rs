@@ -450,10 +450,12 @@ pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
             error_type,
             message,
             code,
+            status,
         } => SamplingError::StreamError {
             error_type: error_type.clone(),
             message: message.clone(),
             code: code.clone(),
+            status: *status,
         },
         SamplingError::IdleTimeout { elapsed_secs } => SamplingError::IdleTimeout {
             elapsed_secs: *elapsed_secs,
@@ -664,6 +666,7 @@ mod tests {
             error_type: "invalid_request_error".into(),
             message: "Base64 string of provided image cannot be decoded.".into(),
             code: Some(ApiErrorCode::InvalidImage),
+            status: None,
         };
         assert!(matches!(
             classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
@@ -674,6 +677,7 @@ mod tests {
             error_type: "overloaded_error".into(),
             message: "The server is overloaded.".into(),
             code: None,
+            status: None,
         };
         assert!(!matches!(
             classify_error(&unrelated, 0, 5, RATE_LIMIT_RETRY_THRESHOLD),
@@ -846,6 +850,7 @@ mod tests {
             error_type: "transient".into(),
             message: "x".into(),
             code: None,
+            status: None,
         };
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
             RetryDecision::RetryWithClientRebuild { .. } => {}
@@ -909,6 +914,7 @@ mod tests {
             error_type: "invalid_request_error".into(),
             message: "bad image".into(),
             code: Some(ApiErrorCode::InvalidImage),
+            status: None,
         });
         let SamplingError::StreamError { code, .. } = &cloned else {
             panic!("expected StreamError, got {cloned:?}");

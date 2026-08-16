@@ -861,6 +861,7 @@ fn test_conversation_request_with_tools_to_responses_api() {
     };
     assert_eq!(ft.name, "search");
     assert_eq!(ft.description, Some("Search the codebase".to_string()));
+    assert_eq!(ft.strict, Some(false));
 }
 
 #[test]

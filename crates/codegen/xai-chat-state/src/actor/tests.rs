@@ -83,30 +83,6 @@ impl TestHarness {
         Self::with_persistence(items, config, mock, persistence_rx)
     }
 
-    fn with_manual_history_replacement_ack_timeout(
-        items: Vec<ConversationItem>,
-        config: SamplingConfig,
-        timeout: Duration,
-    ) -> Self {
-        let (mock, persistence_rx) = MockChatPersistence::new_with_manual_history_replacement_ack();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let token = tokio_util::sync::CancellationToken::new();
-        let handle = ChatStateActor::spawn_with_persistence_ack_timeout(
-            items,
-            config,
-            Box::new(mock),
-            event_tx,
-            token.clone(),
-            timeout,
-        );
-        Self {
-            handle,
-            event_rx,
-            persistence_rx,
-            _cancellation_token: token,
-        }
-    }
-
     fn with_persistence(
         items: Vec<ConversationItem>,
         config: SamplingConfig,
@@ -5418,11 +5394,10 @@ async fn stripped_sampling_transition_waits_for_ack_and_not_committed_is_inert()
 }
 
 #[tokio::test]
-async fn sampling_transition_timeout_is_inert_ignores_late_ack_and_unblocks_actor() {
-    let mut h = TestHarness::with_manual_history_replacement_ack_timeout(
+async fn slow_sampling_transition_waits_for_commit_before_installing() {
+    let mut h = TestHarness::with_manual_history_replacement_ack(
         vec![identity_transition_sidecar("gpt-old")],
         identity_transition_config("gpt-old"),
-        Duration::from_millis(10),
     );
     h.handle.update_credentials(transition_credentials("old"));
     let _ = h.handle.get_sampling_state().await;
@@ -5444,30 +5419,19 @@ async fn sampling_transition_timeout_is_inert_ignores_late_ack_and_unblocks_acto
     .await
     .unwrap()
     .unwrap();
-    let result = transition.await.unwrap();
-    assert!(matches!(
-        result,
-        Err(crate::types::SamplingTransitionError::HistoryReplacementIndeterminate(ref error))
-            if error.kind() == std::io::ErrorKind::TimedOut
-    ));
-
-    let state = tokio::time::timeout(Duration::from_secs(1), h.handle.get_sampling_state())
-        .await
-        .expect("actor must process subsequent commands after timeout")
-        .unwrap();
-    assert_eq!(state.config.model, "gpt-old");
-    assert_eq!(state.credentials.api_key.as_deref(), Some("old"));
-    assert_eq!(h.handle.get_conversation().await.len(), 1);
-
+    tokio::time::sleep(Duration::from_millis(25)).await;
     assert!(
-        late_ack
-            .send(Ok(crate::ReplaceHistoryAck::Committed))
-            .is_err(),
-        "late acknowledgement receiver must be gone"
+        !transition.is_finished(),
+        "slow durable write must remain pending"
     );
+    late_ack
+        .send(Ok(crate::ReplaceHistoryAck::Committed))
+        .unwrap();
+    let result = transition.await.unwrap().unwrap();
+    assert!(result.history_changed);
     let state = h.handle.get_sampling_state().await.unwrap();
-    assert_eq!(state.config.model, "gpt-old");
-    assert_eq!(state.credentials.api_key.as_deref(), Some("old"));
+    assert_eq!(state.config.model, "gpt-new");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("new"));
 }
 
 #[tokio::test]
@@ -5521,17 +5485,242 @@ async fn stripped_sampling_transition_installs_only_after_committed_ack() {
 }
 
 #[tokio::test]
-async fn history_replacement_ack_timeout_is_indeterminate() {
-    let (_sender, receiver) = tokio::sync::oneshot::channel();
-    let error = await_history_replacement_ack(receiver, Duration::from_millis(5))
-        .await
-        .unwrap_err();
+async fn dropped_history_replacement_ack_is_indeterminate() {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    drop(sender);
+    let error = await_history_replacement_ack(receiver).await.unwrap_err();
     match error {
         crate::ReplaceHistoryError::Indeterminate(error) => {
-            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         }
         crate::ReplaceHistoryError::NotCommitted(error) => {
-            panic!("timeout must be indeterminate, got not committed: {error}");
+            panic!("dropped ack must be indeterminate, got not committed: {error}");
         }
     }
+}
+
+#[tokio::test]
+async fn persisted_rewind_preserves_message_accepted_after_snapshot() {
+    use crate::types::ConversationRewindState;
+
+    let mut h = TestHarness::with_conversation(vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept"),
+        ConversationItem::assistant("answer"),
+        ConversationItem::user("rewound"),
+    ]);
+    h.handle.increment_prompt_index();
+    h.handle.increment_prompt_index();
+    let _ = h.handle.get_prompt_index().await;
+    h.drain_persistence();
+
+    h.handle
+        .begin_conversation_rewind()
+        .await
+        .expect("begin rewind");
+    h.handle
+        .push_user_message(ConversationItem::user("late-after-snapshot"));
+
+    let rewind = ConversationRewindState {
+        conversation: vec![
+            ConversationItem::system("system"),
+            ConversationItem::user("kept"),
+            ConversationItem::assistant("answer"),
+        ],
+        prompt_index: 1,
+        prompt_texts: vec!["kept".into()],
+        last_compaction_prompt_index: None,
+    };
+    h.handle
+        .install_conversation_rewind(rewind)
+        .await
+        .expect("install");
+
+    let conversation = h.handle.get_conversation().await;
+    assert!(
+        conversation
+            .iter()
+            .any(|item| item.text_content() == "late-after-snapshot"),
+        "a message already accepted and persisted after the rewind snapshot must not disappear from memory: {conversation:?}"
+    );
+    assert!(
+        conversation
+            .iter()
+            .any(|item| item.text_content() == "kept")
+    );
+    assert!(
+        !conversation
+            .iter()
+            .any(|item| item.text_content() == "rewound")
+    );
+
+    let records = h.drain_persistence();
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            PersistenceRecord::Message(item) if item.text_content() == "late-after-snapshot"
+        )),
+        "the late message must produce a persistence record after the replacement: {records:?}"
+    );
+}
+
+#[tokio::test]
+async fn persisted_rewind_preserves_identity_changed_after_snapshot() {
+    use crate::types::{ConversationRewindState, Credentials};
+
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept"),
+    ]);
+    h.handle.increment_prompt_index();
+    let _ = h.handle.get_prompt_index().await;
+
+    h.handle
+        .begin_conversation_rewind()
+        .await
+        .expect("begin rewind");
+    let mut new_config = test_config();
+    new_config.model = "new-live-model".into();
+    h.handle.update_sampling_config(new_config);
+    h.handle.update_credentials(Credentials {
+        api_key: Some("new-live-key".into()),
+        ..Credentials::default()
+    });
+
+    let rewind = ConversationRewindState {
+        conversation: vec![ConversationItem::system("system")],
+        prompt_index: 0,
+        prompt_texts: vec![],
+        last_compaction_prompt_index: None,
+    };
+    h.handle
+        .install_conversation_rewind(rewind)
+        .await
+        .expect("install");
+
+    let state = h.handle.get_sampling_state().await.expect("state");
+    assert_eq!(state.config.model, "new-live-model");
+    assert_eq!(state.credentials.api_key.as_deref(), Some("new-live-key"));
+}
+
+#[tokio::test]
+async fn request_build_waits_for_pending_rewind_and_includes_queued_prompt() {
+    use crate::types::ConversationRewindState;
+
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept"),
+        ConversationItem::assistant("answer"),
+        ConversationItem::user("rewound"),
+    ]);
+    h.handle.increment_prompt_index();
+    h.handle.increment_prompt_index();
+    let _ = h.handle.get_prompt_index().await;
+
+    h.handle
+        .begin_conversation_rewind()
+        .await
+        .expect("begin rewind");
+    h.handle
+        .push_user_message(ConversationItem::user("late-prompt"));
+
+    let builder = h.handle.clone();
+    let build = tokio::spawn(async move {
+        builder
+            .build_request(vec![], None, false, None, "conv".into(), "req".into())
+            .await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !build.is_finished(),
+        "a request must not be built from pre-rewind history while its prompt is queued"
+    );
+
+    h.handle
+        .install_conversation_rewind(ConversationRewindState {
+            conversation: vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("kept"),
+                ConversationItem::assistant("answer"),
+            ],
+            prompt_index: 1,
+            prompt_texts: vec!["kept".into()],
+            last_compaction_prompt_index: None,
+        })
+        .await
+        .expect("install");
+
+    let request = tokio::time::timeout(Duration::from_secs(1), build)
+        .await
+        .expect("build_request must complete after rewind install")
+        .expect("build task")
+        .expect("chat-state actor");
+    let texts: Vec<String> = request
+        .items
+        .iter()
+        .map(ConversationItem::text_content)
+        .collect();
+    assert!(
+        texts.iter().any(|text| text == "late-prompt"),
+        "queued prompt must be in the post-rewind request: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "kept"),
+        "rewound prefix must remain: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|text| text == "rewound"),
+        "discarded pre-rewind turns must not be sampled: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_snapshot_restore_cannot_undo_pending_rewind() {
+    use crate::types::ConversationRewindState;
+
+    let h = TestHarness::with_conversation(vec![
+        ConversationItem::system("system"),
+        ConversationItem::user("kept"),
+        ConversationItem::assistant("answer"),
+        ConversationItem::user("must be removed"),
+    ]);
+    h.handle
+        .begin_conversation_rewind()
+        .await
+        .expect("begin rewind");
+
+    // Model a concurrent read-modify-restore caller such as cancellation.
+    // Its snapshot must observe the installed timeline, not stale state from
+    // inside the pending transaction.
+    let concurrent = h.handle.clone();
+    let snapshot_restore = tokio::spawn(async move {
+        let snapshot = concurrent.snapshot().await.expect("snapshot");
+        concurrent.restore_snapshot(snapshot);
+    });
+    tokio::task::yield_now().await;
+
+    h.handle
+        .install_conversation_rewind(ConversationRewindState {
+            conversation: vec![
+                ConversationItem::system("system"),
+                ConversationItem::user("kept"),
+                ConversationItem::assistant("answer"),
+            ],
+            prompt_index: 1,
+            prompt_texts: vec!["kept".into()],
+            last_compaction_prompt_index: None,
+        })
+        .await
+        .expect("install");
+    snapshot_restore.await.expect("snapshot/restore task");
+
+    let conversation = h.handle.get_conversation().await;
+    assert!(
+        !conversation
+            .iter()
+            .any(|item| item.text_content() == "must be removed"),
+        "a stale snapshot taken during the gate must not undo the installed rewind: {conversation:?}"
+    );
 }

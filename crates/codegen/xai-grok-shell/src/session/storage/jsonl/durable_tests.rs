@@ -629,6 +629,83 @@ async fn resume_preserves_cache_entries_appended_after_checkpoint_prefix() {
 }
 
 #[tokio::test]
+async fn checkpoint_repair_replays_post_compaction_updates_onto_stale_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = info();
+    let adapter = JsonlStorageAdapter::with_explicit_session_dir(dir.path().to_path_buf());
+    adapter
+        .init_session(&info, default_model_id())
+        .await
+        .unwrap();
+    let (checkpoint, marker) = compaction_fixture(&info);
+    adapter
+        .write_compaction_checkpoint(&info, &checkpoint)
+        .await
+        .unwrap();
+    adapter
+        .append_update_durable_commit_aware(&info, &marker)
+        .await
+        .unwrap();
+    adapter
+        .replace_chat_history(&info, &[ConversationItem::system("stale old cache")])
+        .await
+        .unwrap();
+
+    let later_user = SessionUpdate::Acp(Box::new(acp::SessionNotification::new(
+        info.id.clone(),
+        acp::SessionUpdate::UserMessageChunk(
+            acp::ContentChunk::new(acp::ContentBlock::Text(acp::TextContent::new(
+                "post-compaction turn",
+            )))
+            .meta(serde_json::json!({ "promptIndex": 3 }).as_object().cloned()),
+        ),
+    )));
+    adapter.append_update(&info, &later_user).await.unwrap();
+    adapter
+        .append_update(&info, &update(&info, "post-compaction answer".into()))
+        .await
+        .unwrap();
+
+    let loaded = adapter.load_session_without_updates(&info).await.unwrap();
+    assert!(
+        loaded
+            .chat_history
+            .iter()
+            .any(|item| item.text_content() == "authoritative checkpoint"),
+        "repair must start from the committed checkpoint: {:?}",
+        loaded
+            .chat_history
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        loaded
+            .chat_history
+            .iter()
+            .any(|item| item.text_content() == "post-compaction turn"),
+        "repair must derive checkpoint + all later updates, not checkpoint alone: {:?}",
+        loaded
+            .chat_history
+            .iter()
+            .map(ConversationItem::text_content)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        loaded
+            .chat_history
+            .iter()
+            .any(|item| item.text_content() == "post-compaction answer")
+    );
+    assert!(
+        !loaded
+            .chat_history
+            .iter()
+            .any(|item| item.text_content() == "stale old cache")
+    );
+}
+
+#[tokio::test]
 async fn compact_metadata_survives_checkpoint_cold_load_and_responses_replay() {
     let dir = tempfile::tempdir().unwrap();
     let info = info();

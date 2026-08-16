@@ -25,6 +25,30 @@ pub struct ChatStateConfig {
     pub sampling_config: SamplingConfig,
 }
 
+/// Timeline-only state installed by a persisted conversation rewind.
+///
+/// Rewind must never carry sampling configuration, credentials, routing
+/// state, or unrelated lifecycle fields — those continue on the live
+/// identity while only conversation history is restored.
+#[derive(Debug, Clone)]
+pub struct ConversationRewindState {
+    pub conversation: Vec<ConversationItem>,
+    pub prompt_index: usize,
+    pub prompt_texts: Vec<String>,
+    pub last_compaction_prompt_index: Option<usize>,
+}
+
+impl ConversationRewindState {
+    pub fn from_snapshot(snapshot: &ChatStateSnapshot) -> Self {
+        Self {
+            conversation: snapshot.conversation.clone(),
+            prompt_index: snapshot.prompt_index,
+            prompt_texts: snapshot.prompt_texts.clone(),
+            last_compaction_prompt_index: snapshot.last_compaction_prompt_index,
+        }
+    }
+}
+
 /// Immutable snapshot of the actor's state (for forking, rewind).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatStateSnapshot {

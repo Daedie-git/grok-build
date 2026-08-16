@@ -247,7 +247,11 @@ impl SessionActor {
 
         // Drop stale workflow-completion synthetic fronts (already reported).
         loop {
-            let stale = match state.pending_inputs.front().map(|item| &item.origin) {
+            let stale = match state
+                .pending_inputs
+                .front()
+                .map(|item| item.input_origin.as_prompt_origin())
+            {
                 Some(super::PromptOrigin::WorkflowCompleted { completion_id }) => {
                     match completion_id
                         .rsplit_once('-')
@@ -336,7 +340,7 @@ impl SessionActor {
             verbatim,
             send_now,
             json_schema,
-            origin,
+            input_origin,
             running_display,
             tool_overrides_update,
             promotion_trace_start,
@@ -358,7 +362,7 @@ impl SessionActor {
                 front.verbatim,
                 front.send_now,
                 front.json_schema.clone(),
-                front.origin.clone(),
+                front.input_origin.clone(),
                 running_display,
                 front.tool_overrides_update.take(),
                 front
@@ -368,7 +372,7 @@ impl SessionActor {
             )
         };
         self.apply_tool_overrides_update(tool_overrides_update);
-        if matches!(origin, super::PromptOrigin::User) {
+        if input_origin.policy().authority.is_human_intent() {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(false);
             }
@@ -438,21 +442,27 @@ impl SessionActor {
             }
         }
 
+        // Bump the epoch here rather than in `handle_prompt`: a cancel reads the slot as soon as
+        // `running_task` is set on the next line.
+        self.turn_report.start_next_turn();
         state.running_task = Some(AgentTask::new_prompt(
             self.clone(),
-            prompt_id,
-            prompt_blocks,
-            prompt_mode,
-            trace_gcs_config,
-            artifact_tracker,
-            client_identifier,
-            screen_mode,
-            verbatim,
-            send_now,
-            json_schema,
+            TurnInputRequest {
+                prompt_id,
+                input_origin,
+                prompt_blocks,
+                prompt_mode,
+                trace_gcs_config,
+                artifact_tracker,
+                client_identifier,
+                screen_mode,
+                verbatim,
+                send_now,
+                json_schema,
+                persist_ack,
+                parsed_prompt_tx,
+            },
             completion_tx,
-            persist_ack,
-            parsed_prompt_tx,
         ));
     }
 
@@ -627,14 +637,27 @@ impl SessionActor {
 
     /// Notifies extensions when the session settles idle (nothing running, nothing queued).
     /// The idle check stays host-side; extensions only get the event.
+    ///
+    /// Ignores `notifications_suppressed`, unlike [`is_session_idle_for_injection`]: after an
+    /// interrupt the session really is idle, and that is the ping a host waits for.
     pub(super) async fn emit_session_idle_if_idle(&self) {
-        {
+        let suppressed = {
             let state = self.state.lock().await;
-            if !is_session_idle_for_injection(&state) {
+            if state_is_busy(&state) {
                 return;
             }
+            state.notifications_suppressed
+        };
+        // Reconciliation writes subagent records, so it stays behind the suppression check, and
+        // it runs in a child session, which the notification below does not.
+        if !suppressed {
+            self.reconcile_live_orphaned_subagents().await;
         }
-        self.reconcile_live_orphaned_subagents().await;
+        // Like the session-end `Stop`: a subagent settling is not the session settling.
+        // `SessionEnd` itself still fires for a child, carrying `subagentType`.
+        if self.startup_hints.is_subagent {
+            return;
+        }
         for contributor in self.extension_registry.session_lifecycle_contributors() {
             contributor
                 .on_session_idle(&xai_agent_lifecycle::SessionIdleInput)
@@ -799,13 +822,14 @@ impl SessionActor {
             screen_mode: None,
             verbatim: true,
             json_schema: None,
-            origin: super::PromptOrigin::NotificationDrain,
+            input_origin: InputOrigin::new(super::PromptOrigin::NotificationDrain),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
             queue_meta: None,
+            queue_mutation_policy: QueueMutationPolicy::hidden(),
             send_now: false,
         });
 
@@ -1042,7 +1066,7 @@ mod live_orphan_hook_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn emit_session_idle_skips_reconcile_when_not_idle() {
+    async fn emit_session_idle_skips_reconcile_while_suppressed() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {

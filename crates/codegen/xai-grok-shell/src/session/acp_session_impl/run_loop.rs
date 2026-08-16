@@ -32,12 +32,13 @@ mod yolo_toggle_report_tests {
 fn cleanup_session_scratch(_session: &SessionActor) {}
 /// SessionEnd hooks + stop dispatch. Shared so channel-closed and Shutdown
 /// cannot drift on hook ordering (memory save still runs after this).
-async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
+pub(super) async fn fire_session_end_hooks(session: &SessionActor, reason: &str) {
     let envelope = session.fire_hook(
         xai_grok_hooks::event::HookEventName::SessionEnd,
         None,
         xai_grok_hooks::event::HookPayload::SessionEnd {
             reason: reason.to_string(),
+            subagent_type: session.subagent_type_label(),
             turn_count: None,
             tool_call_count: None,
         },
@@ -200,6 +201,7 @@ pub(super) async fn run_session(
 ) {
     let (completion_tx, mut completion_rx) =
         mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+    let mut turn_end_queue = super::turn_end_hooks::TurnEndQueue::spawn(session.clone());
     tracing::debug!("fs_notify_config: {:?}", fs_notify_config);
     let mut replay_buffer = ReplayBuffer::new(session.buffering_settings.clone());
     let event_tx_for_flush_timer = session.event_tx.clone();
@@ -466,7 +468,9 @@ pub(super) async fn run_session(
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else {
                         // ── session_end (channel-closed path) ────────
-                        // Hooks fire BEFORE memory auto-save per plan contract.
+                        // Queued reports first, so an earlier turn's report precedes the
+                        // session-end `Stop`. Hooks fire BEFORE memory auto-save per plan contract.
+                        turn_end_queue.flush().await;
                         fire_session_end_hooks(&session, "channel_closed").await;
                         session
                             .run_session_end_memory_pipeline(
@@ -491,6 +495,7 @@ pub(super) async fn run_session(
                             }
                         }
                         shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
@@ -524,6 +529,9 @@ pub(super) async fn run_session(
                             tokio::task::spawn_local(async move {
                                 s.resume_plan_approval(completion_tx).await;
                             });
+                        }
+                        SessionCommand::TitleRenamed { manual } => {
+                            session.on_title_renamed(manual);
                         }
                         SessionCommand::GetToolOverrides { respond_to } => {
                             let _ = respond_to.send(session.effective_tool_overrides());
@@ -606,6 +614,7 @@ pub(super) async fn run_session(
                                 .queue_input(QueueInputRequest {
                                     prompt_blocks,
                                     prompt_id,
+                                    input_origin: InputOrigin::new(origin),
                                     prompt_mode,
                                     trace_gcs_config,
                                     artifact_tracker,
@@ -868,11 +877,8 @@ pub(super) async fn run_session(
                             session.handle_hold_edit(id).await;
                         }
                         SessionCommand::ReleaseEdit { id } => {
-                            {
-                                let mut state = session.state.lock().await;
-                                state.edit_holds.remove(&id);
-                            }
-                            // Unblocks a front that was parked under edit hold.
+                            session.handle_release_edit(&id).await;
+                            // Unblocks an editable front that was parked under edit hold.
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                         }
                         SessionCommand::InterjectQueuedPrompt { id, expected_version, owner, new_text } => {
@@ -904,8 +910,7 @@ pub(super) async fn run_session(
                             // that prior success. Cancel targets the current turn;
                             // under show-until-replaced the prior line should still
                             // finish. New real prompts and rewind abort separately.
-                            let barrier = session.cancel_running_task(options).await;
-
+                            let cancel = session.cancel_running_task(options).await;
                             // Auto-pause the active goal on any cancel so timers stop
                             // and the pager shows "paused" instead of "active".
                             // Shared with the doom-loop and back-off paths via
@@ -922,12 +927,15 @@ pub(super) async fn run_session(
                             SessionActor::maybe_start_running_task(session.clone(), completion_tx.clone()).await;
                             // An armed barrier must outlive the cancel; only
                             // a clear one lets queued notifications drain.
-                            if barrier == super::tasks_cancel::WakeBarrier::Clear {
+                            if cancel.barrier == super::tasks_cancel::WakeBarrier::Clear {
                                 SessionActor::maybe_drain_notifications(
                                     session.clone(),
                                     completion_tx.clone(),
                                 )
                                 .await;
+                            }
+                            if cancel.turn_stopped {
+                                session.emit_session_idle_if_idle().await;
                             }
                         }
                         SessionCommand::CompactSession { user_context, respond_to } => {
@@ -1901,13 +1909,14 @@ pub(super) async fn run_session(
                                     screen_mode: None,
                                     verbatim: true,
                                     json_schema: None,
-                                    origin: super::PromptOrigin::GoalSummary,
+                                    input_origin: InputOrigin::new(super::PromptOrigin::GoalSummary),
                                     task_wake_fallback: None,
                                     tool_overrides_update: None,
                                     respond_to,
                                     persist_ack: None,
                                     parsed_prompt_tx: None,
                                     queue_meta: None,
+                                    queue_mutation_policy: QueueMutationPolicy::hidden(),
                                     send_now: false,
                                 });
                             }
@@ -1937,7 +1946,10 @@ pub(super) async fn run_session(
                             {
                                 let mut state = session.state.lock().await;
                                 let workflow_wake_queued = state.pending_inputs.iter().any(|item| {
-                                    matches!(item.origin, super::PromptOrigin::WorkflowCompleted { .. })
+                                    matches!(
+                                        item.input_origin.as_prompt_origin(),
+                                        super::PromptOrigin::WorkflowCompleted { .. }
+                                    )
                                 });
                                 if workflow_wake_queued {
                                     continue;
@@ -1952,15 +1964,16 @@ pub(super) async fn run_session(
                                     screen_mode: None,
                                     verbatim: true,
                                     json_schema: None,
-                                    origin: super::PromptOrigin::WorkflowCompleted {
+                                    input_origin: InputOrigin::new(super::PromptOrigin::WorkflowCompleted {
                                         completion_id: format!("{run_id}-{revision}"),
-                                    },
+                                    }),
                                     task_wake_fallback: None,
                                     tool_overrides_update: None,
                                     respond_to,
                                     persist_ack: None,
                                     parsed_prompt_tx: None,
                                     queue_meta: None,
+                                    queue_mutation_policy: QueueMutationPolicy::hidden(),
                                     send_now: false,
                                 });
                             }
@@ -2035,16 +2048,17 @@ pub(super) async fn run_session(
                             // Session is ending: do not leave a side-call
                             // holding an Arc into this actor.
                             session.abort_turn_summary();
+                            session.abort_title_refresh();
                             // This arm returns; an unanswered turn would race
                             // teardown and report `EndTurn` for unfinished work.
                             if kind == crate::session::ShutdownKind::CancelRunningTurn {
-                                // Shutdown is not a stop gesture; the barrier
-                                // stays clear.
+                                // Shutdown is not a stop gesture: the
+                                // session-end `Stop` reports this teardown.
                                 let _ = session
                                     .cancel_running_task(crate::session::CancelOptions {
                                         cancel_subagents: true,
                                         kill_background_tasks: true,
-                                        rewind_if_no_output: false,
+                                        history: crate::session::CancelHistoryDisposition::Keep,
                                         trigger: Some(crate::session::CancelTrigger::Shutdown),
                                         user_initiated: false,
                                     })
@@ -2062,10 +2076,12 @@ pub(super) async fn run_session(
 
                             // ── session_end (shutdown path) ────────────
                             // Hooks fire BEFORE memory auto-save per plan contract.
+                            turn_end_queue.flush().await;
                             fire_session_end_hooks(&session, "shutdown").await;
                             session
                                 .run_session_end_memory_pipeline("session summary saved")
                                 .await;
+                            turn_end_queue.drain().await;
                             finish_session_exit_feedback(&session).await;
                             return;
                         }
@@ -2078,7 +2094,11 @@ pub(super) async fn run_session(
                         // Completion channel closed: full feedback teardown so
                         // final signal sync + upload drain still run (cancel
                         // alone no longer force-syncs — shutdown owns that).
+                        // No session-end hooks here, but the flush still has to precede
+                        // `shutdown_workflows`, which makes a queued report's entry durable.
+                        turn_end_queue.flush().await;
                         shutdown_workflows(&session).await;
+                        turn_end_queue.drain().await;
                         finish_session_exit_feedback(&session).await;
                         return;
                     };
@@ -2156,6 +2176,9 @@ pub(super) async fn run_session(
                     // work the user aborted.
                     if turn_ran && turn_succeeded && owned_completion {
                         session.restart_turn_summary(completed_prompt_id);
+                        // Early-session auto-title refresh (turns 3 and 6),
+                        // then frozen. Same success gating as the turn summary.
+                        session.maybe_refresh_title();
                     }
                 }
         }

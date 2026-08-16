@@ -567,7 +567,7 @@ impl AgentBuilder {
     /// agent's tool config after `ensure_plan_mode_tools` injection, so
     /// the model cannot ask the user structured questions regardless of
     /// which built-in profile is in use. Driven by the shell's resolved gate
-    /// (`resolve_ask_user_question`, default ON — remote settings/config/env act as
+    /// (the `ask_user_question` feature, default ON: remote settings/config/env act as
     /// a kill-switch) and/or the pager's `--no-ask-user` (`_meta.askUserQuestion`).
     pub fn with_ask_user_question_enabled(mut self, enabled: bool) -> Self {
         self.ask_user_question_enabled = enabled;
@@ -2288,6 +2288,8 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         })
         .with_web_fetch_config(WebFetchConfig::Enabled {
             params: Default::default(),
@@ -2415,6 +2417,8 @@ mod tests {
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
                 alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
             }
         } else {
             WebSearchConfig::Disabled

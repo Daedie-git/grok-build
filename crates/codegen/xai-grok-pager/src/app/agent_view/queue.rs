@@ -455,15 +455,8 @@ impl AgentView {
                 // Forward-only: the xAI rail shares this cursor and may have
                 // applied later events during the buffering window — assigning
                 // a buffered (older) id would re-deliver those on reconnect.
-                let cur_seq = self
-                    .last_seen_event_id
-                    .as_deref()
-                    .and_then(|s| s.rsplit('-').next())
-                    .and_then(|c| c.parse::<u64>().ok());
-                if let (Some(seq), Some(id)) = (meta.event_seq, meta.event_id.take())
-                    && cur_seq.is_none_or(|cur| seq > cur)
-                {
-                    self.last_seen_event_id = Some(id);
+                if let (Some(seq), Some(id)) = (meta.event_seq, meta.event_id.take()) {
+                    self.advance_last_seen_event_id(id, Some(seq));
                 }
                 self.session
                     .handle_update(update, &meta, &mut self.scrollback);
@@ -478,7 +471,7 @@ impl AgentView {
             .retain(|(pid, _, _)| pid != prompt_id);
     }
 
-    /// Toggle queue pane visibility (shared by Ctrl-; shortcut and badge click).
+    /// Toggle queue pane visibility (Ctrl-; shortcut).
     pub(in crate::app) fn toggle_queue_pane(&mut self) {
         self.queue.overlay.toggle();
         self.queue.on_state_change();

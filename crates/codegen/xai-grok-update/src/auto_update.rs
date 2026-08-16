@@ -545,6 +545,15 @@ fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: boo
     })
 }
 
+/// Whether a target should be presented to the user as an available update.
+///
+/// Authoritative installers may converge to an older channel pointer, but a
+/// rollback is not an available update and must not drive the TUI restart CTA.
+/// Keep that presentation decision upgrade-only, matching `update --check`.
+fn should_offer_update_restart(current: &str, target: &str, channel: &str) -> bool {
+    needs_update(current, target, channel, false).unwrap_or(false)
+}
+
 /// Returns `true` for installer backends whose version source is authoritative
 /// (managed by xAI directly), meaning a pointer rollback is intentional and
 /// should trigger a client downgrade. Returns `false` for backends like npm
@@ -590,13 +599,13 @@ impl BackgroundUpdateCheck {
 
 /// Check for available updates without blocking the TUI startup.
 ///
-/// Sets [`BackgroundUpdateCheck::update`] when the running binary is older
-/// than the channel pointer. If `auto_update` is enabled **and the on-disk
-/// install is also behind the pointer**, kicks off a non-blocking download
-/// (spawns `grok update` as a detached child process) so the new binary is
-/// ready when the user quits and relaunches. When another process (an earlier
-/// TUI, the leader's hourly checker) already put the target version on disk,
-/// no download is started — only the restart hint is surfaced.
+/// Sets [`BackgroundUpdateCheck::update`] only when the running binary is
+/// older than the channel pointer. Authoritative-installer rollback still
+/// converges the managed install in the background, but is never mislabeled as
+/// an available update or surfaced as a restart CTA. If `auto_update` is
+/// enabled **and the on-disk install differs in the permitted direction**,
+/// kicks off a non-blocking download (spawns `grok update` as a detached child
+/// process) so the target binary is ready on the next launch.
 pub async fn check_update_background(update_config: &UpdateConfig) -> BackgroundUpdateCheck {
     let Some(installer) = get_installer().await else {
         return BackgroundUpdateCheck::none();
@@ -623,18 +632,20 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     };
 
     let allow_downgrade = installer_allows_downgrade(installer);
-    if !needs_update(
+    let convergence_needed = needs_update(
         &current_version,
         &target_version,
         &update_config.channel,
         allow_downgrade,
     )
-    .unwrap_or(false)
-    {
+    .unwrap_or(false);
+    if !convergence_needed {
         let stable_ptr = try_fetch_stable_pointer().await;
         write_version_cache(&target_version, stable_ptr.as_deref()).await;
         return BackgroundUpdateCheck::none();
     }
+    let offer_restart =
+        should_offer_update_restart(&current_version, &target_version, &update_config.channel);
 
     // Only download when the on-disk install is behind the pointer; the
     // running process being stale (checked above) just means "show the
@@ -673,8 +684,16 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
         None
     };
 
+    // An ahead-of-pointer process (notably a local/fork build) must not repeat
+    // the same suppressed rollback check on every launch when the managed
+    // install is already at the channel pointer.
+    if !offer_restart && !disk_needs_download {
+        let stable_ptr = try_fetch_stable_pointer().await;
+        write_version_cache(&target_version, stable_ptr.as_deref()).await;
+    }
+
     BackgroundUpdateCheck {
-        update: Some(UpdateAvailable {
+        update: offer_restart.then_some(UpdateAvailable {
             latest_version: target_version,
         }),
         download,

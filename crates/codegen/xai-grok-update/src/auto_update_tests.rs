@@ -1488,6 +1488,16 @@ fn test_needs_update_downgrade_stable_when_allowed() {
 }
 
 #[test]
+fn test_background_restart_hint_never_advertises_older_version() {
+    assert!(
+        !should_offer_update_restart("1.0.5", "1.0.4", "stable"),
+        "an authoritative rollback may converge silently, but 1.0.4 is not an update to 1.0.5"
+    );
+    assert!(should_offer_update_restart("1.0.4", "1.0.5", "stable"));
+    assert!(!should_offer_update_restart("1.0.5", "1.0.5", "stable"));
+}
+
+#[test]
 fn test_needs_update_downgrade_stable_blocked_when_disallowed() {
     // Same rollback scenario but npm installer: allow_downgrade=false → no update.
     assert_eq!(needs_update("0.2.7", "0.2.5", "stable", false), Some(false));

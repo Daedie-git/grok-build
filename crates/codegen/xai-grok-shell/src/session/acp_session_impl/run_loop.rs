@@ -639,8 +639,8 @@ pub(super) async fn run_session(
                             session.handle_session_mode(session_mode).await;
                             let _ = responds_to.send(());
                         }
-                        SessionCommand::SetSessionModel { sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, responds_to } => {
-                            let updated_model_id = session.handle_set_session_model(sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent).await;
+                        SessionCommand::SetSessionModel { sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, system_prompt_identity, responds_to } => {
+                            let updated_model_id = session.handle_set_session_model(sampling_config, sampling_identity, rebuild_definition, use_concise, apply_prompt_override, skip_prompt_rewrite, auto_compact_threshold_percent, system_prompt_identity).await;
                             let _ = responds_to.send(updated_model_id);
                         }
                         SessionCommand::OverrideModelName { model_name, extra_headers, context_window, responds_to } => {

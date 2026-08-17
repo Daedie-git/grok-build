@@ -169,10 +169,23 @@ impl From<&ConversationRequest> for rs::CreateResponse {
 /// Reasoning items stay top-level siblings rather than folding into the
 /// assistant, so the input replays the model's original order.
 pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam {
+    responses_input_from_conversation(req, false)
+}
+
+/// Codex exact-replay input: identified empty assistant messages occupy a
+/// `message` slot. Standard Responses keeps the content-only check.
+pub(crate) fn build_codex_responses_input(req: &ConversationRequest) -> rs::InputParam {
+    responses_input_from_conversation(req, true)
+}
+
+fn responses_input_from_conversation(
+    req: &ConversationRequest,
+    project_identified_empty: bool,
+) -> rs::InputParam {
     let items: Vec<rs::InputItem> = req
         .items
         .iter()
-        .flat_map(conversation_item_to_input_items)
+        .flat_map(|item| conversation_item_to_input_items(item, project_identified_empty))
         .collect();
     rs::InputParam::Items(items)
 }
@@ -201,7 +214,10 @@ pub fn patch_reasoning_text_types(body: &mut serde_json::Value) {
     }
 }
 
-fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputItem> {
+fn conversation_item_to_input_items(
+    item: &ConversationItem,
+    project_identified_empty: bool,
+) -> Vec<rs::InputItem> {
     match item {
         ConversationItem::System(s) => {
             vec![rs::InputItem::EasyMessage(rs::EasyInputMessage {
@@ -227,7 +243,7 @@ fn conversation_item_to_input_items(item: &ConversationItem) -> Vec<rs::InputIte
         ConversationItem::Assistant(a) => {
             let mut items = Vec::new();
 
-            if !a.content.is_empty() {
+            if !a.content.is_empty() || (project_identified_empty && a.projects_message()) {
                 items.push(rs::InputItem::EasyMessage(rs::EasyInputMessage {
                     r#type: rs::MessageType::Message,
                     role: rs::Role::Assistant,

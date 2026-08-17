@@ -125,6 +125,7 @@ mod tests {
             "memory_enabled": false,
             "is_non_interactive": false,
             "system_prompt_label": crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL,
+            "system_prompt_vendor": crate::prompt::context::DEFAULT_SYSTEM_PROMPT_VENDOR,
         })
     }
 
@@ -321,6 +322,27 @@ mod tests {
         assert!(
             prompt.contains("user_query"),
             "Must reference user_query tag"
+        );
+        assert!(
+            prompt.starts_with("You are Grok released by xAI."),
+            "default identity must keep the xAI vendor suffix: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_base_template_codex_identity_omits_xai_vendor() {
+        let mut p = default_placeholders();
+        p["system_prompt_label"] =
+            serde_json::json!(crate::prompt::context::CODEX_SYSTEM_PROMPT_LABEL);
+        p["system_prompt_vendor"] = serde_json::json!("");
+        let prompt = render_base(&default_renderer(), &p);
+        assert!(
+            prompt.starts_with("You are Codex."),
+            "Codex identity must not claim an xAI release: {prompt}"
+        );
+        assert!(
+            !prompt.contains("You are Codex released by xAI"),
+            "Codex identity must not claim an xAI release: {prompt}"
         );
     }
 

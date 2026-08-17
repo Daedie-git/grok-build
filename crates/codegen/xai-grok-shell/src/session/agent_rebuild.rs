@@ -139,7 +139,7 @@ pub(crate) struct AgentRebuildSpec {
     pub managed_gateway_tool_client:
         Option<xai_grok_tools::types::resources::ManagedGatewayToolClient>,
     pub is_non_interactive: bool,
-    pub system_prompt_label: String,
+    pub system_prompt_identity: xai_grok_agent::SystemPromptIdentity,
     pub owner_session_id: Option<String>,
     pub parent_scheduler_handle:
         Option<xai_grok_tools::implementations::grok_build::scheduler::types::SchedulerHandle>,
@@ -156,7 +156,17 @@ impl AgentRebuildSpec {
         self: &Arc<Self>,
         definition: AgentDefinition,
     ) -> Result<Agent, AgentBuildError> {
-        self.build_agent_inner(definition, None, None).await
+        self.build_agent_inner(definition, None, None, None).await
+    }
+    /// Like [`Self::build_agent`], but use a model-switch-resolved identity
+    /// instead of the spawn-time spec label.
+    pub(crate) async fn build_agent_with_system_prompt_identity(
+        self: &Arc<Self>,
+        definition: AgentDefinition,
+        system_prompt_identity: xai_grok_agent::SystemPromptIdentity,
+    ) -> Result<Agent, AgentBuildError> {
+        self.build_agent_inner(definition, None, None, Some(system_prompt_identity))
+            .await
     }
     /// Build an agent with optional one-shot overrides for initial spawn.
     ///
@@ -175,7 +185,7 @@ impl AgentRebuildSpec {
         persisted_skill_names: Option<std::collections::HashSet<String>>,
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     ) -> Result<Agent, AgentBuildError> {
-        self.build_agent_inner(definition, persisted_skill_names, preloaded_skills)
+        self.build_agent_inner(definition, persisted_skill_names, preloaded_skills, None)
             .await
     }
     #[deny(unused_variables)]
@@ -184,6 +194,7 @@ impl AgentRebuildSpec {
         definition: AgentDefinition,
         persisted_skill_names: Option<std::collections::HashSet<String>>,
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
+        system_prompt_identity_override: Option<xai_grok_agent::SystemPromptIdentity>,
     ) -> Result<Agent, AgentBuildError> {
         let Self {
             working_directory,
@@ -238,10 +249,12 @@ impl AgentRebuildSpec {
             mcp_state,
             managed_gateway_tool_client,
             is_non_interactive,
-            system_prompt_label,
+            system_prompt_identity,
             owner_session_id,
             parent_scheduler_handle,
         } = self.as_ref();
+        let system_prompt_identity =
+            system_prompt_identity_override.unwrap_or_else(|| system_prompt_identity.clone());
         let _ = mcp_state;
         #[allow(unused_variables)]
         let is_cursor_template =
@@ -269,7 +282,7 @@ impl AgentRebuildSpec {
         .with_memory_enabled(*memory_enabled)
         .with_memory_paths(memory_global_path.clone(), memory_workspace_path.clone())
         .with_is_non_interactive(*is_non_interactive)
-        .with_system_prompt_label(system_prompt_label.clone())
+        .with_system_prompt_identity(system_prompt_identity)
         .with_session_env(session_env.clone())
         .with_state_path(bridge_state_path.clone())
         .with_web_search_config(web_search_config.clone())
@@ -480,7 +493,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         )),
         managed_gateway_tool_client: None,
         is_non_interactive: false,
-        system_prompt_label: xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
+        system_prompt_identity: xai_grok_agent::SystemPromptIdentity::default(),
         owner_session_id: Some("test-session".to_string()),
         parent_scheduler_handle: None,
     })

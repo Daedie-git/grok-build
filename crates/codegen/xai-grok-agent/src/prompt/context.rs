@@ -152,11 +152,37 @@ pub struct PromptContext {
     /// Not the UI picker name. Defaults to [`DEFAULT_SYSTEM_PROMPT_LABEL`].
     #[serde(default = "default_system_prompt_label")]
     pub system_prompt_label: String,
+    /// Vendor in the primary system-prompt identity. Empty omits attribution.
+    #[serde(default = "default_system_prompt_vendor")]
+    pub system_prompt_vendor: String,
 }
 /// Default identity on trim-tool-descriptions (`You are Grok released by xAI`).
 pub const DEFAULT_SYSTEM_PROMPT_LABEL: &str = "Grok";
+/// Identity used for Codex-backed models (`You are Codex.`).
+pub const CODEX_SYSTEM_PROMPT_LABEL: &str = "Codex";
+/// Vendor suffix for non-Codex identities (`released by xAI`).
+pub const DEFAULT_SYSTEM_PROMPT_VENDOR: &str = "xAI";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemPromptIdentity {
+    pub label: String,
+    pub vendor: String,
+}
+
+impl Default for SystemPromptIdentity {
+    fn default() -> Self {
+        Self {
+            label: default_system_prompt_label(),
+            vendor: default_system_prompt_vendor(),
+        }
+    }
+}
+
 fn default_system_prompt_label() -> String {
     DEFAULT_SYSTEM_PROMPT_LABEL.to_string()
+}
+fn default_system_prompt_vendor() -> String {
+    DEFAULT_SYSTEM_PROMPT_VENDOR.to_string()
 }
 fn is_template_override_none(t: &TemplateOverride) -> bool {
     matches!(t, TemplateOverride::None)
@@ -197,6 +223,7 @@ impl Default for PromptContext {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            system_prompt_vendor: default_system_prompt_vendor(),
         }
     }
 }
@@ -255,6 +282,7 @@ impl PromptContext {
             "current_date": self.current_date.as_deref().unwrap_or(""),
             "is_non_interactive": self.is_non_interactive,
             "system_prompt_label": self.system_prompt_label.as_str(),
+            "system_prompt_vendor": self.system_prompt_vendor.as_str(),
             "include_browser_verification": self.include_browser_verification,
         })
     }
@@ -335,6 +363,7 @@ mod tests {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            system_prompt_vendor: default_system_prompt_vendor(),
         }
     }
     #[test]
@@ -351,6 +380,18 @@ mod tests {
         assert_eq!(&on[..block_start], off);
         assert!(on.ends_with("</browser_verification>"));
         assert!(!off.contains("<browser_verification>"));
+    }
+    #[test]
+    fn standard_primary_template_identifies_codex_without_xai_vendor() {
+        let renderer = TemplateRenderer::new(Default::default(), Default::default());
+        let mut ctx = test_context();
+        ctx.system_prompt_label = CODEX_SYSTEM_PROMPT_LABEL.to_string();
+        ctx.system_prompt_vendor.clear();
+        let prompt = ctx.render_with_renderer(&renderer).unwrap();
+        assert!(
+            prompt.starts_with("You are Codex."),
+            "Codex identity must not claim an xAI release: {prompt}"
+        );
     }
     #[test]
     fn full_mode_flag_does_not_append_browser_verification() {
@@ -462,6 +503,7 @@ mod tests {
         assert!(p.get("role_instructions").is_some());
         assert!(p.get("persona_instructions").is_some());
         assert_eq!(p["system_prompt_label"], DEFAULT_SYSTEM_PROMPT_LABEL);
+        assert_eq!(p["system_prompt_vendor"], DEFAULT_SYSTEM_PROMPT_VENDOR);
     }
     #[test]
     fn test_placeholders_system_prompt_label_override() {
@@ -469,12 +511,33 @@ mod tests {
         ctx.system_prompt_label = "Grok Internal".into();
         let p = ctx.placeholders();
         assert_eq!(p["system_prompt_label"], "Grok Internal");
+        assert_eq!(p["system_prompt_vendor"], DEFAULT_SYSTEM_PROMPT_VENDOR);
+    }
+    #[test]
+    fn test_placeholders_codex_identity_omits_xai_vendor() {
+        let mut ctx = test_context();
+        ctx.system_prompt_label = "Custom Codex".into();
+        ctx.system_prompt_vendor.clear();
+        let p = ctx.placeholders();
+        assert_eq!(p["system_prompt_label"], "Custom Codex");
+        assert_eq!(p["system_prompt_vendor"], "");
+    }
+
+    #[test]
+    fn custom_codex_identity_renders_without_xai_vendor() {
+        let renderer = TemplateRenderer::new(Default::default(), Default::default());
+        let mut ctx = test_context();
+        ctx.system_prompt_label = "Custom Codex".into();
+        ctx.system_prompt_vendor.clear();
+        let prompt = ctx.render_with_renderer(&renderer).unwrap();
+        assert!(prompt.starts_with("You are Custom Codex."), "{prompt}");
     }
     #[test]
     fn test_missing_system_prompt_label_deserializes_to_default() {
         let json = r#"{"version":1,"prompt_mode":"extend","agents_md_files":[],"build_timestamp_utc":"2025-06-15T12:00:00+00:00"}"#;
         let ctx: PromptContext = serde_json::from_str(json).unwrap();
         assert_eq!(ctx.system_prompt_label, DEFAULT_SYSTEM_PROMPT_LABEL);
+        assert_eq!(ctx.system_prompt_vendor, DEFAULT_SYSTEM_PROMPT_VENDOR);
     }
     #[test]
     fn test_placeholders_includes_all_eight_keys() {
@@ -659,6 +722,7 @@ mod tests {
             current_date: None,
             is_non_interactive: false,
             system_prompt_label: default_system_prompt_label(),
+            system_prompt_vendor: default_system_prompt_vendor(),
         }
     }
     #[test]

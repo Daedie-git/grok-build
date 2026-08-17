@@ -94,4 +94,45 @@ mod tests {
                 .all(|model| model["max_retries"].as_u64() == Some(5))
         );
     }
+
+    #[test]
+    fn built_in_codex_catalog_is_sol_and_luna_only() {
+        let value: serde_json::Value = serde_json::from_str(DEFAULT_MODELS_JSON).unwrap();
+        let models = value["models"].as_array().unwrap();
+        let codex: Vec<(&str, &str)> = models
+            .iter()
+            .filter(|model| model["provider_id"] == "codex")
+            .map(|model| {
+                (
+                    model["id"].as_str().expect("codex id"),
+                    model["model"].as_str().expect("codex model"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            codex,
+            vec![
+                ("codex-gpt-5.6-sol", "gpt-5.6-sol"),
+                ("codex-gpt-5.6-luna", "gpt-5.6-luna"),
+            ]
+        );
+        for model in models {
+            if model["provider_id"] == "codex" {
+                assert_eq!(
+                    model["system_prompt_label"].as_str(),
+                    Some("Codex"),
+                    "built-in Codex model {} must identify as Codex in the system prompt",
+                    model["id"]
+                );
+            }
+            for field in ["id", "model", "name", "description"] {
+                if let Some(text) = model.get(field).and_then(|value| value.as_str()) {
+                    assert!(
+                        !text.to_ascii_lowercase().contains("spark"),
+                        "default_models.json {field} still mentions spark: {text}"
+                    );
+                }
+            }
+        }
+    }
 }

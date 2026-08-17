@@ -10,6 +10,7 @@ mod responses;
 
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
+pub(crate) use responses::build_codex_responses_input;
 pub use responses::{
     extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,
 };
@@ -416,6 +417,17 @@ pub struct AssistantItem {
     /// backends that don't echo it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+}
+
+impl AssistantItem {
+    /// True when this assistant occupies a Responses `message` slot.
+    ///
+    /// Tool-only turns have empty content and no item id; those emit only
+    /// function calls. Identified empty messages must stay on the wire so
+    /// Codex can replay them exactly.
+    pub fn projects_message(&self) -> bool {
+        !self.content.is_empty() || self.response_item_id.is_some()
+    }
 }
 
 /// Tool result message
@@ -5331,6 +5343,22 @@ mod tests {
     #[test]
     fn empty_reason_no_visible_content() {
         let resp = make_response(ConversationItem::assistant(""));
+        assert_eq!(
+            resp.empty_reason(),
+            Some(crate::error::EmptyReason::NoVisibleContent)
+        );
+        assert!(resp.is_empty());
+    }
+
+    #[test]
+    fn empty_reason_treats_identified_empty_message_as_empty() {
+        let mut assistant = match ConversationItem::assistant("") {
+            ConversationItem::Assistant(assistant) => assistant,
+            other => panic!("expected assistant, got {other:?}"),
+        };
+        assistant.response_item_id = Some("msg_empty".into());
+        assert!(assistant.projects_message());
+        let resp = make_response(ConversationItem::Assistant(assistant));
         assert_eq!(
             resp.empty_reason(),
             Some(crate::error::EmptyReason::NoVisibleContent)

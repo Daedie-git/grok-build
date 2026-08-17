@@ -16,20 +16,18 @@ Grok also ships first-class models that bill against your ChatGPT/Codex plan (no
 |---|---|
 | `codex-gpt-5.6-sol` | `gpt-5.6-sol` |
 | `codex-gpt-5.6-luna` | `gpt-5.6-luna` |
-| `codex-gpt-5.3-codex-spark` | `gpt-5.3-codex-spark` |
 
 1. Sign in with the Codex CLI once: `codex login` (ChatGPT account).
 2. Confirm credentials: `grok login --codex`.
 3. Select a model: `/model codex-gpt-5.6-sol` or `grok -m codex-gpt-5.6-sol ...`.
 
-These models use the Responses API against `chatgpt.com/backend-api/codex`, support the reasoning efforts listed by the Codex catalog, and share the same tool/subagent path as other Responses models.
+These models use the Responses API against `chatgpt.com/backend-api/codex`, support the reasoning efforts listed by the Codex catalog, and share the same tool/subagent path as other Responses models. Their system prompt identifies them as Codex, not Grok.
 
 Context and auto-compact values follow the Codex CLI safety policy:
 
 | Model | Context window | Auto-compact safety limit |
 |-------|----------------|---------------------------|
 | Sol / Luna | 272,000 tokens | 244,800 tokens (90%) |
-| Spark | 128,000 tokens | 115,200 tokens (90%) |
 
 For Codex-backed models this limit remains active during tool-call follow-ups and cannot be raised or disabled by normal compaction suppression. Threshold overrides can still trigger compaction earlier. Other providers, including Grok 4.5, retain their existing per-model percentage behavior.
 

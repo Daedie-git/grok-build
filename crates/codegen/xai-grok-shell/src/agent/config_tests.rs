@@ -1226,11 +1226,7 @@ fn default_models_dual_endpoint_routing() {
 fn default_model_retry_budgets_keep_grok_resilient_and_codex_bounded() {
     let entries = default_model_entries(&EndpointsConfig::default());
     assert_eq!(entries["grok-4.5"].info.max_retries, None);
-    for model_id in [
-        "codex-gpt-5.6-sol",
-        "codex-gpt-5.6-luna",
-        "codex-gpt-5.3-codex-spark",
-    ] {
+    for model_id in ["codex-gpt-5.6-sol", "codex-gpt-5.6-luna"] {
         assert_eq!(entries[model_id].info.max_retries, Some(5), "{model_id}");
     }
 
@@ -1716,7 +1712,7 @@ fn byok_from_lookup_classifies_all_states() {
         ModelByok::NotByok,
     );
     let codex = test_model_entry(
-        "spark",
+        "codex-model",
         xai_grok_sampling_types::CODEX_BACKEND_BASE_URL,
         None,
         None,
@@ -7239,7 +7235,7 @@ fn resolve_model_list_prefetch_visibility_matches_auth_and_server_list() {
             .values()
             .filter(|entry| is_locally_authenticated_provider_model(entry))
             .count(),
-        3,
+        2,
         "remote xAI visibility must not prune the separate local Codex catalog"
     );
 }
@@ -7275,7 +7271,7 @@ fn resolve_model_list_prefetch_replaces_bundled_xai_models() {
 fn resolve_model_list_empty_prefetch_keeps_only_local_provider_catalog() {
     let cfg = Config::default();
     let resolved = resolve_model_list(&cfg, Some(IndexMap::new()));
-    assert_eq!(resolved.len(), 3);
+    assert_eq!(resolved.len(), 2);
     assert!(
         resolved
             .values()

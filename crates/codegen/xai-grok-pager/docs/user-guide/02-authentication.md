@@ -36,7 +36,7 @@ Running `grok login` starts the sign-in flow again, replacing your cached sessio
 |------|-------------|
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
 | `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. |
-| `--codex` | Validate and refresh ChatGPT/Codex subscription credentials from `~/.codex/auth.json` (same file as the Codex CLI). Use with built-in models `codex-gpt-5.6-sol`, `codex-gpt-5.6-luna`, and `codex-gpt-5.3-codex-spark`. If the file is missing, run `codex login` first, then `grok login --codex`. |
+| `--codex` | Validate and refresh ChatGPT/Codex subscription credentials from `~/.codex/auth.json` (same file as the Codex CLI). Use with built-in models `codex-gpt-5.6-sol` and `codex-gpt-5.6-luna`. If the file is missing, run `codex login` first, then `grok login --codex`. |
 
 To sign out, run `grok logout`. It takes no flags and clears your cached credentials. Codex credentials live in `~/.codex/auth.json` and are not cleared by `grok logout`.
 

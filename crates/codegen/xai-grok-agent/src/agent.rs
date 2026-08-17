@@ -8,7 +8,7 @@ use xai_grok_tools::types::definition::ToolDefinition;
 
 use crate::compaction::CompactionPolicy;
 use crate::config::{AgentDefinition, CompletionRequirement, PermissionMode};
-use crate::prompt::context::PromptContext;
+use crate::prompt::context::{PromptContext, SystemPromptIdentity};
 use crate::system_reminder::ReminderPolicy;
 
 /// A fully built agent: definition + session context.
@@ -232,6 +232,18 @@ impl Agent {
             .render(&self.tool_bridge)
             .await
             .unwrap_or_default();
+    }
+
+    /// Update the model-facing identity and re-render the system prompt.
+    pub async fn apply_system_prompt_identity(&mut self, identity: SystemPromptIdentity) {
+        if self.prompt_context.system_prompt_label == identity.label
+            && self.prompt_context.system_prompt_vendor == identity.vendor
+        {
+            return;
+        }
+        self.prompt_context.system_prompt_label = identity.label;
+        self.prompt_context.system_prompt_vendor = identity.vendor;
+        self.finalize_prompt().await;
     }
 
     /// Re-render the system prompt for a different definition, reusing

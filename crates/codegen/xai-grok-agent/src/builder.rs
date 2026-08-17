@@ -83,6 +83,7 @@ pub struct AgentBuilder {
     memory_workspace_path: Option<String>,
     is_non_interactive: bool,
     system_prompt_label: String,
+    system_prompt_vendor: String,
     session_env: Option<Arc<HashMap<String, String>>>,
     state_path: Option<PathBuf>,
     memory_backend: Option<Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>>,
@@ -227,6 +228,7 @@ impl AgentBuilder {
             memory_workspace_path: None,
             is_non_interactive: false,
             system_prompt_label: crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
+            system_prompt_vendor: crate::prompt::context::DEFAULT_SYSTEM_PROMPT_VENDOR.to_string(),
             session_env: None,
             state_path: None,
             memory_backend: None,
@@ -369,8 +371,12 @@ impl AgentBuilder {
         self.is_non_interactive = value;
         self
     }
-    pub fn with_system_prompt_label(mut self, label: impl Into<String>) -> Self {
-        self.system_prompt_label = label.into();
+    pub fn with_system_prompt_identity(
+        mut self,
+        identity: crate::prompt::context::SystemPromptIdentity,
+    ) -> Self {
+        self.system_prompt_label = identity.label;
+        self.system_prompt_vendor = identity.vendor;
         self
     }
     pub fn with_reminder_policy(mut self, policy: ReminderPolicy) -> Self {
@@ -1185,6 +1191,7 @@ impl AgentBuilder {
             ),
             is_non_interactive: self.is_non_interactive,
             system_prompt_label: self.system_prompt_label,
+            system_prompt_vendor: self.system_prompt_vendor,
         };
         let system_prompt = prompt_context
             .render(&tool_bridge)

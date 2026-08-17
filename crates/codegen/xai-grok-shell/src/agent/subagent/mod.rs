@@ -361,6 +361,38 @@ impl SubagentSpawnContext {
             self.auto_compact_threshold_tiers.remote_global,
         )
     }
+
+    /// Resolve the system-prompt identity for the child's effective model.
+    ///
+    /// Same catalog lookup as auto-compact: session id then routing slug.
+    /// Codex-backed children get the Codex identity even when the parent is Grok.
+    pub(crate) fn resolve_system_prompt_identity(
+        &self,
+        subagent_model_id: &str,
+    ) -> xai_grok_agent::SystemPromptIdentity {
+        let model =
+            crate::agent::config::find_model_by_id(&self.available_models, subagent_model_id)
+                .map(crate::agent::config::ModelEntry::info);
+        match self.agent_config.as_ref() {
+            Some(cfg) => {
+                crate::util::config::resolve_system_prompt_identity(cfg, subagent_model_id, model)
+            }
+            None => {
+                let label = crate::util::config::catalog_system_prompt_label(model)
+                    .unwrap_or_else(|| xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string());
+                let vendor = if model.is_some_and(|info| {
+                    info.provider_id == Some(xai_grok_sampling_types::ProviderId::Codex)
+                        || xai_grok_sampling_types::is_codex_backend_url(&info.base_url)
+                }) {
+                    String::new()
+                } else {
+                    xai_grok_agent::DEFAULT_SYSTEM_PROMPT_VENDOR.to_string()
+                };
+                xai_grok_agent::SystemPromptIdentity { label, vendor }
+            }
+        }
+    }
+
     /// Bind a spawned subagent by the parent session's `--tools`/
     /// `--disallowed-tools`/`--permission-mode` restrictions.
     fn apply_session_cli_overrides(&self, def: &mut xai_grok_agent::config::AgentDefinition) {

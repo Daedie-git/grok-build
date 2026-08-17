@@ -123,11 +123,7 @@ impl ResponsesWireAdapter {
     /// Apply provider constraints after generic defaults have been populated.
     pub(crate) fn normalize_create_response(self, wrapper: &mut CreateResponseWrapper) {
         if self.protocol == ResponsesWireProtocol::Codex {
-            let model = wrapper.inner.model.clone().unwrap_or_default();
-            xai_grok_sampling_types::normalize_create_response_for_codex(
-                &mut wrapper.inner,
-                &model,
-            );
+            xai_grok_sampling_types::normalize_create_response_for_codex(&mut wrapper.inner);
         }
     }
 
@@ -630,7 +626,7 @@ mod tests {
         );
 
         for request in [
-            codex.apply_request_headers(client.post("http://example.test"), "gpt-5.3-codex-spark"),
+            codex.apply_request_headers(client.post("http://example.test"), "unlisted-codex-model"),
             standard.apply_request_headers(client.post("http://example.test"), "gpt-5.6-sol"),
         ] {
             assert!(

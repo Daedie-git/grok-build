@@ -2143,6 +2143,26 @@ fn turn_active_flag_shared_via_arc() {
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
 }
+#[test]
+fn child_system_prompt_identity_follows_effective_model() {
+    let mut grok_ctx = ctx_with_toggle(HashMap::new());
+    grok_ctx.available_models.insert("grok-4.6".into(), test_model_entry("grok-4.6"));
+    grok_ctx.agent_config = Some(crate::agent::config::Config::default());
+    let grok = grok_ctx.resolve_system_prompt_identity("grok-4.6");
+    assert_eq!(grok.label, xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL);
+    assert_eq!(grok.vendor, xai_grok_agent::DEFAULT_SYSTEM_PROMPT_VENDOR);
+
+    let mut codex_entry = test_model_entry("gpt-5.6-sol");
+    codex_entry.info.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+    let mut codex_ctx = ctx_with_toggle(HashMap::new());
+    codex_ctx
+        .available_models
+        .insert("codex-gpt-5.6-sol".into(), codex_entry);
+    let codex = codex_ctx.resolve_system_prompt_identity("codex-gpt-5.6-sol");
+    assert_eq!(codex.label, xai_grok_agent::CODEX_SYSTEM_PROMPT_LABEL);
+    assert_eq!(codex.vendor, "");
+}
+
 fn ctx_with_parent_chat_state(
     session_model_id: &str,
     inference_slug: &str,

@@ -387,6 +387,8 @@ pub enum SessionCommand {
         /// `compaction.threshold_percent` (which is `Cell<u8>` so it can
         /// update without `&mut self`).
         auto_compact_threshold_percent: u8,
+        /// System-prompt identity resolved for the target model.
+        system_prompt_identity: xai_grok_agent::SystemPromptIdentity,
         responds_to: oneshot::Sender<Result<acp::ModelId, acp::Error>>,
     },
     /// Override the model name and optionally inject extra HTTP headers

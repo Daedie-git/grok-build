@@ -1000,7 +1000,7 @@ pub(crate) async fn run_shell_child(
         },
         xai_grok_workspace::permission::ClientType::Generic,
         ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
-        xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
+        ctx.resolve_system_prompt_identity(effective_model_id.0.as_ref()),
         xai_chat_state::CompactionMode::Summary,
         ctx.resolve_compaction_verbatim_input(),
         ctx.resolve_compaction_tool_choice(),

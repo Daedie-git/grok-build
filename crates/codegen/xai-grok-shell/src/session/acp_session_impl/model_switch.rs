@@ -9,6 +9,21 @@ pub(super) struct PreparedAgentRebuild {
     prompt_context: xai_grok_agent::PromptContext,
 }
 
+fn prompt_artifacts_for_persistence(
+    prompt_context: &xai_grok_agent::PromptContext,
+    rendered_system_prompt: &str,
+    use_concise: bool,
+) -> (xai_grok_agent::PromptContext, String) {
+    let mut prompt_context = prompt_context.clone();
+    prompt_context.normalize_for_persistence();
+    let system_prompt = if use_concise {
+        xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT.to_string()
+    } else {
+        rendered_system_prompt.to_string()
+    };
+    (prompt_context, system_prompt)
+}
+
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
         &self,
@@ -19,12 +34,19 @@ impl SessionActor {
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
+        system_prompt_identity: xai_grok_agent::SystemPromptIdentity,
     ) -> Result<acp::ModelId, acp::Error> {
         // Build a candidate harness first, but do not touch live agent state,
         // tool bindings, conversation, prompt artifacts, or persistence until
         // the authoritative sampling transition has committed.
         let prepared_rebuild = match rebuild_definition {
-            Some(definition) => Some(self.prepare_agent_rebuild(*definition).await?),
+            Some(definition) => Some(
+                self.prepare_agent_rebuild_with_identity(
+                    *definition,
+                    Some(system_prompt_identity.clone()),
+                )
+                .await?,
+            ),
             None => None,
         };
 
@@ -143,21 +165,28 @@ impl SessionActor {
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
         if apply_prompt_override && !skip_prompt_rewrite {
+            self.agent
+                .borrow_mut()
+                .apply_system_prompt_identity(system_prompt_identity)
+                .await;
+            let (prompt_context, active_system_prompt) = {
+                let agent = self.agent.borrow();
+                prompt_artifacts_for_persistence(
+                    agent.prompt_context(),
+                    agent.system_prompt(),
+                    use_concise,
+                )
+            };
             let mut conversation = self.chat_state_handle.get_conversation().await;
             for item in conversation.iter_mut() {
                 if let ConversationItem::System(sys) = item {
-                    if use_concise {
-                        sys.content = std::sync::Arc::<str>::from(
-                            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT,
-                        );
-                    } else {
-                        sys.content =
-                            std::sync::Arc::<str>::from(self.agent.borrow().system_prompt());
-                    }
+                    sys.content = std::sync::Arc::<str>::from(active_system_prompt.as_str());
                     break;
                 }
             }
             self.chat_state_handle.replace_conversation(conversation);
+            save_prompt_context(&self.session_info, &prompt_context);
+            save_system_prompt(&self.session_info, &active_system_prompt);
         } else if !apply_prompt_override {
             tracing::info!(
                 session_id = %self.session_info.id.0,
@@ -280,6 +309,15 @@ impl SessionActor {
         &self,
         definition: xai_grok_agent::AgentDefinition,
     ) -> Result<PreparedAgentRebuild, acp::Error> {
+        self.prepare_agent_rebuild_with_identity(definition, None)
+            .await
+    }
+
+    pub(super) async fn prepare_agent_rebuild_with_identity(
+        &self,
+        definition: xai_grok_agent::AgentDefinition,
+        system_prompt_identity: Option<xai_grok_agent::SystemPromptIdentity>,
+    ) -> Result<PreparedAgentRebuild, acp::Error> {
         {
             let state = self.state.lock().await;
             if state.running_task.is_some() {
@@ -298,21 +336,25 @@ impl SessionActor {
             new_agent_type = %new_agent_name,
             "prepare_agent_rebuild: rebuilding harness"
         );
-        let new_agent = self
-            .rebuild_spec
-            .build_agent(definition)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    session_id = %self.session_info.id.0,
-                    new_agent_type = %new_agent_name,
-                    error = %e,
-                    "prepare_agent_rebuild: AgentBuilder::build failed"
-                );
-                acp::Error::internal_error().data(format!(
-                    "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
-                ))
-            })?;
+        let new_agent = match system_prompt_identity {
+            Some(identity) => {
+                self.rebuild_spec
+                    .build_agent_with_system_prompt_identity(definition, identity)
+                    .await
+            }
+            None => self.rebuild_spec.build_agent(definition).await,
+        }
+        .map_err(|e| {
+            tracing::error!(
+                session_id = %self.session_info.id.0,
+                new_agent_type = %new_agent_name,
+                error = %e,
+                "prepare_agent_rebuild: AgentBuilder::build failed"
+            );
+            acp::Error::internal_error().data(format!(
+                "rebuild_agent: build failed for agent_type={new_agent_name}: {e}"
+            ))
+        })?;
         let system_prompt = new_agent.system_prompt().to_string();
         let mut prompt_context = new_agent.prompt_context().clone();
         prompt_context.normalize_for_persistence();
@@ -500,5 +542,37 @@ impl SessionActor {
                 "handle_replace_system_prompt: head already matches, no-op"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_artifacts_for_persistence;
+
+    #[test]
+    fn compatible_switch_artifacts_use_updated_identity_and_active_prompt() {
+        let context = xai_grok_agent::PromptContext {
+            system_prompt_label: "Custom Codex".into(),
+            system_prompt_vendor: String::new(),
+            ..Default::default()
+        };
+        let (persisted_context, persisted_prompt) =
+            prompt_artifacts_for_persistence(&context, "You are Custom Codex.", false);
+
+        assert_eq!(persisted_context.system_prompt_label, "Custom Codex");
+        assert!(persisted_context.system_prompt_vendor.is_empty());
+        assert_eq!(persisted_prompt, "You are Custom Codex.");
+    }
+
+    #[test]
+    fn compatible_concise_switch_persists_conversation_prompt() {
+        let context = xai_grok_agent::PromptContext::default();
+        let (_, persisted_prompt) =
+            prompt_artifacts_for_persistence(&context, "rendered prompt", true);
+
+        assert_eq!(
+            persisted_prompt,
+            xai_grok_agent::prompt::template::COMPACT_SYSTEM_PROMPT
+        );
     }
 }

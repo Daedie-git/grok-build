@@ -496,9 +496,7 @@ pub async fn run_cli_login_codex() -> anyhow::Result<()> {
             if let Some(exp) = creds.expires_at {
                 println!("Access token expires at: {}", exp.to_rfc3339());
             }
-            println!(
-                "Use models: codex-gpt-5.6-sol, codex-gpt-5.6-luna, codex-gpt-5.3-codex-spark"
-            );
+            println!("Use models: codex-gpt-5.6-sol, codex-gpt-5.6-luna");
             Ok(())
         }
         Err(CodexAuthError::MissingFile(p)) => {
@@ -707,7 +705,6 @@ mod tests {
         let expected = [
             ("codex-gpt-5.6-sol", 272_000u64, "high"),
             ("codex-gpt-5.6-luna", 272_000, "high"),
-            ("codex-gpt-5.3-codex-spark", 128_000, "high"),
         ];
         for (id, ctx, default_effort) in expected {
             let entry = find_model_by_id(&models, id).unwrap_or_else(|| panic!("missing {id}"));
@@ -733,11 +730,7 @@ mod tests {
                 Some(90),
                 "{id} Codex soft threshold"
             );
-            let expected_limit = match id {
-                "codex-gpt-5.6-sol" | "codex-gpt-5.6-luna" => 244_800,
-                "codex-gpt-5.3-codex-spark" => 115_200,
-                _ => unreachable!(),
-            };
+            let expected_limit = 244_800;
             assert_eq!(
                 entry
                     .info()

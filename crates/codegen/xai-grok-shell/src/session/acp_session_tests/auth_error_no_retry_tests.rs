@@ -1174,7 +1174,16 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
             )
             .unwrap();
             let _ = actor
-                .handle_set_session_model(cfg, identity, None, false, false, true, 85)
+                .handle_set_session_model(
+                    cfg,
+                    identity,
+                    None,
+                    false,
+                    false,
+                    true,
+                    85,
+                    xai_grok_agent::SystemPromptIdentity::default(),
+                )
                 .await;
 
             assert!(
@@ -1269,6 +1278,7 @@ async fn full_switch_and_override_share_authoritative_rejection() {
                     false,
                     true,
                     85,
+                    xai_grok_agent::SystemPromptIdentity::default(),
                 )
                 .await
                 .expect_err("full switch must propagate native identity rejection");
@@ -1392,7 +1402,16 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
             )
             .unwrap();
             let _ = actor
-                .handle_set_session_model(cfg, identity, None, false, false, true, 85)
+                .handle_set_session_model(
+                    cfg,
+                    identity,
+                    None,
+                    false,
+                    false,
+                    true,
+                    85,
+                    xai_grok_agent::SystemPromptIdentity::default(),
+                )
                 .await;
 
             let creds = actor.chat_state_handle.get_credentials().await;

@@ -283,8 +283,9 @@ pub fn conversation_request_to_codex_compact_request_for_origin(
 
 /// Provider fields corresponding one-for-one with user/assistant message
 /// records emitted by Responses conversion. System messages are instructions
-/// on Codex and assistant items without text emit only tool calls, so neither
-/// consumes a slot here.
+/// on Codex and tool-only assistants (no text and no item id) emit only
+/// function calls, so neither consumes a slot here. Identified empty
+/// assistant messages do occupy a slot so they can be replayed exactly.
 pub fn response_message_metadata(
     req: &ConversationRequest,
 ) -> std::result::Result<Vec<CodexResponseMessageMetadata>, String> {
@@ -308,7 +309,7 @@ pub fn response_message_metadata(
                     phase,
                 })
             }
-            ConversationItem::Assistant(assistant) if !assistant.content.is_empty() => {
+            ConversationItem::Assistant(assistant) if assistant.projects_message() => {
                 Some(CodexResponseMessageMetadata {
                     item_id: assistant.response_item_id.clone(),
                     status: ProviderReplayField::Missing,
@@ -395,7 +396,7 @@ pub fn response_item_metadata_passthrough_for_origin(
                 owners.push((Kind::Reasoning, Some(reasoning.id.as_str()), None));
             }
             ConversationItem::Assistant(assistant) => {
-                if !assistant.content.is_empty() {
+                if assistant.projects_message() {
                     owners.push((Kind::Message, assistant.response_item_id.as_deref(), None));
                 }
                 owners.extend(
@@ -930,11 +931,6 @@ fn compact_message_content_to_parts(
         .collect()
 }
 
-/// Model slug that rejects `reasoning.summary` (research preview spark).
-pub fn model_rejects_reasoning_summary(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("spark")
-}
-
 /// One ordinary Responses output item decoded from raw JSON before the
 /// pinned async-openai model can discard provider metadata.
 ///
@@ -1459,11 +1455,6 @@ pub fn captured_response_to_conversation_items(
                 }
 
                 if require_exact {
-                    if message_content.is_empty() {
-                        return Err(
-                            "empty Codex Responses message cannot be replayed exactly".into()
-                        );
-                    }
                     if message.id.is_empty() {
                         return Err("Codex Responses message id is empty".into());
                     }
@@ -1660,41 +1651,24 @@ pub fn conversation_request_to_codex_create_response(
     req: &ConversationRequest,
 ) -> rs::CreateResponse {
     let mut created: rs::CreateResponse = req.into();
-    let model = req.model.clone().unwrap_or_default();
-    normalize_create_response_for_codex(&mut created, &model);
+    created.input = crate::conversation::build_codex_responses_input(req);
+    normalize_create_response_for_codex(&mut created);
     // Re-apply effort after normalize (normalize may drop empty reasoning).
     if let Some(effort) = req.reasoning_effort {
-        apply_reasoning_effort(&mut created, &model, Some(effort));
+        apply_reasoning_effort(&mut created, effort);
     }
     created
 }
 
-fn apply_reasoning_effort(
-    req: &mut rs::CreateResponse,
-    model: &str,
-    effort: Option<ReasoningEffort>,
-) {
-    match effort {
-        Some(e) => {
-            let mut r = rs::Reasoning {
-                effort: Some(e.to_responses_api()),
-                summary: None,
-            };
-            if !model_rejects_reasoning_summary(model) {
-                r.summary = Some(rs::ReasoningSummary::Concise);
-            }
-            req.reasoning = Some(r);
-        }
-        None => {
-            if model_rejects_reasoning_summary(model) {
-                req.reasoning = None;
-            }
-        }
-    }
+fn apply_reasoning_effort(req: &mut rs::CreateResponse, effort: ReasoningEffort) {
+    req.reasoning = Some(rs::Reasoning {
+        effort: Some(effort.to_responses_api()),
+        summary: Some(rs::ReasoningSummary::Concise),
+    });
 }
 
 /// Post-process a CreateResponse for Codex wire rules.
-pub fn normalize_create_response_for_codex(req: &mut rs::CreateResponse, model: &str) {
+pub fn normalize_create_response_for_codex(req: &mut rs::CreateResponse) {
     // Codex requires streaming; non-stream requests 400. It rejects these
     // optional sampling/output-limit controls, including values inherited
     // from client defaults, so they must be removed at the wire boundary.
@@ -1732,15 +1706,9 @@ pub fn normalize_create_response_for_codex(req: &mut rs::CreateResponse, model: 
     }
 
     if let Some(ref mut reasoning) = req.reasoning {
-        if model_rejects_reasoning_summary(model) {
-            reasoning.summary = None;
-        }
         if reasoning.effort.is_none() && reasoning.summary.is_none() {
             req.reasoning = None;
         }
-    } else if model_rejects_reasoning_summary(model) {
-        // Default converter always sets summary=concise; ensure spark is clean
-        // if reasoning was somehow absent.
     }
 
     // Drop include entries Codex may not care about beyond encrypted content.
@@ -1781,12 +1749,6 @@ mod tests {
     }
 
     #[test]
-    fn spark_rejects_summary() {
-        assert!(model_rejects_reasoning_summary("gpt-5.3-codex-spark"));
-        assert!(!model_rejects_reasoning_summary("gpt-5.6-sol"));
-    }
-
-    #[test]
     fn system_becomes_instructions_not_input() {
         let req = ConversationRequest {
             items: vec![
@@ -1812,22 +1774,6 @@ mod tests {
         let reasoning = created.reasoning.expect("reasoning");
         assert!(reasoning.summary.is_some());
         assert!(reasoning.effort.is_some());
-    }
-
-    #[test]
-    fn spark_omits_reasoning_summary() {
-        let req = ConversationRequest {
-            items: vec![ConversationItem::user("hi")],
-            model: Some("gpt-5.3-codex-spark".into()),
-            reasoning_effort: Some(ReasoningEffort::High),
-            ..Default::default()
-        };
-        let created = conversation_request_to_codex_create_response(&req);
-        let reasoning = created.reasoning.expect("reasoning");
-        assert!(reasoning.summary.is_none());
-        assert!(reasoning.effort.is_some());
-        assert_eq!(created.store, Some(false));
-        assert_eq!(created.stream, Some(true));
     }
 
     #[test]
@@ -1902,7 +1848,7 @@ mod tests {
         assert!(reasoning.effort.is_some());
         assert!(
             reasoning.summary.is_some(),
-            "sol may keep summary; spark is tested separately"
+            "Codex wire requests keep reasoning.summary=concise"
         );
     }
 
@@ -3657,6 +3603,219 @@ mod tests {
         let error = captured_response_to_conversation_items(completed_response(), output)
             .expect_err("empty provider message ids cannot bind uniquely");
         assert!(error.contains("id is empty"), "{error}");
+    }
+
+    #[test]
+    fn empty_identified_message_round_trips_on_ordinary_and_compact_wire() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![captured_item(
+            0,
+            serde_json::json!({
+                "type": "message", "id": "msg_empty", "role": "assistant",
+                "status": "completed",
+                "content": []
+            }),
+            &origin,
+        )];
+        let durable = captured_response_to_conversation_items(completed_response(), output)
+            .expect("identified empty Codex messages are replayable");
+        let ConversationItem::Assistant(assistant) = durable
+            .iter()
+            .find(|item| matches!(item, ConversationItem::Assistant(_)))
+            .expect("empty message becomes an assistant")
+        else {
+            unreachable!();
+        };
+        assert!(assistant.content.is_empty());
+        assert_eq!(assistant.response_item_id.as_deref(), Some("msg_empty"));
+        assert!(assistant.tool_calls.is_empty());
+
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        let compact = serde_json::to_value(
+            conversation_request_to_codex_compact_request_for_origin(&request, Some(&origin))
+                .unwrap(),
+        )
+        .unwrap();
+        for wire in [&ordinary, &compact] {
+            assert_eq!(
+                wire["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(input_identity)
+                    .collect::<Vec<_>>(),
+                [("message", Some("msg_empty"), None)]
+            );
+        }
+        assert_eq!(ordinary["input"][0]["content"], "");
+        assert_eq!(compact["input"][0]["content"][0]["type"], "output_text");
+        assert_eq!(compact["input"][0]["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn empty_identified_message_can_own_function_calls() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "message", "id": "msg_empty_owner", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "", "annotations": []}]
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc_empty_owner",
+                    "call_id": "call_empty_owner", "name": "todo_write",
+                    "arguments": "{}"
+                }),
+                &origin,
+            ),
+        ];
+        let durable = captured_response_to_conversation_items(completed_response(), output)
+            .expect("empty message plus function call is replayable");
+        let assistant = durable
+            .iter()
+            .find_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .expect("function call attaches to the empty message");
+        assert!(assistant.content.is_empty());
+        assert_eq!(
+            assistant.response_item_id.as_deref(),
+            Some("msg_empty_owner")
+        );
+        assert_eq!(assistant.tool_calls.len(), 1);
+        assert_eq!(assistant.tool_calls[0].id.as_ref(), "call_empty_owner");
+
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        assert_eq!(
+            ordinary["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(input_identity)
+                .collect::<Vec<_>>(),
+            [
+                ("message", Some("msg_empty_owner"), None),
+                (
+                    "function_call",
+                    Some("fc_empty_owner"),
+                    Some("call_empty_owner")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn standard_responses_input_omits_identified_empty_assistant() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![
+            captured_item(
+                0,
+                serde_json::json!({
+                    "type": "message", "id": "msg_empty_std", "role": "assistant",
+                    "status": "completed",
+                    "content": []
+                }),
+                &origin,
+            ),
+            captured_item(
+                1,
+                serde_json::json!({
+                    "type": "function_call", "id": "fc_empty_std",
+                    "call_id": "call_empty_std", "name": "read_file",
+                    "arguments": "{}"
+                }),
+                &origin,
+            ),
+        ];
+        let durable = captured_response_to_conversation_items(completed_response(), output)
+            .expect("empty identified message is durable");
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let standard = serde_json::to_value(rs::CreateResponse::from(&request)).unwrap();
+        assert_eq!(
+            standard["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(input_identity)
+                .collect::<Vec<_>>(),
+            [("function_call", None, Some("call_empty_std"))],
+            "standard Responses must not emit an anonymous empty assistant message"
+        );
+    }
+
+    #[test]
+    fn tool_only_exact_response_does_not_emit_a_message() {
+        let origin =
+            crate::ResponseMetadataOrigin::codex(CODEX_BACKEND_BASE_URL, "gpt-codex", None)
+                .unwrap();
+        let output = vec![captured_item(
+            0,
+            serde_json::json!({
+                "type": "function_call", "id": "fc_tool_only",
+                "call_id": "call_tool_only", "name": "read_file",
+                "arguments": "{}"
+            }),
+            &origin,
+        )];
+        let durable = captured_response_to_conversation_items(completed_response(), output)
+            .expect("function-call-only output remains legal");
+        let assistant = durable
+            .iter()
+            .find_map(|item| match item {
+                ConversationItem::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .expect("tool-only turns still synthesize an assistant");
+        assert!(assistant.content.is_empty());
+        assert!(assistant.response_item_id.is_none());
+        assert!(!assistant.projects_message());
+
+        let request = ConversationRequest {
+            items: durable,
+            model: Some("gpt-codex".into()),
+            ..Default::default()
+        };
+        let ordinary = ordinary_wire(&request, &origin);
+        assert_eq!(
+            ordinary["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(input_identity)
+                .collect::<Vec<_>>(),
+            [(
+                "function_call",
+                Some("fc_tool_only"),
+                Some("call_tool_only")
+            )]
+        );
     }
 
     #[test]

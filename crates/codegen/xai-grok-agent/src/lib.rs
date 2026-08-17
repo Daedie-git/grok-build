@@ -25,5 +25,8 @@ pub use config::preset_names;
 pub use config::toolset_for_preset;
 pub use config::workspace_grok_build_toolset;
 pub use error::AgentBuildError;
-pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
+pub use prompt::context::{
+    CODEX_SYSTEM_PROMPT_LABEL, DEFAULT_SYSTEM_PROMPT_LABEL, DEFAULT_SYSTEM_PROMPT_VENDOR,
+    PromptContext, SystemPromptIdentity,
+};
 pub use system_reminder::ReminderPolicy;

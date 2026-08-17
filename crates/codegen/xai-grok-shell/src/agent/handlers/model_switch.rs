@@ -167,6 +167,14 @@ pub(crate) async fn apply(
             model.map(|e| &e.info),
         )
     };
+    let system_prompt_identity = {
+        let cfg = agent.cfg.borrow();
+        crate::util::config::resolve_system_prompt_identity(
+            &cfg,
+            model_id.0.as_ref(),
+            Some(model.info()),
+        )
+    };
     let (tx, rx) = oneshot::channel();
     let _ = handle.cmd_tx.send(SessionCommand::SetSessionModel {
         sampling_config: model_sampling,
@@ -176,6 +184,7 @@ pub(crate) async fn apply(
         apply_prompt_override,
         skip_prompt_rewrite: did_rebuild || model_unchanged,
         auto_compact_threshold_percent: new_threshold,
+        system_prompt_identity,
         responds_to: tx,
     });
     let updated_model = rx

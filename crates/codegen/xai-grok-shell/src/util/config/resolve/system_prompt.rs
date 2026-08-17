@@ -1,19 +1,21 @@
 pub const ENV_SYSTEM_PROMPT_LABEL: &str = "GROK_SYSTEM_PROMPT_LABEL";
 
 pub const DEFAULT_SYSTEM_PROMPT_LABEL: &str = xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL;
+pub const CODEX_SYSTEM_PROMPT_LABEL: &str = xai_grok_agent::CODEX_SYSTEM_PROMPT_LABEL;
 
-/// Resolve system-prompt identity label.
-/// Precedence: env → config per-model → `[agent]` → GB per-model → GB global →
-/// `"Grok"`. Empty/whitespace falls through.
+/// Resolve the system-prompt identity for a model.
+/// Label precedence: env → config per-model → `[agent]` → GB per-model (or
+/// Codex provider default) → GB global → `"Grok"`. Empty values fall through.
+/// Vendor attribution follows the provider independently of the chosen label.
 ///
 /// Per-model TOML is looked up by session catalog id, then routing slug
 /// (`ModelInfo.model`). Do not use CLI `-m` alone — it may outlive a mid-session
 /// model switch.
-pub(crate) fn resolve_system_prompt_label(
+pub(crate) fn resolve_system_prompt_identity(
     cfg: &crate::agent::config::Config,
     model_id: &str,
     model: Option<&crate::agent::config::ModelInfo>,
-) -> String {
+) -> xai_grok_agent::SystemPromptIdentity {
     let label_for = |key: &str| {
         cfg.config_models
             .get(key)
@@ -22,14 +24,49 @@ pub(crate) fn resolve_system_prompt_label(
     let user_per_model =
         label_for(model_id).or_else(|| model.map(|m| m.model.as_str()).and_then(label_for));
 
-    resolve_system_prompt_label_from_tiers(
+    let label = resolve_system_prompt_label_from_tiers(
         user_per_model,
         cfg.agent.system_prompt_label.clone(),
-        model.and_then(|m| m.system_prompt_label.clone()),
+        catalog_system_prompt_label(model),
         cfg.remote_settings
             .as_ref()
             .and_then(|r| r.system_prompt_label.clone()),
-    )
+    );
+    system_prompt_identity(label, model)
+}
+
+fn system_prompt_identity(
+    label: String,
+    model: Option<&crate::agent::config::ModelInfo>,
+) -> xai_grok_agent::SystemPromptIdentity {
+    let vendor = if model.is_some_and(model_uses_codex_identity) {
+        String::new()
+    } else {
+        xai_grok_agent::DEFAULT_SYSTEM_PROMPT_VENDOR.to_string()
+    };
+    xai_grok_agent::SystemPromptIdentity { label, vendor }
+}
+
+/// GB per-model label, or the Codex provider default when the catalog left it
+/// unset. Empty/whitespace is treated as unset.
+pub(crate) fn catalog_system_prompt_label(
+    model: Option<&crate::agent::config::ModelInfo>,
+) -> Option<String> {
+    let model = model?;
+    if let Some(label) = model
+        .system_prompt_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(label.to_string());
+    }
+    model_uses_codex_identity(model).then(|| CODEX_SYSTEM_PROMPT_LABEL.to_string())
+}
+
+fn model_uses_codex_identity(model: &crate::agent::config::ModelInfo) -> bool {
+    model.provider_id == Some(xai_grok_sampling_types::ProviderId::Codex)
+        || xai_grok_sampling_types::is_codex_backend_url(&model.base_url)
 }
 
 pub(crate) fn resolve_system_prompt_label_from_tiers(
@@ -57,7 +94,7 @@ pub(crate) fn resolve_system_prompt_label_from_tiers(
 #[cfg(test)]
 mod system_prompt_label_tests {
     use super::{
-        DEFAULT_SYSTEM_PROMPT_LABEL, ENV_SYSTEM_PROMPT_LABEL,
+        CODEX_SYSTEM_PROMPT_LABEL, DEFAULT_SYSTEM_PROMPT_LABEL, ENV_SYSTEM_PROMPT_LABEL,
         resolve_system_prompt_label_from_tiers,
     };
 
@@ -160,6 +197,59 @@ mod system_prompt_label_tests {
         );
         unsafe { std::env::remove_var(ENV_SYSTEM_PROMPT_LABEL) };
         assert_eq!(got, "FromEnv");
+    }
+
+    #[test]
+    fn catalog_codex_provider_defaults_to_codex_not_global_grok() {
+        let mut model = crate::agent::config::ModelInfo::fallback("gpt-5.6-sol");
+        model.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+        assert_eq!(
+            super::catalog_system_prompt_label(Some(&model)).as_deref(),
+            Some(CODEX_SYSTEM_PROMPT_LABEL)
+        );
+        assert_eq!(
+            resolve_system_prompt_label_from_tiers(
+                None,
+                None,
+                super::catalog_system_prompt_label(Some(&model)),
+                Some("Grok 4.6".into()),
+            ),
+            CODEX_SYSTEM_PROMPT_LABEL
+        );
+    }
+
+    #[test]
+    fn catalog_codex_url_without_provider_id_defaults_to_codex() {
+        let mut model = crate::agent::config::ModelInfo::fallback("gpt-5.6-sol");
+        model.base_url = xai_grok_sampling_types::CODEX_BACKEND_BASE_URL.to_string();
+        assert_eq!(
+            super::catalog_system_prompt_label(Some(&model)).as_deref(),
+            Some(CODEX_SYSTEM_PROMPT_LABEL)
+        );
+    }
+
+    #[test]
+    fn catalog_explicit_label_wins_over_codex_provider_default() {
+        let mut model = crate::agent::config::ModelInfo::fallback("gpt-5.6-sol");
+        model.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+        model.system_prompt_label = Some("Custom Codex".into());
+        assert_eq!(
+            super::catalog_system_prompt_label(Some(&model)).as_deref(),
+            Some("Custom Codex")
+        );
+        assert_eq!(
+            super::system_prompt_identity("Custom Codex".into(), Some(&model)),
+            xai_grok_agent::SystemPromptIdentity {
+                label: "Custom Codex".into(),
+                vendor: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn catalog_non_codex_without_label_does_not_invent_identity() {
+        let model = crate::agent::config::ModelInfo::fallback("grok-4.6");
+        assert_eq!(super::catalog_system_prompt_label(Some(&model)), None);
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

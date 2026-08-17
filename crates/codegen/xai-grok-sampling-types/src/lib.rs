@@ -31,10 +31,9 @@ pub use self::codex::{
     conversation_request_to_codex_compact_request,
     conversation_request_to_codex_compact_request_for_origin,
     conversation_request_to_codex_create_response, is_codex_backend_url,
-    model_rejects_reasoning_summary, normalize_create_response_for_codex,
-    patch_response_item_metadata_passthrough, patch_response_message_metadata,
-    response_item_metadata_passthrough, response_item_metadata_passthrough_for_origin,
-    response_message_metadata,
+    normalize_create_response_for_codex, patch_response_item_metadata_passthrough,
+    patch_response_message_metadata, response_item_metadata_passthrough,
+    response_item_metadata_passthrough_for_origin, response_message_metadata,
 };
 pub use self::conversation::*;
 pub use self::doom_loop::{

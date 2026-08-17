@@ -4205,11 +4205,11 @@ impl MvpAgent {
                 model.map(|e| &e.info),
             )
         };
-        let system_prompt_label = {
+        let system_prompt_identity = {
             let cfg = self.cfg.borrow();
             let models = self.models_manager.models();
             let model = config::find_model_by_id(&models, &session_model_id.0);
-            crate::util::config::resolve_system_prompt_label(
+            crate::util::config::resolve_system_prompt_identity(
                 &cfg,
                 &session_model_id.0,
                 model.map(|e| &e.info),
@@ -4634,7 +4634,7 @@ impl MvpAgent {
                     startup_hints,
                     client_type,
                     auto_compact_threshold_percent,
-                    system_prompt_label,
+                    system_prompt_identity,
                     compaction_mode,
                     compaction_verbatim_input,
                     compaction_tool_choice,

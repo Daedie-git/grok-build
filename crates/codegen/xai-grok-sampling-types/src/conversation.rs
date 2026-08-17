@@ -10,7 +10,7 @@ mod responses;
 
 pub use chat_completions::{conversation_item_to_chat_message, conversation_to_chat_messages};
 pub use messages::build_messages_request;
-pub(crate) use responses::build_codex_responses_input;
+pub(crate) use responses::create_codex_create_response;
 pub use responses::{
     extra_tool_entries, patch_reasoning_text_types, response_to_conversation_items,
 };

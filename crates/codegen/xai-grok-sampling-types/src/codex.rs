@@ -1650,8 +1650,7 @@ impl DecodedResponse {
 pub fn conversation_request_to_codex_create_response(
     req: &ConversationRequest,
 ) -> rs::CreateResponse {
-    let mut created: rs::CreateResponse = req.into();
-    created.input = crate::conversation::build_codex_responses_input(req);
+    let mut created = crate::conversation::create_codex_create_response(req);
     normalize_create_response_for_codex(&mut created);
     // Re-apply effort after normalize (normalize may drop empty reasoning).
     if let Some(effort) = req.reasoning_effort {

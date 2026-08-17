@@ -99,70 +99,85 @@ pub fn response_to_conversation_items(response: rs::Response) -> Vec<Conversatio
 
 impl From<&ConversationRequest> for rs::CreateResponse {
     fn from(req: &ConversationRequest) -> Self {
-        let input = build_responses_input(req);
-        let tools = build_responses_tools(req);
+        create_response(req, false)
+    }
+}
 
-        let tool_choice = req.tool_choice.as_ref().map(|tc| match tc {
-            ConversationToolChoice::Auto => rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::Auto),
-            ConversationToolChoice::None => rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::None),
-            ConversationToolChoice::Required => {
-                rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::Required)
-            }
-            ConversationToolChoice::Function(name) => {
-                rs::ToolChoiceParam::Function(rs::ToolChoiceFunction { name: name.clone() })
-            }
+/// Codex CreateResponse before wire normalization. Builds the input once
+/// with identified-empty assistant messages projected.
+pub(crate) fn create_codex_create_response(req: &ConversationRequest) -> rs::CreateResponse {
+    create_response(req, true)
+}
+
+fn create_response(
+    req: &ConversationRequest,
+    project_identified_empty: bool,
+) -> rs::CreateResponse {
+    let input = if project_identified_empty {
+        build_codex_responses_input(req)
+    } else {
+        build_responses_input(req)
+    };
+    let tools = build_responses_tools(req);
+
+    let tool_choice = req.tool_choice.as_ref().map(|tc| match tc {
+        ConversationToolChoice::Auto => rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::Auto),
+        ConversationToolChoice::None => rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::None),
+        ConversationToolChoice::Required => {
+            rs::ToolChoiceParam::Mode(rs::ToolChoiceOptions::Required)
+        }
+        ConversationToolChoice::Function(name) => {
+            rs::ToolChoiceParam::Function(rs::ToolChoiceFunction { name: name.clone() })
+        }
+    });
+
+    let text = req
+        .json_schema
+        .as_ref()
+        .map(|schema| rs::ResponseTextParam {
+            format: rs::TextResponseFormatConfiguration::JsonSchema(rs::ResponseFormatJsonSchema {
+                description: None,
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME.to_string(),
+                schema: Some(schema.clone()),
+                strict: Some(true),
+            }),
+            verbosity: None,
         });
 
-        let text = req
-            .json_schema
-            .as_ref()
-            .map(|schema| rs::ResponseTextParam {
-                format: rs::TextResponseFormatConfiguration::JsonSchema(
-                    rs::ResponseFormatJsonSchema {
-                        description: None,
-                        name: STRUCTURED_OUTPUT_SCHEMA_NAME.to_string(),
-                        schema: Some(schema.clone()),
-                        strict: Some(true),
-                    },
-                ),
-                verbosity: None,
-            });
-
-        rs::CreateResponse {
-            background: None,
-            conversation: None,
-            include: None,
-            input,
-            instructions: None,
-            max_output_tokens: req.max_output_tokens,
-            max_tool_calls: None,
-            metadata: None,
-            model: req.model.clone(),
-            parallel_tool_calls: None,
-            previous_response_id: None,
-            prompt: None,
-            prompt_cache_key: req
-                .prompt_cache_key
-                .clone()
-                .or_else(|| req.x_grok_conv_id.clone()),
-            prompt_cache_retention: None,
-            reasoning: Some(rs::Reasoning {
-                effort: req.reasoning_effort.map(|e| e.to_responses_api()),
-                summary: Some(rs::ReasoningSummary::Concise),
-            }),
-            safety_identifier: None,
-            service_tier: None,
-            store: None,
-            stream: None,
-            stream_options: None,
-            temperature: req.temperature,
-            text,
-            tool_choice,
-            tools: if tools.is_empty() { None } else { Some(tools) },
-            top_logprobs: None,
-            top_p: req.top_p,
-            truncation: None,
-        }
+    rs::CreateResponse {
+        background: None,
+        conversation: None,
+        include: None,
+        input,
+        instructions: None,
+        max_output_tokens: req.max_output_tokens,
+        max_tool_calls: None,
+        metadata: None,
+        model: req.model.clone(),
+        parallel_tool_calls: None,
+        previous_response_id: None,
+        prompt: None,
+        prompt_cache_key: req
+            .prompt_cache_key
+            .clone()
+            .or_else(|| req.x_grok_conv_id.clone()),
+        prompt_cache_retention: None,
+        reasoning: Some(rs::Reasoning {
+            effort: req.reasoning_effort.map(|e| e.to_responses_api()),
+            summary: Some(rs::ReasoningSummary::Concise),
+        }),
+        safety_identifier: None,
+        service_tier: None,
+        store: None,
+        stream: None,
+        stream_options: None,
+        temperature: req.temperature,
+        text,
+        tool_choice,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        top_logprobs: None,
+        top_p: req.top_p,
+        truncation: None,
     }
 }
 
@@ -174,7 +189,7 @@ pub(super) fn build_responses_input(req: &ConversationRequest) -> rs::InputParam
 
 /// Codex exact-replay input: identified empty assistant messages occupy a
 /// `message` slot. Standard Responses keeps the content-only check.
-pub(crate) fn build_codex_responses_input(req: &ConversationRequest) -> rs::InputParam {
+fn build_codex_responses_input(req: &ConversationRequest) -> rs::InputParam {
     responses_input_from_conversation(req, true)
 }
 

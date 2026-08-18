@@ -572,7 +572,14 @@ impl SessionActor {
         }
 
         let total_tokens = self.chat_state_handle.get_total_tokens().await;
-        let (running_task, pending_inputs, rewound_input, had_queued_user_prompt, turn_epoch) = {
+        let (
+            running_task,
+            pending_inputs,
+            rewound_input,
+            had_queued_user_prompt,
+            turn_epoch,
+            parked_completion_ids,
+        ) = {
             let mut state = self.state.lock().await;
             debug_assert!(
                 pinned_prompt_id.is_none()
@@ -700,6 +707,7 @@ impl SessionActor {
             // ahead of `maybe_start_running_task`), gating on `running_task`
             // would drop the front's `respond_to`, hanging the client's
             // `session/prompt` forever (the TUI spinner never returns to idle).
+            let mut parked_completion_ids = Vec::new();
             let pending_inputs = if rewound_input.is_some() {
                 VecDeque::new()
             } else if kill_background_tasks {
@@ -719,6 +727,9 @@ impl SessionActor {
                         // across cancellation rather than losing the only
                         // model-visible copy of the completion.
                         if let Some(fallback) = item.task_wake_fallback.take() {
+                            if let Some(task_id) = item.input_origin.completion_id() {
+                                parked_completion_ids.push(task_id.to_owned());
+                            }
                             self.push_task_wake_fallback(&mut state, fallback);
                         }
                         cancelled.push_back(item);
@@ -730,8 +741,16 @@ impl SessionActor {
                                 | super::PromptOrigin::WorkflowCompleted { .. }
                         )
                     {
-                        if let Some(fallback) = item.task_wake_fallback {
+                        if let Some(fallback) = item.task_wake_fallback.take() {
+                            if let Some(task_id) = item.input_origin.completion_id() {
+                                parked_completion_ids.push(task_id.to_owned());
+                            }
                             self.push_task_wake_fallback(&mut state, fallback);
+                        } else if let Some(task_id) = item.input_origin.completion_id()
+                            && let Some(reservations) =
+                                &self.tool_context.task_completion_reservations
+                        {
+                            reservations.release(task_id);
                         }
                         Self::respond_removed_prompt(item.respond_to);
                     } else {
@@ -760,6 +779,7 @@ impl SessionActor {
                 rewound_input,
                 had_queued_user_prompt,
                 turn_epoch,
+                parked_completion_ids,
             )
         };
         // Abort before the first await after removing the running queue item.
@@ -923,9 +943,13 @@ impl SessionActor {
             let is_running_turn = idx == 0;
             if let Some(task_id) = input.input_origin.completion_id()
                 && input.task_wake_fallback.is_none()
+                && !parked_completion_ids.iter().any(|id| id == task_id)
                 && let Some(reservations) = &self.tool_context.task_completion_reservations
             {
-                // An owned fallback releases itself when `input` is dropped.
+                // Legacy/non-owning entries have no Drop owner. Parked
+                // fallbacks already transferred theirs onto
+                // `pending_notifications`; releasing here would drop the
+                // only remaining count.
                 reservations.release(task_id);
             }
             let _ = input

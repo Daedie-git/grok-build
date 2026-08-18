@@ -236,8 +236,11 @@ async fn run_prompt(
 /// The wake sequence: the resolver has nothing wire-valid, the send goes
 /// out with no `Authorization` header, the server 401s it, recovery lands a
 /// fresh token. The turn must survive and resubmit with the fresh bearer.
-#[tokio::test(flavor = "current_thread")]
-async fn fail_closed_401_is_uncharged_and_turn_survives() {
+#[test]
+fn fail_closed_401_is_uncharged_and_turn_survives() {
+    run_large_stack_session_test(fail_closed_401_is_uncharged_and_turn_survives_inner);
+}
+async fn fail_closed_401_is_uncharged_and_turn_survives_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -296,8 +299,11 @@ async fn fail_closed_401_is_uncharged_and_turn_survives() {
 /// carries a bearer the server rejects, the escalating budget exhausts after
 /// `MAX_RETRIES` and the failure names authenticated rejections — not a
 /// generic budget message. `start_paused` auto-advances the backoff ladder.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn authenticated_401s_still_exhaust_after_three_retries() {
+#[test]
+fn authenticated_401s_still_exhaust_after_three_retries() {
+    run_large_stack_session_test_paused(authenticated_401s_still_exhaust_after_three_retries_inner);
+}
+async fn authenticated_401s_still_exhaust_after_three_retries_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {

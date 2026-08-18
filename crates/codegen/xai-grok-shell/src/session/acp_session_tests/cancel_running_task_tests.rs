@@ -13,27 +13,6 @@ impl AsyncTerminalRunner for DummyTerminal {
     }
 }
 
-/// Run full session-turn futures with the same stack budget as the dedicated
-/// production session thread.
-fn run_large_stack_session_test<F, Fut>(test: F)
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + 'static,
-{
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test runtime")
-                .block_on(test());
-        })
-        .expect("spawn session-stack test thread")
-        .join()
-        .expect("session-stack test thread");
-}
-
 #[test]
 fn persist_ack_waits_for_disk_flush_before_success() {
     run_large_stack_session_test(persist_ack_waits_for_disk_flush_before_success_inner);
@@ -389,8 +368,11 @@ async fn persist_ack_waits_for_disk_flush_before_success_inner() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn first_turn_memory_injection_persists_to_chat_history() {
+#[test]
+fn first_turn_memory_injection_persists_to_chat_history() {
+    run_large_stack_session_test(first_turn_memory_injection_persists_to_chat_history_inner);
+}
+async fn first_turn_memory_injection_persists_to_chat_history_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -886,8 +868,13 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history_i
 /// aborts the running turn AND drains every queued prompt, responding
 /// `Cancelled` to each. Interactive cancel preserves the queue instead — see
 /// `cancel_running_task_interactive_preserves_queued_work`.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_running_task_teardown_clears_running_and_pending_work() {
+#[test]
+fn cancel_running_task_teardown_clears_running_and_pending_work() {
+    run_large_stack_session_test(
+        cancel_running_task_teardown_clears_running_and_pending_work_inner,
+    );
+}
+async fn cancel_running_task_teardown_clears_running_and_pending_work_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1258,8 +1245,11 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
 /// `MidTurnAbort` interrupt cause on the EventTracker so the *next* real user
 /// prompt gets tagged `PriorTurnInterrupt::MidTurnAbort`. Guards the cancel →
 /// next-message marking contract and the one-shot (consumed-once) semantics.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_records_mid_turn_abort_interrupt_marker() {
+#[test]
+fn cancel_records_mid_turn_abort_interrupt_marker() {
+    run_large_stack_session_test(cancel_records_mid_turn_abort_interrupt_marker_inner);
+}
+async fn cancel_records_mid_turn_abort_interrupt_marker_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1301,8 +1291,11 @@ async fn cancel_records_mid_turn_abort_interrupt_marker() {
         .await;
 }
 /// No assistant text → do not arm the interrupt reminder.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_without_assistant_text_skips_interrupt_reminder() {
+#[test]
+fn cancel_without_assistant_text_skips_interrupt_reminder() {
+    run_large_stack_session_test(cancel_without_assistant_text_skips_interrupt_reminder_inner);
+}
+async fn cancel_without_assistant_text_skips_interrupt_reminder_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1347,8 +1340,13 @@ async fn cancel_without_assistant_text_skips_interrupt_reminder() {
 /// interrupt lead-in on the continuation turn) NOR the
 /// zombie wait guard from the aborted turn can't auto-send-now-cancel (and
 /// drop) the next user prompt.
-#[tokio::test(flavor = "current_thread")]
-async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
+#[test]
+fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
+    run_large_stack_session_test(
+        send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth_inner,
+    );
+}
+async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1404,8 +1402,11 @@ async fn send_now_cancel_arms_no_interrupt_signals_and_resets_wait_depth() {
 /// committed but NO tool is marked active yet (`has_active_tool()` is false).
 /// Gating on the dangling state rather than `had_active_tool` keeps both cases
 /// covered.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
+#[test]
+fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
+    run_large_stack_session_test(cancel_with_dangling_tool_call_skips_interrupt_reminder_inner);
+}
+async fn cancel_with_dangling_tool_call_skips_interrupt_reminder_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1454,8 +1455,11 @@ async fn cancel_with_dangling_tool_call_skips_interrupt_reminder() {
 }
 /// Once armed, `maybe_apply_interrupt_envelope` frames the next user query
 /// with the interjection envelope exactly once (one-shot).
-#[tokio::test(flavor = "current_thread")]
-async fn maybe_apply_interrupt_envelope_is_one_shot() {
+#[test]
+fn maybe_apply_interrupt_envelope_is_one_shot() {
+    run_large_stack_session_test(maybe_apply_interrupt_envelope_is_one_shot_inner);
+}
+async fn maybe_apply_interrupt_envelope_is_one_shot_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1473,8 +1477,11 @@ async fn maybe_apply_interrupt_envelope_is_one_shot() {
 /// Headless `--verbatim` / ACP `_meta.verbatim` owns the exact prompt. Framing
 /// would break that contract; the one-shot still fires so it cannot leak onto
 /// a later non-verbatim user turn.
-#[tokio::test(flavor = "current_thread")]
-async fn maybe_apply_interrupt_envelope_skips_verbatim() {
+#[test]
+fn maybe_apply_interrupt_envelope_skips_verbatim() {
+    run_large_stack_session_test(maybe_apply_interrupt_envelope_skips_verbatim_inner);
+}
+async fn maybe_apply_interrupt_envelope_skips_verbatim_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1496,8 +1503,11 @@ async fn maybe_apply_interrupt_envelope_skips_verbatim() {
 /// preceding `<system-reminder>`. Synchronizes on the persist-ack (fires
 /// after the user item is pushed, before the model call), then aborts the
 /// turn so the dead-URL model call can't hang.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_frames_interrupt_on_user_message() {
+#[test]
+fn handle_prompt_frames_interrupt_on_user_message() {
+    run_large_stack_session_test(handle_prompt_frames_interrupt_on_user_message_inner);
+}
+async fn handle_prompt_frames_interrupt_on_user_message_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1546,8 +1556,11 @@ async fn handle_prompt_frames_interrupt_on_user_message() {
 }
 /// Integration: a verbatim user turn must stay byte-identical to the caller
 /// text even when the interrupt one-shot is armed.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_verbatim_skips_interrupt_envelope() {
+#[test]
+fn handle_prompt_verbatim_skips_interrupt_envelope() {
+    run_large_stack_session_test(handle_prompt_verbatim_skips_interrupt_envelope_inner);
+}
+async fn handle_prompt_verbatim_skips_interrupt_envelope_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1595,8 +1608,11 @@ async fn handle_prompt_verbatim_skips_interrupt_envelope() {
 }
 /// Send-now must use the full interjection envelope (prefix + already-wrapped
 /// `<user_query>` + unfinished-task trailer), not the note prefix alone.
-#[tokio::test(flavor = "current_thread")]
-async fn handle_prompt_send_now_frames_interjection_envelope() {
+#[test]
+fn handle_prompt_send_now_frames_interjection_envelope() {
+    run_large_stack_session_test(handle_prompt_send_now_frames_interjection_envelope_inner);
+}
+async fn handle_prompt_send_now_frames_interjection_envelope_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1700,8 +1716,11 @@ async fn handle_prompt_synthetic_origin_preserves_interrupt_reminder_inner() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_running_task_interactive_preserves_queued_work() {
+#[test]
+fn cancel_running_task_interactive_preserves_queued_work() {
+    run_large_stack_session_test(cancel_running_task_interactive_preserves_queued_work_inner);
+}
+async fn cancel_running_task_interactive_preserves_queued_work_inner() {
     use tokio::sync::oneshot::error::TryRecvError;
     fn make_item(
         prompt_id: &str,
@@ -1825,8 +1844,13 @@ async fn cancel_running_task_interactive_preserves_queued_work() {
 /// and the cancel destroys it instead — the message never runs and, since
 /// user messages are only persisted when their turn starts, it is silently
 /// lost from history.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
+#[test]
+fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
+    run_large_stack_session_test(
+        cancel_after_own_completion_sweep_preserves_queued_user_prompt_inner,
+    );
+}
+async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt_inner() {
     use tokio::sync::oneshot::error::TryRecvError;
     let local = tokio::task::LocalSet::new();
     local
@@ -1934,8 +1958,13 @@ async fn cancel_after_own_completion_sweep_preserves_queued_user_prompt() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
+#[test]
+fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
+    run_large_stack_session_test(
+        interactive_cancel_drops_queued_task_wakes_and_promotes_user_inner,
+    );
+}
+async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user_inner() {
     use tokio::sync::oneshot::error::TryRecvError;
     let local = tokio::task::LocalSet::new();
     local
@@ -2064,8 +2093,13 @@ async fn interactive_cancel_drops_queued_task_wakes_and_promotes_user() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn ctrl_c_clears_turn_active_before_background_completion_routes() {
+#[test]
+fn ctrl_c_clears_turn_active_before_background_completion_routes() {
+    run_large_stack_session_test(
+        ctrl_c_clears_turn_active_before_background_completion_routes_inner,
+    );
+}
+async fn ctrl_c_clears_turn_active_before_background_completion_routes_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -2225,14 +2259,22 @@ async fn assert_stop_trigger_arms_wake_barrier(trigger: &str) {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn stop_gestures_arm_wake_barrier() {
+#[test]
+fn stop_gestures_arm_wake_barrier() {
+    run_large_stack_session_test(stop_gestures_arm_wake_barrier_inner);
+}
+async fn stop_gestures_arm_wake_barrier_inner() {
     for trigger in ["esc", "mouse", "dashboard_stop", "some_future_gesture"] {
         assert_stop_trigger_arms_wake_barrier(trigger).await;
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
+#[test]
+fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
+    run_large_stack_session_test(
+        non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier_inner,
+    );
+}
+async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier_inner() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -2309,8 +2351,11 @@ async fn non_stop_cancels_preserve_queued_task_wakes_and_do_not_arm_barrier() {
 /// `maybe_start_running_task`), the front's `respond_to` was dropped, hanging
 /// the client's `session/prompt` and spinning the spinner forever. The front
 /// (index 0) must now always be resolved; deeper queued prompts are preserved.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_resolves_front_when_running_task_is_none() {
+#[test]
+fn cancel_resolves_front_when_running_task_is_none() {
+    run_large_stack_session_test(cancel_resolves_front_when_running_task_is_none_inner);
+}
+async fn cancel_resolves_front_when_running_task_is_none_inner() {
     use tokio::sync::oneshot::error::TryRecvError;
     fn make_item(
         prompt_id: &str,
@@ -2413,8 +2458,11 @@ async fn cancel_resolves_front_when_running_task_is_none() {
 }
 /// Regression: aborting `running_task` must propagate
 /// cancellation to the `SamplerHandle` so the sampler stops emitting.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
+#[test]
+fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
+    run_large_stack_session_test(cancel_propagates_to_sampler_handle_so_no_further_emission_inner);
+}
+async fn cancel_propagates_to_sampler_handle_so_no_further_emission_inner() {
     use axum::Router;
     use axum::response::sse::{Event, Sse};
     use axum::routing::post;
@@ -2826,8 +2874,13 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
         })
         .await;
 }
-#[tokio::test(flavor = "current_thread")]
-async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
+#[test]
+fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
+    run_large_stack_session_test(
+        skill_reminder_deferred_while_turn_running_flushed_when_idle_inner,
+    );
+}
+async fn skill_reminder_deferred_while_turn_running_flushed_when_idle_inner() {
     use xai_grok_tools::types::skill_discovery_tracker::{SkillUpdateEffects, SkillUpdateKind};
     fn effects() -> SkillUpdateEffects {
         SkillUpdateEffects {
@@ -2900,8 +2953,11 @@ async fn skill_reminder_deferred_while_turn_running_flushed_when_idle() {
 }
 /// Cancel (Esc/Ctrl+C) with prompts waiting behind the running one: the queue broadcast to clients
 /// keeps waiting prompts in order, drops only the cancelled one, leaves the next free to start.
-#[tokio::test(flavor = "current_thread")]
-async fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
+#[test]
+fn cancel_keeps_remaining_queued_prompts_visible_to_clients() {
+    run_large_stack_session_test(cancel_keeps_remaining_queued_prompts_visible_to_clients_inner);
+}
+async fn cancel_keeps_remaining_queued_prompts_visible_to_clients_inner() {
     fn make_item(prompt_id: &str, queue_id: &str) -> InputItem {
         let (respond_to, _rx) = tokio::sync::oneshot::channel();
         InputItem {

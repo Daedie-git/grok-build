@@ -1,5 +1,49 @@
 #![allow(dead_code)]
 use super::*;
+use std::future::Future;
+
+/// Session-actor + mock-server turn futures overflow the default 2 MiB
+/// libtest stack (`current_thread` polls them on that thread). Run the
+/// fixture on a 16 MiB stack instead — same order as the production
+/// session thread, without a process-wide `RUST_MIN_STACK`.
+pub(crate) fn run_large_stack_session_test<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_large_stack_session_test_inner(false, test);
+}
+
+/// Same as [`run_large_stack_session_test`] with a paused clock so
+/// `start_paused` backoff tests still auto-advance.
+pub(crate) fn run_large_stack_session_test_paused<F, Fut>(test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_large_stack_session_test_inner(true, test);
+}
+
+fn run_large_stack_session_test_inner<F, Fut>(start_paused: bool, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name("session-stack-test".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let mut builder = tokio::runtime::Builder::new_current_thread();
+            builder.enable_all();
+            if start_paused {
+                builder.start_paused(true);
+            }
+            builder.build().expect("test runtime").block_on(test());
+        })
+        .expect("spawn session-stack test thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+}
 /// Wrap `id` in a shared auth-method handle for `SessionActor` test literals
 /// (the field is now a shared live handle, not an owned id).
 pub(crate) fn test_auth_method_id(id: &str) -> crate::agent::auth_method::SharedAuthMethodId {

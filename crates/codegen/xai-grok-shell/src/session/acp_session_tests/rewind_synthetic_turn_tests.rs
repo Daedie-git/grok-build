@@ -51,9 +51,11 @@ async fn rewind_not_committed_keeps_prepared_snapshot_out_of_live_state() {
                 panic!("expected rewind transaction")
             };
             assert_eq!(replacement.len(), 4);
-            let still_live = actor.chat_state_handle.snapshot().await.unwrap();
-            assert_eq!(still_live.prompt_index, 2);
-            assert_eq!(still_live.conversation.len(), 6);
+            // `snapshot()` queues behind the rewind gate. Use the live
+            // queries that stay allowed so this check cannot deadlock the
+            // pending NotCommitted ack.
+            assert_eq!(actor.chat_state_handle.get_prompt_index().await, 2);
+            assert_eq!(actor.chat_state_handle.get_conversation_len().await, 6);
             respond_to
                 .send(crate::session::persistence::TimelineTransactionOutcome::NotCommitted(
                     std::io::Error::other("injected marker failure"),
@@ -131,9 +133,9 @@ async fn rewind_all_not_committed_leaves_chat_and_files_untouched() {
             };
 
             // Marker not yet acked: live chat and disk must still be the pre-rewind world.
-            let mid = actor.chat_state_handle.snapshot().await.unwrap();
-            assert_eq!(mid.prompt_index, 2);
-            assert_eq!(mid.conversation.len(), 6);
+            // `snapshot()` queues behind the rewind gate; these queries do not.
+            assert_eq!(actor.chat_state_handle.get_prompt_index().await, 2);
+            assert_eq!(actor.chat_state_handle.get_conversation_len().await, 6);
             let mid_file = actor
                 .tool_context
                 .fs

@@ -1412,6 +1412,18 @@ async fn ensure_binding_forks_conv_branch_off_base_and_is_idempotent() {
     }
     let (_tmp, work) = conv_repo_with_origin().await;
     git_cli(&work, &["checkout", "main"]).await.unwrap();
+    // `ensure_binding` commits a default `.gitignore` on a genuine fresh
+    // fork. Seed it on `main` so `head_sha` is the fork point, not the
+    // seed commit.
+    std::fs::write(
+        work.join(".gitignore"),
+        xai_grok_workspace_types::binding::DEFAULT_GITIGNORE,
+    )
+    .unwrap();
+    git_cli(&work, &["add", "--end-of-options", ".gitignore"])
+        .await
+        .unwrap();
+    git_cli(&work, &["commit", "-m", "gitignore"]).await.unwrap();
     let main_sha = git_cli(&work, &["rev-parse", "main"]).await.unwrap();
     let res = ensure_binding(&work, "conv/new", "main").await.unwrap();
     assert!(res.created);

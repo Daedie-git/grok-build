@@ -100,15 +100,16 @@ dump_bash_state() {
 
   _emit "$PWD"
 
+  # Capture option state (including allexport) before turning it off.
+  # `set -a` would otherwise export this function's locals (`all_functions`
+  # especially) and `exec` of base64/tr then fails with E2BIG / 126.
+  local posix_opts
+  posix_opts=$(builtin shopt -po 2>/dev/null | command grep -vE '^set [-+]o (nounset|errexit|pipefail)$' || true)
+  set +a
+
   local env_vars
   env_vars=$(builtin export -p 2>/dev/null | command grep -viE '_proxy=|GROK_SANDBOX|GROK_AGENT=|SUDO_ASKPASS|GROK_ASKPASS|ELECTRON_RUN_AS_NODE|SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR|WAYLAND_DISPLAY|GPG_TTY' || true)
   _emit_encoded "$env_vars" "ENV_VARS_B64"
-
-  # errexit/pipefail here are this function's own `set -euo pipefail` (set is
-  # shell-global in bash); replaying them would abort later user commands.
-  local posix_opts
-  posix_opts=$(builtin shopt -po 2>/dev/null | command grep -vE '^set [-+]o (nounset|errexit|pipefail)$' || true)
-  _emit_encoded "$posix_opts" "POSIX_OPTS_B64"
 
   local bash_opts
   bash_opts=$(builtin shopt -p 2>/dev/null || true)
@@ -121,6 +122,13 @@ dump_bash_state() {
   local aliases
   aliases=$(builtin alias -p 2>/dev/null || true)
   _emit_encoded "$aliases" "ALIASES_B64"
+
+  # Replay options last. posix_opts may include `allexport`; if that
+  # lands before the grok_snap_* assignments, those huge temps are
+  # exported and the next command's children die with E2BIG / 126.
+  # errexit/pipefail here are this function's own `set -euo pipefail`
+  # (set is shell-global in bash); they are filtered out above.
+  _emit_encoded "$posix_opts" "POSIX_OPTS_B64"
 
   _emit "# end of bash state dump"
   _emit "__GROK_BASH_STATE_END__"
@@ -443,6 +451,7 @@ impl ShellState {
                 // dump (`export -p`).
                 "{dump_script} \
                  snap=$(command cat <&3) && builtin shopt -s extglob && builtin eval -- \"$snap\" && \
+                 builtin unset grok_snap_ENV_VARS_B64 grok_snap_POSIX_OPTS_B64 grok_snap_BASH_OPTS_B64 grok_snap_FUNCTIONS_B64 grok_snap_ALIASES_B64 2>/dev/null; \
                  {{ builtin set +u 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \

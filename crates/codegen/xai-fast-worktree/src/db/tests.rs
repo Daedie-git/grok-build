@@ -214,6 +214,31 @@ fn sweep_dead_marks_missing_paths() {
     assert_eq!(exists_rec.status, WorktreeStatus::Alive);
 }
 
+#[cfg(unix)]
+#[test]
+fn sweep_dead_keeps_a_dangling_symlink_alive() {
+    let db = WorktreeDb::open_in_memory().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let link = tmp.path().join("dangling-wt");
+    std::os::unix::fs::symlink(tmp.path().join("gone-target"), &link).unwrap();
+    assert!(!link.exists(), "precondition: the symlink target is absent");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "precondition: the link itself is on disk"
+    );
+
+    db.register(&make_record(
+        "dangling",
+        &link.to_string_lossy(),
+        WorktreeKind::Session,
+    ))
+    .unwrap();
+
+    assert_eq!(db.sweep_dead().unwrap(), 0);
+    let rec = db.get("dangling").unwrap().unwrap();
+    assert_eq!(rec.status, WorktreeStatus::Alive);
+}
+
 #[test]
 fn register_upsert_overwrites() {
     let db = WorktreeDb::open_in_memory().unwrap();

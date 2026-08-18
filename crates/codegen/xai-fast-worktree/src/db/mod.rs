@@ -6,6 +6,8 @@
 mod queries;
 mod schema;
 
+pub(crate) use queries::worktree_path_gone;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

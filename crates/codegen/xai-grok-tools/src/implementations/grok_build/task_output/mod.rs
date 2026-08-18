@@ -3183,7 +3183,7 @@ mod tests {
                 .iter()
                 .map(|item| (item.task_id.as_str(), item.status.as_str()))
                 .collect::<Vec<_>>(),
-            [("stalled", "not_found"), ("done", "completed")],
+            [("stalled", "unknown"), ("done", "completed")],
             "resolved and fallback rows must retain caller order"
         );
     }
@@ -3354,7 +3354,31 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let req = unwrap_query(query_rx.recv().await.unwrap());
-            assert!(req.block);
+            assert!(
+                !req.block,
+                "first query is a snapshot to see whether the subagent is already terminal"
+            );
+            req.respond_to
+                .send(Some(SubagentSnapshot {
+                    subagent_id: "sub-run".to_string(),
+                    description: "exploring".to_string(),
+                    subagent_type: "general-purpose".to_string(),
+                    status: SubagentSnapshotStatus::Running {
+                        turn_count: 2,
+                        tool_call_count: 5,
+                        tokens_used: 10_000,
+                        context_window_tokens: 128_000,
+                        context_usage_pct: 8,
+                        tools_used: vec!["grep".to_string()],
+                        error_count: 0,
+                    },
+                    started_at_epoch_ms: 1_700_000_000_000,
+                    duration_ms: 3000,
+                    persona: None,
+                }))
+                .unwrap();
+            let req = unwrap_query(query_rx.recv().await.unwrap());
+            assert!(req.block, "still-running subagent then waits");
             tokio::time::sleep(Duration::from_millis(150)).await;
             req.respond_to
                 .send(Some(SubagentSnapshot {
@@ -3464,7 +3488,10 @@ mod tests {
             let shared = resources.into_shared();
             let handle = tokio::spawn(async move {
                 let req = unwrap_query(query_rx.recv().await.unwrap());
-                assert!(req.block);
+                assert!(
+                    !req.block,
+                    "cancelled/failed subagents are identified with a snapshot query"
+                );
                 req.respond_to.send(Some(snapshot)).unwrap();
             });
             let started = std::time::Instant::now();

@@ -375,6 +375,7 @@ async fn provider_concurrent_mints_single_flight() {
 /// distant one serves from cache.
 #[tokio::test]
 async fn provider_expiry_source_precedence() {
+    let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
     fn short_jwt() -> String {
         // exp within the skew window: stale immediately if consumed.
         jwt_with_exp(chrono::Utc::now().timestamp() + 30)

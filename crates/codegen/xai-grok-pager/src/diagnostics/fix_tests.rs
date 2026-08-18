@@ -1084,7 +1084,7 @@ fn shell_aliases_expand_to_exact_argv_and_bypass_is_explicit() {
         );
         let mut shell = std::process::Command::new(bash);
         shell
-            .args(["-ic", &command])
+            .args(["--norc", "-ic", &command])
             .env(
                 "PATH",
                 format!(

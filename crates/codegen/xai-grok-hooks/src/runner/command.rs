@@ -326,13 +326,7 @@ pub async fn run_command_hook(
 ///   map (those attempts would be silently ignored by the spawn-time
 ///   precedence ordering anyway, but stripping them at load time gives
 ///   users a clear "ignored, reserved key" warning).
-pub(crate) const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
-    "GROK_HOOK_EVENT",
-    "GROK_HOOK_NAME",
-    "GROK_SESSION_ID",
-    "GROK_WORKSPACE_ROOT",
-    "CLAUDE_PROJECT_DIR",
-];
+pub(crate) use crate::env_expand::RUNNER_ALWAYS_SET_ENV;
 
 /// Parse `command_str` for `${VAR}` and `$VAR` references and return the
 /// names that aren't resolvable from any of:

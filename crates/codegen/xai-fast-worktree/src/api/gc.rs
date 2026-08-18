@@ -337,7 +337,10 @@ fn reclaim_dead_records(db: &WorktreeDb, opts: &GcOptions, report: &mut GcReport
         })?;
         let dead = all
             .iter()
-            .filter(|rec| rec.status == WorktreeStatus::Dead || !Path::new(&rec.path).exists())
+            .filter(|rec| {
+                rec.status == WorktreeStatus::Dead
+                    || crate::db::worktree_path_gone(&rec.path)
+            })
             .count();
         report.dead_removed = u64::try_from(dead).unwrap_or(u64::MAX);
         return Ok(());

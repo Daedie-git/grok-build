@@ -208,6 +208,16 @@ pub fn stats(conn: &Connection) -> Result<DbStats> {
     })
 }
 
+/// True only when the directory entry itself is gone. A dangling symlink
+/// is still present (`exists()` would follow it and lie). Stat errors
+/// other than `NotFound` (e.g. `EACCES`) fail closed: keep the row.
+pub(crate) fn worktree_path_gone(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 pub fn sweep_dead(conn: &Connection) -> Result<u64> {
     let alive_paths: Vec<(String, String)> = {
         let mut stmt = conn.prepare("SELECT id, path FROM worktrees WHERE status = 'alive'")?;
@@ -219,7 +229,7 @@ pub fn sweep_dead(conn: &Connection) -> Result<u64> {
 
     let mut marked = 0u64;
     for (id, path_str) in alive_paths {
-        if !Path::new(&path_str).exists() {
+        if worktree_path_gone(Path::new(&path_str)) {
             conn.execute(
                 "UPDATE worktrees SET status = 'dead' WHERE id = ?1",
                 params![id],

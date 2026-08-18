@@ -2347,9 +2347,25 @@ fn cleanup_queue_dir(queue_dir: &Path, max_age: Duration, stats: Option<&UploadQ
         Err(_) => return 0,
     };
     let all_names: HashSet<std::ffi::OsString> = entries.iter().map(|e| e.file_name()).collect();
+    // Age every entry before deleting any of them. `pair_age` reads the
+    // sidecar from disk; if we delete the sidecar first, the temp falls
+    // back to its (possibly fresh) mtime and an expired pair leaks.
+    let ages: Vec<Duration> = entries
+        .iter()
+        .map(|entry| {
+            pair_age(&entry.path(), &entry.file_name(), &all_names).unwrap_or_else(|| {
+                entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| m.elapsed().ok())
+                    .unwrap_or(Duration::MAX)
+            })
+        })
+        .collect();
     let mut cleaned = 0u64;
     let mut cleaned_bytes = 0u64;
-    for entry in &entries {
+    for (entry, age) in entries.iter().zip(ages) {
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -2362,13 +2378,6 @@ fn cleanup_queue_dir(queue_dir: &Path, max_age: Duration, stats: Option<&UploadQ
             cleaned_bytes += sub_bytes;
             continue;
         }
-        let age = pair_age(&path, &name, &all_names).unwrap_or_else(|| {
-            metadata
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .unwrap_or(Duration::MAX)
-        });
         if age <= max_age {
             continue;
         }

@@ -103,6 +103,17 @@ fn make_sentinel() -> String {
     format!("{SENTINEL_PREFIX}{hi:016x}{lo:016x}{SENTINEL_SUFFIX}")
 }
 
+/// Runner-injected identity keys. Load-time expansion must leave these
+/// unresolved so a nested Grok session's process env cannot bake the
+/// outer session into the command string before spawn.
+pub(crate) const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
+    "GROK_HOOK_EVENT",
+    "GROK_HOOK_NAME",
+    "GROK_SESSION_ID",
+    "GROK_WORKSPACE_ROOT",
+    "CLAUDE_PROJECT_DIR",
+];
+
 /// Expand `${VAR}` / `$VAR` references in `input`.
 ///
 /// Lookup order for each reference:
@@ -142,6 +153,9 @@ pub(crate) fn expand_env_vars_with_extra(input: &str, extra: &HashMap<String, St
 
     // Step 2: run shellexpand on the (possibly) masked input.
     let context = |name: &str| -> Option<String> {
+        if RUNNER_ALWAYS_SET_ENV.contains(&name) {
+            return None;
+        }
         if let Some(v) = extra.get(name) {
             return Some(v.clone());
         }
@@ -366,6 +380,18 @@ mod tests {
                 assert_eq!(out, "from-extra");
             },
         );
+    }
+
+    #[test]
+    fn defers_runner_reserved_names_even_when_set_in_process_env() {
+        with_env_var("GROK_SESSION_ID", Some("outer-session"), || {
+            let extra = HashMap::new();
+            let out = expand_env_vars_with_extra("SESSION=$GROK_SESSION_ID", &extra);
+            assert_eq!(
+                out, "SESSION=$GROK_SESSION_ID",
+                "load-time expand must not bake the outer session into the command"
+            );
+        });
     }
 
     #[test]

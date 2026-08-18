@@ -819,7 +819,10 @@ pub(crate) struct SessionActor {
     /// The fully-built Agent: owns the ToolBridge, system prompt, policies,
     /// and the AgentDefinition. Replaces the old `tool_bridge` + `agent_definition` fields.
     /// Wrapped in `RefCell` for mid-session mutation (skill refresh, prompt regen).
-    /// Safe: session actor is single-threaded (LocalSet), no concurrent access.
+    /// The session actor is single-threaded (`LocalSet`), but the command loop
+    /// and the turn task interleave at `.await`. Do not hold a `Ref`/`RefMut`
+    /// across an await — a concurrent `borrow_mut` (e.g. `SetSessionModel`)
+    /// aborts the process.
     pub(crate) agent: std::cell::RefCell<xai_grok_agent::Agent>,
     /// Dedup slot for `x.ai/git_head_changed`, shared with the fs-watch
     /// `GitHead` consumer (see `git_head_dedup_key`).
@@ -1728,6 +1731,10 @@ mod fs_injection_regression_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/interjection_actor_tests.rs"]
 mod interjection_actor_tests;
+/// Mid-turn `SetSessionModel` must not abort when the turn holds `agent`.
+#[cfg(test)]
+#[path = "acp_session_tests/model_switch_midturn_tests.rs"]
+mod model_switch_midturn_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/observability_bridge_mapping_tests.rs"]
 mod observability_bridge_mapping_tests;

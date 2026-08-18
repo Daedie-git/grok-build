@@ -68,16 +68,26 @@ impl CompactFailure {
 // compaction's retry loop agree on size detection.
 pub(crate) use xai_grok_sampling_types::is_context_length_error;
 
+/// ChatGPT/Codex often answers a compact POST with a bare 403 (HTML or
+/// empty body → `Request failed (HTTP 403).`). That has cleared on retry
+/// in production; a JSON policy message stays deterministic.
+fn is_transient_forbidden(status: StatusCode, message: &str) -> bool {
+    status == StatusCode::FORBIDDEN
+        && (message.trim().is_empty() || message.contains("Request failed (HTTP 403)"))
+}
+
 /// Classify an upstream `SamplingError` for the compaction retry loop.
 ///
 /// `Auth`, `InvalidConfiguration`, `Serialization` and
 /// `IdleTimeout` are all deterministic by construction (re-issuing the same
 /// request cannot change the outcome — auth state, config, payload shape,
 /// and stuck-model conditions all persist). 4xx API responses other than
-/// 408 (timeout) and 429 (rate limit) are likewise deterministic. Network
-/// transport errors, non-size stream-level blips, and 5xx responses are transient.
-/// Context-window errors are deterministic regardless of whether they arrive
-/// as an HTTP `Api` error or a provider-specific SSE `StreamError`.
+/// 408 (timeout), 429 (rate limit), and an unstructured 403 (empty/HTML
+/// gateway body, not a policy JSON message) are likewise deterministic.
+/// Network transport errors, non-size stream-level blips, and 5xx
+/// responses are transient. Context-window errors are deterministic
+/// regardless of whether they arrive as an HTTP `Api` error or a
+/// provider-specific SSE `StreamError`.
 fn classify_sampling_error(err: SamplingError) -> CompactFailure {
     let acp_err = acp::Error::internal_error().data(format!("compact failed: {err}"));
     let deterministic = match &err {
@@ -95,7 +105,8 @@ fn classify_sampling_error(err: SamplingError) -> CompactFailure {
             is_context_length_error(message)
                 || (status.is_client_error()
                     && *status != StatusCode::REQUEST_TIMEOUT
-                    && *status != StatusCode::TOO_MANY_REQUESTS)
+                    && *status != StatusCode::TOO_MANY_REQUESTS
+                    && !is_transient_forbidden(*status, message))
         }
         SamplingError::StreamError { message, .. } => {
             is_context_length_error(message) || !err.is_retryable()

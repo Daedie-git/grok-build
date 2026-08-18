@@ -164,29 +164,46 @@ impl SessionActor {
         self.invalidate_model_auth_memo();
         self.signals_handle()
             .record_model_usage(&sampling_config.model);
+        // The turn task may still hold `self.agent` across `.await` on this
+        // same `LocalSet`. `borrow`/`borrow_mut` would abort the process.
+        let turn_in_flight = self.state.lock().await.running_task.is_some();
         if apply_prompt_override && !skip_prompt_rewrite {
-            self.agent
-                .borrow_mut()
-                .apply_system_prompt_identity(system_prompt_identity)
-                .await;
-            let (prompt_context, active_system_prompt) = {
-                let agent = self.agent.borrow();
-                prompt_artifacts_for_persistence(
-                    agent.prompt_context(),
-                    agent.system_prompt(),
-                    use_concise,
-                )
-            };
-            let mut conversation = self.chat_state_handle.get_conversation().await;
-            for item in conversation.iter_mut() {
-                if let ConversationItem::System(sys) = item {
-                    sys.content = std::sync::Arc::<str>::from(active_system_prompt.as_str());
-                    break;
+            if turn_in_flight {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    model_id = %model_id.0,
+                    "handle_set_session_model: skipping prompt rewrite (turn in flight)"
+                );
+            } else if let Ok(mut agent) = self.agent.try_borrow_mut() {
+                agent
+                    .apply_system_prompt_identity(system_prompt_identity)
+                    .await;
+                drop(agent);
+                let (prompt_context, active_system_prompt) = {
+                    let agent = self.agent.borrow();
+                    prompt_artifacts_for_persistence(
+                        agent.prompt_context(),
+                        agent.system_prompt(),
+                        use_concise,
+                    )
+                };
+                let mut conversation = self.chat_state_handle.get_conversation().await;
+                for item in conversation.iter_mut() {
+                    if let ConversationItem::System(sys) = item {
+                        sys.content = std::sync::Arc::<str>::from(active_system_prompt.as_str());
+                        break;
+                    }
                 }
+                self.chat_state_handle.replace_conversation(conversation);
+                save_prompt_context(&self.session_info, &prompt_context);
+                save_system_prompt(&self.session_info, &active_system_prompt);
+            } else {
+                tracing::info!(
+                    session_id = %self.session_info.id.0,
+                    model_id = %model_id.0,
+                    "handle_set_session_model: skipping prompt rewrite (agent borrowed)"
+                );
             }
-            self.chat_state_handle.replace_conversation(conversation);
-            save_prompt_context(&self.session_info, &prompt_context);
-            save_system_prompt(&self.session_info, &active_system_prompt);
         } else if !apply_prompt_override {
             tracing::info!(
                 session_id = %self.session_info.id.0,
@@ -200,7 +217,10 @@ impl SessionActor {
                 "handle_set_session_model: skipping prompt rewrite (just rebuilt harness)"
             );
         }
-        let agent_name = self.agent.borrow().definition().name.clone();
+        let agent_name = match self.agent.try_borrow() {
+            Ok(agent) => agent.definition().name.clone(),
+            Err(_) => self.active_agent_type.lock().clone().unwrap_or_default(),
+        };
         let _ = self
             .notifications
             .persistence_tx

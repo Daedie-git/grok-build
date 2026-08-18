@@ -29,6 +29,35 @@ fn sampling_api_4xx_is_deterministic_except_408_and_429() {
 }
 
 #[test]
+fn unstructured_forbidden_is_transient_structured_stays_deterministic() {
+    let generic = classify_sampling_error(SamplingError::Api {
+        status: StatusCode::FORBIDDEN,
+        message: "Request failed (HTTP 403).".into(),
+        model_metadata: None,
+        retry_after_secs: None,
+        should_retry: None,
+        error_code: None,
+    });
+    assert!(
+        !is_det(&generic),
+        "empty/gateway 403 must be retried: {generic:?}"
+    );
+
+    let policy = classify_sampling_error(SamplingError::Api {
+        status: StatusCode::FORBIDDEN,
+        message: "Access to the chat endpoint is denied".into(),
+        model_metadata: None,
+        retry_after_secs: None,
+        should_retry: None,
+        error_code: None,
+    });
+    assert!(
+        is_det(&policy),
+        "structured policy 403 must stay deterministic: {policy:?}"
+    );
+}
+
+#[test]
 fn sampling_non_api_variants_classify_correctly() {
     assert!(is_det(&classify_sampling_error(
         SamplingError::auth_unknown("expired")

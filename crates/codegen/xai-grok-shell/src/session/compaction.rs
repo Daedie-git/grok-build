@@ -2881,6 +2881,88 @@ impl SessionActor {
             ));
         }
     }
+    /// Codex 90% safety gate: compact before the next sample, retrying
+    /// transient provider errors so an AFK turn is not killed by a one-shot
+    /// 403/5xx. Auth, size, schema, credit, cancel, and bounded-cycle
+    /// failures still abort immediately.
+    pub(crate) async fn ensure_codex_safety_headroom(self: &Arc<Self>) -> Result<(), acp::Error> {
+        let (cancel, _scope) = self.compaction.cancel.enter();
+        let mut attempt = 0u32;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(
+                    crate::session::helpers::session_compact::CompactFailure::cancelled_error(),
+                );
+            }
+            let Some(trigger_info) = self.check_codex_auto_compact_needed().await else {
+                return Ok(());
+            };
+            self.clear_auto_compact_retry_gate();
+            match self.run_compact_only(trigger_info).await {
+                Ok(()) => return Ok(()),
+                Err(e) if Self::is_auth_compact_error(&e) => {
+                    return Err(self.surface_compact_auth_failure(e).await);
+                }
+                Err(e) if Self::codex_safety_compact_should_abort(&e) => {
+                    tracing::error!(error = %e, "Codex safety-limit compaction failed");
+                    return Err(e);
+                }
+                Err(e) => {
+                    attempt += 1;
+                    let delay = Self::codex_safety_compact_retry_delay(attempt);
+                    tracing::warn!(
+                        attempt,
+                        delay_secs = delay.as_secs(),
+                        error = %e,
+                        "Codex safety compaction failed; retrying so the turn can continue"
+                    );
+                    xai_grok_telemetry::unified_log::warn(
+                        "codex.safety_compact.retry",
+                        Some(self.session_info.id.0.as_ref()),
+                        Some(serde_json::json!({
+                            "attempt": attempt,
+                            "delay_secs": delay.as_secs(),
+                            "error": crate::util::truncate(&Self::acp_error_message(&e), 300),
+                        })),
+                    );
+                    tokio::select! {
+                        () = cancel.cancelled() => return Err(e),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn codex_safety_compact_retry_delay(attempt: u32) -> std::time::Duration {
+        const SECS: [u64; 4] = [5, 15, 45, 60];
+        let idx = attempt.saturating_sub(1).min(3) as usize;
+        std::time::Duration::from_secs(SECS[idx])
+    }
+
+    fn codex_safety_compact_should_abort(error: &acp::Error) -> bool {
+        if error
+            .data
+            .as_ref()
+            .and_then(|d| d.as_str())
+            .is_some_and(|s| {
+                s.contains(crate::session::helpers::session_compact::COMPACT_CANCELLED_MSG)
+            })
+        {
+            return true;
+        }
+        let message = Self::acp_error_message(error);
+        if message.contains("compaction cycle limit")
+            || message.contains("automatic compaction previously failed deterministically")
+        {
+            return true;
+        }
+        matches!(
+            Self::classify_suppress_reason(&message),
+            SuppressReason::Size | SuppressReason::Schema | SuppressReason::CreditBlock
+        )
+    }
+
     /// Compact without auto-continue. The outer turn loop rebuilds and retries.
     /// Emits telemetry (`auto_compact_fired`) and UI notifications automatically.
     #[tracing::instrument(

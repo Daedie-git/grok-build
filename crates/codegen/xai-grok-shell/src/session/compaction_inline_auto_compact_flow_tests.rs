@@ -931,6 +931,7 @@ async fn spawn_status_body_server(status: u16, body: &'static str) -> String {
     let status_line = match status {
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
+        403 => "403 Forbidden",
         503 => "503 Service Unavailable",
         other => panic!("add status line for {other}"),
     };
@@ -2294,7 +2295,70 @@ fn classify_suppress_reason_maps_error_text() {
         classify("upstream 500 internal error"),
         SuppressReason::Other
     );
+    assert_eq!(
+        classify("compact failed: API error (status 403 Forbidden): Request failed (HTTP 403)."),
+        SuppressReason::Other
+    );
 }
+
+#[test]
+fn codex_safety_abort_skips_transient_403_and_stops_on_schema() {
+    let abort = |msg: &str| {
+        SessionActor::codex_safety_compact_should_abort(&acp::Error::internal_error().data(msg))
+    };
+    assert!(!abort(
+        "compact failed: API error (status 403 Forbidden): Request failed (HTTP 403)."
+    ));
+    assert!(!abort(
+        "compact failed: API error (status 503 Service Unavailable): temporarily unavailable"
+    ));
+    assert!(abort("provider returned invalid_request_error: messages.3"));
+    assert!(abort(
+        "compact failed: The prompt is too long for this model's context window."
+    ));
+    assert!(abort("compaction cycle limit reached"));
+    assert!(abort("compact cancelled"));
+}
+
+#[test]
+fn codex_safety_retry_delay_caps_at_one_minute() {
+    assert_eq!(
+        SessionActor::codex_safety_compact_retry_delay(1),
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        SessionActor::codex_safety_compact_retry_delay(4),
+        std::time::Duration::from_secs(60)
+    );
+    assert_eq!(
+        SessionActor::codex_safety_compact_retry_delay(20),
+        std::time::Duration::from_secs(60)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ensure_codex_safety_headroom_is_noop_below_limit() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, _prx) = mpsc::unbounded_channel();
+            let actor =
+                Arc::new(create_test_actor(1_000, 272_000, 85, gateway_tx, persistence_tx).await);
+            if let Some(mut cfg) = actor.chat_state_handle.get_sampling_config().await {
+                cfg.provider_id = Some(xai_grok_sampling_types::ProviderId::Codex);
+                cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+                cfg.base_url = "https://chatgpt.com/backend-api/codex".to_string();
+                actor.chat_state_handle.update_sampling_config(cfg);
+            }
+            actor
+                .ensure_codex_safety_headroom()
+                .await
+                .expect("under the Codex safety limit must not compact or fail");
+        })
+        .await;
+}
+
 /// `SuppressReason::as_str` is the stable telemetry wire value — BQ/OTLP and
 /// dashboards key off these exact strings. Lock them so a rename can't break monitoring.
 #[test]

@@ -1672,35 +1672,32 @@ impl SessionActor {
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let agent_ref = self.agent.borrow();
-        let completion_req = match agent_ref.completion_requirement() {
-            Some(req) => req,
-            None => {
-                return self
-                    .process_conversation_turn(
-                        req_id,
-                        trace_gcs_config,
-                        artifact_tracker.as_ref(),
-                        json_schema,
-                    )
-                    .await;
-            }
+        // Clone out of the `RefCell` before any `.await`. A named `Ref` that
+        // lives across `process_conversation_turn` races with `SetSessionModel`
+        // on the same `LocalSet` and aborts (`already borrowed`).
+        let completion_req = self.agent.borrow().completion_requirement().cloned();
+        let Some(completion_req) = completion_req else {
+            return self
+                .process_conversation_turn(
+                    req_id,
+                    trace_gcs_config,
+                    artifact_tracker.as_ref(),
+                    json_schema,
+                )
+                .await;
         };
-        let recovery = match &completion_req.recovery {
-            Some(r) => r.clone(),
-            None => {
-                return self
-                    .process_conversation_turn(
-                        req_id,
-                        trace_gcs_config,
-                        artifact_tracker.as_ref(),
-                        json_schema,
-                    )
-                    .await;
-            }
+        let Some(recovery) = completion_req.recovery.clone() else {
+            return self
+                .process_conversation_turn(
+                    req_id,
+                    trace_gcs_config,
+                    artifact_tracker.as_ref(),
+                    json_schema,
+                )
+                .await;
         };
-        let required_tool = completion_req.tool.clone();
-        let recovery_prompt = completion_req.reminder.clone();
+        let required_tool = completion_req.tool;
+        let recovery_prompt = completion_req.reminder;
         let mut result = self
             .process_conversation_turn(
                 req_id,
@@ -2296,13 +2293,9 @@ impl SessionActor {
             // normal compaction is suppressed or this is a budgeted child.
             // This executes at every model-loop iteration, including tool-call
             // follow-ups after their results have entered chat state.
-            if let Some(trigger_info) = self.check_codex_auto_compact_needed().await
-                && let Err(e) = self.run_compact_only(trigger_info).await
-            {
-                tracing::error!(error = %e, "Codex safety-limit compaction failed");
-                if Self::is_auth_compact_error(&e) {
-                    return Err(self.surface_compact_auth_failure(e).await);
-                }
+            // Transient provider errors (bare 403, 5xx) retry with backoff
+            // instead of aborting an AFK turn.
+            if let Err(e) = self.ensure_codex_safety_headroom().await {
                 return Err(e);
             }
             if self.tool_context.task_output_token_budget.is_none()
